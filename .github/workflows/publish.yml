@@ -1,10 +1,14 @@
 name: Publish to NuGet
 
-# Run by hand from the Actions tab. Builds, tests and packs the libraries at the chosen ref, then pushes Pgmq and
-# Pgmq.Hosting (with their symbol packages) to NuGet.org.
+# Run by hand from the Actions tab. Builds, tests and packs the libraries on main, then pushes Pgmq and Pgmq.Hosting
+# (with their symbol packages) to NuGet.org.
 #
-# Needs a repository or environment secret NUGET_API_KEY: a NuGet.org API key with the "Push" scope, limited to the
-# Pgmq and Pgmq.Hosting packages. The job runs in the "nuget" environment, so required reviewers can be added there.
+# Keyless, through NuGet trusted publishing: GitHub vouches for this workflow (OIDC) and NuGet.org hands back an API
+# key that lives for one hour. Nothing long-lived is stored. It needs:
+#   - a trusted publishing policy on nuget.org: owner filipbekic01, repository pgmq-dotnet, workflow file publish.yml,
+#     environment nuget;
+#   - the repository variable NUGET_USER: the nuget.org profile name (not the email) that owns that policy.
+# The job runs in the "nuget" environment, which only main may deploy to; add required reviewers there if wanted.
 
 on:
   workflow_dispatch:
@@ -35,6 +39,9 @@ jobs:
     name: Pack and push
     runs-on: ubuntu-latest
     environment: nuget
+    permissions:
+      contents: read
+      id-token: write # lets NuGet/login ask GitHub for the OIDC token NuGet.org trusts
     steps:
       - name: Only from main
         if: github.ref != 'refs/heads/main'
@@ -93,15 +100,18 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
+      - name: NuGet login (OIDC to a one-hour API key)
+        if: ${{ !inputs.dry-run }}
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
       - name: Push to NuGet.org
         if: ${{ !inputs.dry-run }}
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
         run: |
-          if [ -z "$NUGET_API_KEY" ]; then
-            echo "The NUGET_API_KEY secret is not set."
-            exit 1
-          fi
           # Pgmq first: Pgmq.Hosting depends on it. Symbol packages beside each .nupkg are pushed with it.
           for package in artifacts/Pgmq.[0-9]*.nupkg artifacts/Pgmq.Hosting.[0-9]*.nupkg; do
             dotnet nuget push "$package" --api-key "$NUGET_API_KEY" \

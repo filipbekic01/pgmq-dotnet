@@ -38,6 +38,8 @@ Packages go to NuGet.org only through the **Publish to NuGet** workflow, run by 
 3. Start the workflow. Tick **dry-run** first to build, test and pack without pushing; the packages are attached to
    the run.
 
-It needs a `NUGET_API_KEY` secret: a NuGet.org API key with the Push scope, limited to `Pgmq` and `Pgmq.Hosting`. The
-job runs in the `nuget` environment, so required reviewers can be set there. A version already on NuGet.org is
-skipped, never overwritten.
+Publishing is keyless, through [NuGet trusted publishing](https://learn.microsoft.com/nuget/nuget-org/trusted-publishing):
+GitHub vouches for the workflow and NuGet.org returns an API key that lives for one hour. It relies on a trusted
+publishing policy on nuget.org (owner `filipbekic01`, repository `pgmq-dotnet`, workflow file `publish.yml`, environment
+`nuget`) and on the repository variable `NUGET_USER`, the nuget.org profile name. The job runs in the `nuget`
+environment, which only `main` may deploy to. A version already on NuGet.org is skipped, never overwritten.
