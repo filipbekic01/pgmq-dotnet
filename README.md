@@ -7,8 +7,8 @@ worker handles them with per-queue concurrency, leases, retries, timeouts and gr
 The aim is a small, predictable alternative to full messaging frameworks such as MassTransit, Wolverine and Rebus:
 publish and subscribe, nothing more. There are no sagas, workflow engines or middleware pipelines.
 
-> **Status: early alpha (`0.1.0-alpha.1`), not yet published to NuGet.** The features below are implemented and
-> tested, including against a real PGMQ database. The public API may still change before 1.0. Pgmq.NET is an
+> **Status: early alpha (`0.1.0-alpha.1`), on NuGet.org as `Pgmq` and `Pgmq.Hosting`.** The features below are
+> implemented and tested, including against a real PGMQ database. The public API may still change before 1.0. Pgmq.NET is an
 > independent project, not affiliated with the PGMQ project.
 
 ## Packages
@@ -19,6 +19,10 @@ publish and subscribe, nothing more. There are no sagas, workflow engines or mid
 | `Pgmq.Hosting` | Consumers (`IPgmqConsumer<T>`), the background worker, dependency injection, a health check and status reporting on the .NET Generic Host. References `Pgmq`. |
 
 Both target .NET 10 and build on [Npgmq](https://github.com/brianpursley/Npgmq) and Npgsql.
+
+```bash
+dotnet add package Pgmq.Hosting --prerelease
+```
 
 ## Quick start
 
