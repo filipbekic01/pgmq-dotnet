@@ -41,17 +41,10 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
             CreateCommand(queueName, options ?? PgmqQueueOptions.Standard);
 
         // pgmq.create_partitioned fails on an existing queue, and two instances starting together would both see it
-        // missing. A lock per queue name, held to the end of the transaction, serializes the check and the create.
+        // missing. pgmq's queue lock, held to the end of the transaction, serializes the check and the create.
         await using NpgsqlConnection connection = await dataSource.OpenConnectionAsync(cancellationToken);
         await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
-
-        await using (NpgsqlCommand lockCommand = new(
-                         "select pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('pgmq.create.' || $1))",
-                         connection, transaction))
-        {
-            lockCommand.Parameters.Add(new NpgsqlParameter { Value = queueName });
-            await lockCommand.ExecuteNonQueryAsync(cancellationToken);
-        }
+        await AcquireQueueLockAsync(queueName, transaction, cancellationToken);
 
         await using (NpgsqlCommand exists = new("select exists (select 1 from pgmq.meta where queue_name = $1)",
                          connection, transaction))
@@ -72,6 +65,19 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
 
         await transaction.CommitAsync(cancellationToken);
         return true;
+    }
+
+    /// <inheritdoc />
+    public async Task AcquireQueueLockAsync(string queueName, NpgsqlTransaction transaction,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
+        NpgsqlConnection connection = transaction.Connection
+            ?? throw new InvalidOperationException("The transaction has already ended.");
+
+        await using NpgsqlCommand command = new("select pgmq.acquire_queue_lock($1)", connection, transaction);
+        command.Parameters.Add(Text(queueName));
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     /// <inheritdoc />
@@ -216,7 +222,7 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
 
     private const string MetricsColumns =
         "queue_name, queue_length, queue_visible_length, newest_msg_age_sec, oldest_msg_age_sec, total_messages, " +
-        "scrape_time";
+        "scrape_time, default_partition_length";
 
     private static PgmqQueueMetrics ReadMetrics(NpgsqlDataReader r)
         => new(
@@ -226,7 +232,8 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
             r.IsDBNull(3) ? null : TimeSpan.FromSeconds(r.GetInt32(3)),
             r.IsDBNull(4) ? null : TimeSpan.FromSeconds(r.GetInt32(4)),
             r.GetInt64(5),
-            r.GetFieldValue<DateTimeOffset>(6));
+            r.GetFieldValue<DateTimeOffset>(6),
+            r.IsDBNull(7) ? null : r.GetInt64(7));
 
     private static (string Sql, NpgsqlParameter[] Parameters) CreateCommand(string queueName, PgmqQueueOptions options)
         => options.Type switch

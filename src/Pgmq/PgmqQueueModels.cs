@@ -69,6 +69,10 @@ public sealed record PgmqQueueInfo(string QueueName, DateTimeOffset CreatedAt, b
 /// <param name="OldestMessageAge">Age of the oldest message; null when the queue is empty.</param>
 /// <param name="TotalMessages">Messages ever sent to the queue.</param>
 /// <param name="ScrapeTime">When the numbers were taken.</param>
+/// <param name="DefaultPartitionLength">
+/// Partitioned queues only, null otherwise: about how many messages (queue and archive) sit in the default partition.
+/// Above zero means pg_partman maintenance is not keeping up and needs attention. An estimate from table statistics.
+/// </param>
 public sealed record PgmqQueueMetrics(
     string QueueName,
     long QueueLength,
@@ -76,7 +80,8 @@ public sealed record PgmqQueueMetrics(
     TimeSpan? NewestMessageAge,
     TimeSpan? OldestMessageAge,
     long TotalMessages,
-    DateTimeOffset ScrapeTime);
+    DateTimeOffset ScrapeTime,
+    long? DefaultPartitionLength);
 
 /// <summary>A topic pattern bound to a queue (<c>pgmq.bind_topic</c>).</summary>
 public sealed record PgmqTopicBinding(string Pattern, string QueueName, DateTimeOffset BoundAt, string CompiledRegex);

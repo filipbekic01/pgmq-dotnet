@@ -1,3 +1,5 @@
+using Npgsql;
+
 namespace Pgmq;
 
 /// <summary>
@@ -26,6 +28,14 @@ public interface IPgmqQueueManager
     /// </summary>
     /// <returns>True when the queue was created.</returns>
     Task<bool> EnsureQueueAsync(string queueName, PgmqQueueOptions? options = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Locks a queue until <paramref name="transaction"/> ends (<c>pgmq.acquire_queue_lock</c>). pgmq takes the same
+    /// lock when it creates a partitioned queue, so this serializes your own work on a queue with that, and with
+    /// other callers of this method.
+    /// </summary>
+    Task AcquireQueueLockAsync(string queueName, NpgsqlTransaction transaction,
         CancellationToken cancellationToken = default);
 
     /// <summary>Drops a queue and its archive (<c>pgmq.drop_queue</c>).</summary>

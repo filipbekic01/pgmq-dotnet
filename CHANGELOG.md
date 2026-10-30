@@ -10,7 +10,9 @@ All notable changes to this project are recorded here. The format follows
 - Support for every function of the PGMQ 1.13 SQL API; the README has a table of what maps where.
 - `IPgmqQueueManager` / `PgmqQueueManager`: create (standard, unlogged, partitioned), ensure, drop, purge, list and
   check queues; metrics; topic bindings and routing tests; insert notifications; FIFO indexes; archive partitioning;
-  the extension version.
+  the extension version; `AcquireQueueLockAsync` (`pgmq.acquire_queue_lock`) to lock a queue for a transaction.
+- `PgmqQueueMetrics.DefaultPartitionLength`: how many messages of a partitioned queue sit in its default partition,
+  which means pg_partman maintenance is failing.
 - `PgmqPublishOptions` with a delay or delivery time, a FIFO `GroupId` and custom `Headers`, and `PublishToTopicAsync`
   / `PublishBatchToTopicAsync` for topic routing.
 - Consumers: `ReadMode` (`Grouped`, `GroupedRoundRobin`, `GroupedHead` FIFO reads, in order per group),
