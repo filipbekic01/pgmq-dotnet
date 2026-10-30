@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Npgsql;
 
 namespace Pgmq.IntegrationTests;
 
@@ -247,6 +248,8 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         PgmqQueueMetrics metrics = await queues.GetMetricsAsync("m_standard", Ct);
         Assert.Equal((3L, 3L), (metrics.QueueLength, metrics.VisibleLength));
         Assert.NotNull(metrics.OldestMessageAge);
+        Assert.Null(metrics.DefaultPartitionLength);
+        Assert.Equal(0, (await queues.GetMetricsAsync("m_partitioned", Ct)).DefaultPartitionLength);
         Assert.Contains(await queues.GetAllMetricsAsync(Ct), m => m.QueueName == "m_standard");
 
         Assert.Equal(3, await queues.PurgeQueueAsync("m_standard", Ct));
@@ -285,6 +288,39 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         Assert.Equal(1, await db.CountAsync("m_messages"));
         Assert.Equal(3, await db.ArchivedAsync("m_messages"));
         Assert.False(await queues.SetVisibilityTimeoutAsync("m_messages", ids[0], TimeSpan.Zero, Ct));
+    }
+
+    [Fact]
+    public async Task The_queue_manager_Should_hold_a_queue_lock_until_the_transaction_ends()
+    {
+        PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
+        await queues.EnsureQueueAsync("m_lock", cancellationToken: Ct);
+
+        await using NpgsqlConnection holder = new(db.ConnectionString);
+        await holder.OpenAsync(Ct);
+        await using NpgsqlTransaction held = await holder.BeginTransactionAsync(Ct);
+        await queues.AcquireQueueLockAsync("m_lock", held, Ct);
+
+        await using NpgsqlConnection other = new(db.ConnectionString);
+        await other.OpenAsync(Ct);
+        await using (NpgsqlTransaction blocked = await other.BeginTransactionAsync(Ct))
+        {
+            await using (NpgsqlCommand timeout = new("set local lock_timeout = '200ms'", other, blocked))
+            {
+                await timeout.ExecuteNonQueryAsync(Ct);
+            }
+
+            PostgresException ex = await Assert.ThrowsAsync<PostgresException>(
+                () => queues.AcquireQueueLockAsync("m_lock", blocked, Ct));
+            Assert.Equal(PostgresErrorCodes.LockNotAvailable, ex.SqlState);
+        }
+
+        await held.CommitAsync(Ct);
+
+        await using NpgsqlTransaction after = await other.BeginTransactionAsync(Ct);
+        await queues.AcquireQueueLockAsync("m_lock", after, Ct);
+        await after.CommitAsync(Ct);
     }
 
     [Fact]

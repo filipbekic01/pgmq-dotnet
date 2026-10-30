@@ -67,7 +67,8 @@ Npgsql and nothing else in between.
 | **Utilities** | | | |
 | Set the visibility timeout | `set_vt` (one or many) | ✅ | Worker for leases, retries and releases; or `IPgmqQueueManager.SetVisibilityTimeoutAsync` |
 | List queues | `list_queues` | ✅ | `IPgmqQueueManager.ListQueuesAsync` |
-| Metrics for a queue / all queues | `metrics`, `metrics_all` | ✅ | `IPgmqQueueManager.GetMetricsAsync` / `GetAllMetricsAsync` |
+| Metrics for a queue / all queues | `metrics`, `metrics_all` | ✅ | `IPgmqQueueManager.GetMetricsAsync` / `GetAllMetricsAsync`, with `DefaultPartitionLength` to spot failing pg_partman maintenance |
+| Lock a queue for a transaction | `acquire_queue_lock` | ✅ | `EnsureQueueAsync` uses it; or `IPgmqQueueManager.AcquireQueueLockAsync(queue, transaction)` |
 | Notify on insert (LISTEN/NOTIFY) | `enable_notify_insert` | ✅ | Worker, on by default (`PgmqOptions.UseInsertNotifications`); or `IPgmqQueueManager.EnableInsertNotificationsAsync` |
 | Change or stop notifications | `update_notify_insert`, `disable_notify_insert` | ✅ | `IPgmqQueueManager.UpdateInsertNotificationsAsync` / `DisableInsertNotificationsAsync` |
 | List notification throttles | `list_notify_insert_throttles` | ✅ | `IPgmqQueueManager.ListInsertNotificationsAsync` |
