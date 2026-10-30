@@ -144,12 +144,12 @@ public sealed class RegistrationTests
     }
 
     [Fact]
-    public void The_queue_manager_and_client_Should_resolve_from_the_registrations()
+    public void The_queue_manager_and_publisher_Should_resolve_from_the_registrations()
     {
         using ServiceProvider services = Build(o => o.ConnectionString = Unreachable, _ => { });
 
         Assert.IsType<PgmqQueueManager>(services.GetRequiredService<IPgmqQueueManager>());
-        Assert.NotNull(services.GetRequiredService<Npgmq.INpgmqClient>());
+        Assert.IsType<PgmqPublisher>(services.GetRequiredService<IPgmqPublisher>());
     }
 
     [Fact]

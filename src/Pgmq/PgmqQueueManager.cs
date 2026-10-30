@@ -214,6 +214,42 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
     public async Task CreateFifoIndexesAsync(CancellationToken cancellationToken = default)
         => await ExecuteAsync("select pgmq.create_fifo_indexes_all()", [], cancellationToken);
 
+    /// <inheritdoc />
+    public async Task<bool> DeleteMessageAsync(string queueName, long messageId,
+        CancellationToken cancellationToken = default)
+        => await ScalarAsync<bool>("select pgmq.delete($1, $2)", [Text(queueName), Long(messageId)],
+            cancellationToken);
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<long>> DeleteMessagesAsync(string queueName, IReadOnlyCollection<long> messageIds,
+        CancellationToken cancellationToken = default)
+        => QueryAsync("select * from pgmq.delete($1, $2)", [Text(queueName), Longs(messageIds)],
+            r => r.GetInt64(0), cancellationToken);
+
+    /// <inheritdoc />
+    public async Task<bool> ArchiveMessageAsync(string queueName, long messageId,
+        CancellationToken cancellationToken = default)
+        => await ScalarAsync<bool>("select pgmq.archive($1, $2)", [Text(queueName), Long(messageId)],
+            cancellationToken);
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<long>> ArchiveMessagesAsync(string queueName, IReadOnlyCollection<long> messageIds,
+        CancellationToken cancellationToken = default)
+        => QueryAsync("select * from pgmq.archive($1, $2)", [Text(queueName), Longs(messageIds)],
+            r => r.GetInt64(0), cancellationToken);
+
+    /// <inheritdoc />
+    public async Task<bool> SetVisibilityTimeoutAsync(string queueName, long messageId, TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+        => (await QueryAsync("select msg_id from pgmq.set_vt($1, $2, $3)",
+            [Text(queueName), Long(messageId), Int(Seconds(timeout))], r => r.GetInt64(0), cancellationToken)).Count > 0;
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<long>> SetVisibilityTimeoutAsync(string queueName, IReadOnlyCollection<long> messageIds,
+        TimeSpan timeout, CancellationToken cancellationToken = default)
+        => QueryAsync("select msg_id from pgmq.set_vt($1, $2, $3)",
+            [Text(queueName), Longs(messageIds), Int(Seconds(timeout))], r => r.GetInt64(0), cancellationToken);
+
     private const string MetricsColumns =
         "queue_name, queue_length, queue_visible_length, newest_msg_age_sec, oldest_msg_age_sec, total_messages, " +
         "scrape_time";
@@ -252,7 +288,21 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         return new NpgsqlParameter { Value = value, NpgsqlDbType = NpgsqlDbType.Text };
     }
 
+    private static int Seconds(TimeSpan timeout)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero, nameof(timeout));
+        return (int)Math.Ceiling(timeout.TotalSeconds);
+    }
+
     private static NpgsqlParameter Int(int value) => new() { Value = value, NpgsqlDbType = NpgsqlDbType.Integer };
+
+    private static NpgsqlParameter Long(long value) => new() { Value = value, NpgsqlDbType = NpgsqlDbType.Bigint };
+
+    private static NpgsqlParameter Longs(IReadOnlyCollection<long> values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+        return new NpgsqlParameter { Value = values.ToArray(), NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Bigint };
+    }
 
     private async Task ExecuteAsync(string sql, NpgsqlParameter[] parameters, CancellationToken cancellationToken)
     {

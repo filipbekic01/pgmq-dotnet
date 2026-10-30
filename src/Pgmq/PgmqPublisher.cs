@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
-using Npgmq;
+using Npgsql;
 
 namespace Pgmq;
 
@@ -9,12 +9,27 @@ namespace Pgmq;
 /// delayed send. The copies are separate writes, not one transaction. Topic publishes are one <c>pgmq.send_topic</c>
 /// call, which writes to every bound queue in one statement.
 /// </summary>
-/// <param name="client">The PGMQ client to write with.</param>
-/// <param name="topology">Which queues each message type goes to.</param>
-/// <param name="logger">Notes messages that no queue is subscribed to.</param>
-public sealed class PgmqPublisher(INpgmqClient client, PgmqTopology topology, ILogger<PgmqPublisher> logger)
-    : IPgmqPublisher
+public sealed class PgmqPublisher : IPgmqPublisher
 {
+    private readonly IPgmqSender _client;
+    private readonly PgmqTopology _topology;
+    private readonly ILogger<PgmqPublisher> _logger;
+
+    /// <param name="dataSource">The database with the pgmq extension.</param>
+    /// <param name="topology">Which queues each message type goes to.</param>
+    /// <param name="logger">Notes messages that no queue is subscribed to.</param>
+    public PgmqPublisher(NpgsqlDataSource dataSource, PgmqTopology topology, ILogger<PgmqPublisher> logger)
+        : this(new PgmqSender(dataSource ?? throw new ArgumentNullException(nameof(dataSource))), topology, logger)
+    {
+    }
+
+    internal PgmqPublisher(IPgmqSender client, PgmqTopology topology, ILogger<PgmqPublisher> logger)
+    {
+        _client = client ?? throw new ArgumentNullException(nameof(client));
+        _topology = topology ?? throw new ArgumentNullException(nameof(topology));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
     private static readonly PgmqPublishOptions NoOptions = new();
 
     /// <inheritdoc />
@@ -65,9 +80,7 @@ public sealed class PgmqPublisher(INpgmqClient client, PgmqTopology topology, IL
             IReadOnlyDictionary<string, object>[] headers =
                 [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
 
-            await (delay is { } d && d > TimeSpan.Zero
-                ? client.SendBatchAsync(queue, bodies, headers, DateTimeOffset.UtcNow + d, cancellationToken)
-                : client.SendBatchAsync(queue, bodies, headers, cancellationToken));
+            await _client.SendBatchAsync(queue, bodies, headers, DeliverAt(delay), cancellationToken);
         }
     }
 
@@ -97,7 +110,7 @@ public sealed class PgmqPublisher(INpgmqClient client, PgmqTopology topology, IL
         int delaySeconds = Seconds(options.ResolveDelay());
         using Activity? activity = PgmqTelemetry.StartSend(MessageNames.Of(typeof(TMessage)), routingKey);
 
-        return await client.SendTopicAsync(routingKey, MessageSerializer.Serialize(message, typeof(TMessage)),
+        return await _client.SendTopicAsync(routingKey, MessageSerializer.Serialize(message, typeof(TMessage)),
             NewHeaders(typeof(TMessage), options).ToDictionary(), delaySeconds, cancellationToken);
     }
 
@@ -128,10 +141,10 @@ public sealed class PgmqPublisher(INpgmqClient client, PgmqTopology topology, IL
         IReadOnlyDictionary<string, object>[] headers =
             [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
 
-        List<NpgmqSendTopicResult> sent =
-            await client.SendBatchTopicAsync(routingKey, bodies, headers, delaySeconds, cancellationToken);
+        IReadOnlyList<string> sent =
+            await _client.SendBatchTopicAsync(routingKey, bodies, headers, delaySeconds, cancellationToken);
 
-        return sent.Select(s => s.QueueName).Distinct(StringComparer.Ordinal).Count();
+        return sent.Distinct(StringComparer.Ordinal).Count();
     }
 
     /// <summary>
@@ -176,16 +189,18 @@ public sealed class PgmqPublisher(INpgmqClient client, PgmqTopology topology, IL
 
     private Task<long> SendAsync(string queueName, string body, MessageHeaders headers, TimeSpan? delay,
         CancellationToken cancellationToken)
-        => delay is { } d && d > TimeSpan.Zero
-            ? client.SendAsync(queueName, body, headers.ToDictionary(), DateTimeOffset.UtcNow + d, cancellationToken)
-            : client.SendAsync(queueName, body, headers.ToDictionary(), cancellationToken);
+        => _client.SendAsync(queueName, body, headers.ToDictionary(), DeliverAt(delay), cancellationToken);
+
+    /// <summary>When a delayed message becomes visible, or null to send it visible at once.</summary>
+    private static DateTimeOffset? DeliverAt(TimeSpan? delay)
+        => delay is { } d && d > TimeSpan.Zero ? DateTimeOffset.UtcNow + d : null;
 
     private IReadOnlyList<string> QueuesFor(Type messageType)
     {
-        IReadOnlyList<string> queues = topology.QueuesFor(messageType);
+        IReadOnlyList<string> queues = _topology.QueuesFor(messageType);
         if (queues.Count == 0)
         {
-            logger.LogDebug("No queue is subscribed to {MessageType}; the message goes nowhere", messageType.FullName);
+            _logger.LogDebug("No queue is subscribed to {MessageType}; the message goes nowhere", messageType.FullName);
         }
 
         return queues;

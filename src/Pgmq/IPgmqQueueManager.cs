@@ -2,8 +2,9 @@ namespace Pgmq;
 
 /// <summary>
 /// Manages queues and everything around them: creating and dropping queues, metrics, topic bindings, insert
-/// notifications and FIFO indexes. Each method is one pgmq function; its summary names it. Pgmq.Hosting sets up the
-/// consumers' queues itself, so this is for what an application does on its own.
+/// notifications, FIFO indexes, and deleting, archiving or hiding messages by id. Each method is one pgmq function;
+/// its summary names it. Pgmq.Hosting sets up the consumers' queues itself, so this is for what an application does
+/// on its own.
 /// </summary>
 public interface IPgmqQueueManager
 {
@@ -97,4 +98,37 @@ public interface IPgmqQueueManager
 
     /// <summary>Indexes the FIFO group header of every queue (<c>pgmq.create_fifo_indexes_all</c>).</summary>
     Task CreateFifoIndexesAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>Deletes one message (<c>pgmq.delete</c>).</summary>
+    /// <returns>True when the message existed.</returns>
+    Task<bool> DeleteMessageAsync(string queueName, long messageId, CancellationToken cancellationToken = default);
+
+    /// <summary>Deletes several messages in one call (<c>pgmq.delete</c> with an array).</summary>
+    /// <returns>The ids that existed and were deleted.</returns>
+    Task<IReadOnlyList<long>> DeleteMessagesAsync(string queueName, IReadOnlyCollection<long> messageIds,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Moves one message to the queue's archive (<c>pgmq.archive</c>).</summary>
+    /// <returns>True when the message existed.</returns>
+    Task<bool> ArchiveMessageAsync(string queueName, long messageId, CancellationToken cancellationToken = default);
+
+    /// <summary>Moves several messages to the queue's archive in one call (<c>pgmq.archive</c> with an array).</summary>
+    /// <returns>The ids that existed and were archived.</returns>
+    Task<IReadOnlyList<long>> ArchiveMessagesAsync(string queueName, IReadOnlyCollection<long> messageIds,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Hides one message for <paramref name="timeout"/> from now, rounded up to whole seconds; zero makes it visible at
+    /// once (<c>pgmq.set_vt</c>).
+    /// </summary>
+    /// <returns>True when the message existed.</returns>
+    Task<bool> SetVisibilityTimeoutAsync(string queueName, long messageId, TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Hides several messages for <paramref name="timeout"/> from now in one call (<c>pgmq.set_vt</c> with an array).
+    /// </summary>
+    /// <returns>The ids that existed and were updated.</returns>
+    Task<IReadOnlyList<long>> SetVisibilityTimeoutAsync(string queueName, IReadOnlyCollection<long> messageIds,
+        TimeSpan timeout, CancellationToken cancellationToken = default);
 }
