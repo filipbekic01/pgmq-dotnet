@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Pgmq;
 using Pgmq.Benchmarks;
 
 // Throughput benchmark: pushes messages through PGMQ queues whose consumers do nothing, and compares the speed with
@@ -10,14 +11,27 @@ using Pgmq.Benchmarks;
 //   dotnet run -c Release --project benchmarks/Pgmq.Benchmarks
 //   dotnet run -c Release --project benchmarks/Pgmq.Benchmarks -- --messages 100000 --queues 100 --runs 3 --instances 1
 //   dotnet run -c Release --project benchmarks/Pgmq.Benchmarks -- --save-baseline
+//   dotnet run -c Release --project benchmarks/Pgmq.Benchmarks -- --matrix
+//   dotnet run -c Release --project benchmarks/Pgmq.Benchmarks -- --matrix --queues 1,10,100 --messages 50000
+//
+// --matrix pushes the same messages through each queue count in turn (default 1, 10, 50, 100, 200; one run each
+// unless --runs is given) and writes the chart in the README to docs/benchmark.svg, or to --chart.
+// --notifications off measures without LISTEN/NOTIFY, so long polling alone.
 //
 // Numbers are only comparable on the same machine: save the baseline where you compare, and compare before and
 // after a change on that machine. Exit code 1 if a run lost, duplicated or archived a message, or logged an error;
 // 2 if --fail-on-regression is given and a number got worse than --threshold percent.
 
 Dictionary<string, string?> options = ParseArgs(args);
+bool matrix = options.ContainsKey("matrix");
 int messages = Int("messages", 100_000);
-int queues = Int("queues", 100);
+int[] queueCounts = matrix
+    ? [.. (options.GetValueOrDefault("queues") ?? "1,10,50,100,200").Split(',').Select(q => int.Parse(q, CultureInfo.InvariantCulture))]
+    : [Int("queues", 100)];
+int queues = queueCounts.Max();
+Action<PgmqOptions>? configure = options.GetValueOrDefault("notifications") == "off"
+    ? o => o.UseInsertNotifications = false
+    : null;
 int runs = Int("runs", 3);
 int instances = Int("instances", 1);
 double threshold = double.Parse(options.GetValueOrDefault("threshold") ?? "10", CultureInfo.InvariantCulture);
@@ -28,11 +42,32 @@ LoadMode[] modes = options.GetValueOrDefault("mode") switch
     _ => [LoadMode.Drain, LoadMode.Live],
 };
 
-Console.WriteLine($"Pgmq benchmark: {messages:N0} messages over {queues} queues, {instances} instance(s), {runs} runs per mode, " +
+if (matrix)
+{
+    runs = options.ContainsKey("runs") ? runs : 1;
+}
+
+Console.WriteLine($"Pgmq benchmark: {messages:N0} messages over {string.Join(", ", queueCounts)} queues, {instances} instance(s), {runs} runs per mode, " +
                   $"{Environment.ProcessorCount} cores, {RuntimeInformation.OSDescription}");
 
 await using PgmqContainer container = new();
 string connectionString = options.GetValueOrDefault("connection") ?? await StartContainerAsync(container);
+
+if (matrix)
+{
+    (List<MatrixRow> rows, bool matrixClean) = await Matrix.RunAsync(connectionString, messages, queueCounts, runs, instances, configure);
+    string chartPath = options.GetValueOrDefault("chart") ?? Path.Combine(RepositoryRoot(), "docs", "benchmark.svg");
+    File.WriteAllText(chartPath, Matrix.Svg(rows, messages));
+    Console.WriteLine($"Wrote the chart to {chartPath}");
+
+    if (!matrixClean)
+    {
+        Console.WriteLine("FAILED: a run lost, duplicated or archived messages, left some on a queue, or logged an error.");
+        return 1;
+    }
+
+    return 0;
+}
 
 Dictionary<LoadMode, LoadResult> medians = [];
 bool clean = true;
@@ -40,12 +75,12 @@ bool clean = true;
 foreach (LoadMode mode in modes)
 {
     // A small warmup run: JIT, connection pool and Postgres caches, none of it measured.
-    await new LoadScenario(connectionString, Math.Min(messages, 5_000), queues) { Instances = instances }.RunAsync(mode);
+    await new LoadScenario(connectionString, Math.Min(messages, 5_000), queues, configure) { Instances = instances }.RunAsync(mode);
 
     List<LoadResult> results = [];
     for (int run = 1; run <= runs; run++)
     {
-        LoadResult result = await new LoadScenario(connectionString, messages, queues) { Instances = instances }.RunAsync(mode);
+        LoadResult result = await new LoadScenario(connectionString, messages, queues, configure) { Instances = instances }.RunAsync(mode);
         results.Add(result);
         Console.WriteLine($"  {mode} run {run}: {Describe(result)}");
         clean &= result.Clean;
@@ -166,14 +201,15 @@ static bool PrintComparison(JsonObject now, JsonObject? baseline, double thresho
     return regressed;
 }
 
-static string BaselinePath()
+static string BaselinePath() => Path.Combine(RepositoryRoot(), "benchmarks", "Pgmq.Benchmarks", "baseline.json");
+
+static string RepositoryRoot()
 {
     for (DirectoryInfo? dir = new(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
     {
-        string candidate = Path.Combine(dir.FullName, "benchmarks", "Pgmq.Benchmarks", "baseline.json");
-        if (Directory.Exists(Path.GetDirectoryName(candidate)))
+        if (Directory.Exists(Path.Combine(dir.FullName, "benchmarks", "Pgmq.Benchmarks")))
         {
-            return candidate;
+            return dir.FullName;
         }
     }
 

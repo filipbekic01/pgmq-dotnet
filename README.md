@@ -9,6 +9,8 @@ with long polling as the fallback.
 
 > Early alpha (`0.1.0-alpha.1`). The API may change before 1.0.
 
+![Throughput: 100,000 messages over 1 to 200 queues](https://raw.githubusercontent.com/filipbekic01/pgmq-dotnet/main/docs/benchmark.svg)
+
 ## Run it
 
 1. Start PostgreSQL with pgmq:
