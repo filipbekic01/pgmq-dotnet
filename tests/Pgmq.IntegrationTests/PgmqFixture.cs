@@ -157,6 +157,7 @@ public sealed class TransportHarness : IAsyncDisposable
         options.DrainGrace = TimeSpan.FromMilliseconds(500);
         options.MinIdleDelay = TimeSpan.FromMilliseconds(50);
         options.MaxIdleDelay = TimeSpan.FromMilliseconds(200);
+        options.LongPollTimeout = TimeSpan.FromSeconds(2);
         options.StallAfter = TimeSpan.FromSeconds(5);
         return options;
     }

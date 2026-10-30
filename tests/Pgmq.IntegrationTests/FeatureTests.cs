@@ -79,8 +79,8 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     {
         await using TransportHarness harness = await StartAsync([typeof(NotifiedConsumer)], o =>
         {
-            o.UseInsertNotifications = true;
             o.InsertNotificationThrottle = TimeSpan.Zero;
+            o.LongPollTimeout = null;
             o.MinIdleDelay = TimeSpan.FromSeconds(15);
             o.MaxIdleDelay = TimeSpan.FromSeconds(15);
             o.StallAfter = TimeSpan.FromMinutes(1);
@@ -97,10 +97,72 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task Insert_notifications_Should_be_on_by_default_with_long_polling_as_the_fallback()
+    {
+        PgmqOptions defaults = new();
+
+        Assert.True(defaults.UseInsertNotifications);
+        Assert.NotNull(defaults.LongPollTimeout);
+
+        await using TransportHarness harness = await StartAsync(typeof(FallbackConsumer));
+
+        Assert.Contains(await db.Queues.ListInsertNotificationsAsync(Ct), n => n.QueueName == "t_fallback");
+    }
+
+    [Fact]
+    public async Task Without_auto_setup_Should_create_nothing_and_fail_on_a_missing_queue()
+    {
+        await db.Queues.InitAsync(Ct);
+        if ((await db.Queues.ListQueuesAsync(Ct)).Any(q => q.QueueName == "t_fallback"))
+        {
+            await db.Queues.DropQueueAsync("t_fallback", Ct);
+        }
+
+        await Assert.ThrowsAnyAsync<InvalidOperationException>(async () =>
+        {
+            await using TransportHarness harness = await StartAsync([typeof(FallbackConsumer)], o => o.AutoSetup = false);
+        });
+
+        Assert.DoesNotContain(await db.Queues.ListQueuesAsync(Ct), q => q.QueueName == "t_fallback");
+
+        await db.Queues.CreateQueueAsync("t_fallback", cancellationToken: Ct);
+        await using TransportHarness started = await StartAsync([typeof(FallbackConsumer)], o => o.AutoSetup = false);
+        await started.Bus.PublishAsync(new FallbackMessage(), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "handled from the existing queue");
+    }
+
+    [Fact]
+    public async Task A_lost_listener_Should_leave_the_queue_long_polling_until_it_reconnects()
+    {
+        await using TransportHarness harness = await StartAsync([typeof(FallbackConsumer)], o =>
+        {
+            o.InsertNotificationThrottle = TimeSpan.Zero;
+            o.LongPollTimeout = TimeSpan.FromSeconds(3);
+            o.MinIdleDelay = TimeSpan.FromMilliseconds(100);
+            o.MaxIdleDelay = TimeSpan.FromSeconds(15);
+            o.StallAfter = TimeSpan.FromMinutes(1);
+        });
+
+        // Let the listener come up, then cut its connection. It waits 5 seconds before reconnecting.
+        await Task.Delay(TimeSpan.FromSeconds(2), Ct);
+        object? killed = await db.ScalarObjectAsync(
+            "select count(pg_terminate_backend(pid)) from pg_stat_activity " +
+            "where query ilike 'LISTEN %t_fallback%' and pid <> pg_backend_pid()");
+        Assert.Equal(1L, killed);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(500), Ct);
+        await harness.Bus.PublishAsync(new FallbackMessage(), Ct);
+
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, TimeSpan.FromSeconds(3),
+            "picked up by a long poll, before the listener reconnects or the 15 second poll");
+    }
+
+    [Fact]
     public async Task A_long_poll_Should_pick_up_a_message_while_the_database_waits()
     {
         await using TransportHarness harness = await StartAsync([typeof(LongPollConsumer)], o =>
         {
+            o.UseInsertNotifications = false;
             o.LongPollTimeout = TimeSpan.FromSeconds(3);
             o.MinIdleDelay = TimeSpan.FromMilliseconds(100);
             o.MaxIdleDelay = TimeSpan.FromSeconds(15);
@@ -370,6 +432,18 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         public Task HandleAsync(PgmqConsumeContext<NotifiedMessage> context, CancellationToken cancellationToken)
         {
             probe.Record(nameof(NotifiedConsumer), context.Message, context);
+            return Task.CompletedTask;
+        }
+    }
+
+    public sealed record FallbackMessage;
+
+    [QueueName("t_fallback")]
+    public sealed class FallbackConsumer(Probe probe) : IPgmqConsumer<FallbackMessage>
+    {
+        public Task HandleAsync(PgmqConsumeContext<FallbackMessage> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(FallbackConsumer), context.Message, context);
             return Task.CompletedTask;
         }
     }

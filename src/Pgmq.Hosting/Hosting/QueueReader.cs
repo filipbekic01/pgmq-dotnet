@@ -21,10 +21,16 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
 {
     private const string Columns = "msg_id, read_ct, message::text, headers::text";
 
+    /// <summary>
+    /// Reads up to <paramref name="quantity"/> messages. With <paramref name="longPoll"/>, which needs
+    /// <see cref="CanLongPoll"/>, an empty queue is waited on inside the database for up to
+    /// <see cref="PgmqOptions.LongPollTimeout"/>.
+    /// </summary>
     public async Task<List<QueueMessage>> ReadAsync(ConsumerRegistration consumer, int leaseSeconds, int quantity,
-        CancellationToken cancellationToken)
+        bool longPoll, CancellationToken cancellationToken)
     {
-        await using NpgsqlCommand command = dataSource.CreateCommand(Sql(consumer));
+        longPoll = longPoll && CanLongPoll(consumer);
+        await using NpgsqlCommand command = dataSource.CreateCommand(Sql(consumer, longPoll));
         command.Parameters.Add(new NpgsqlParameter { Value = consumer.QueueName, NpgsqlDbType = NpgsqlDbType.Text });
 
         if (!consumer.AtMostOnce)
@@ -34,7 +40,7 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
 
         command.Parameters.Add(new NpgsqlParameter { Value = quantity, NpgsqlDbType = NpgsqlDbType.Integer });
 
-        if (LongPolls(consumer))
+        if (longPoll)
         {
             int pollSeconds = (int)Math.Ceiling(options.LongPollTimeout!.Value.TotalSeconds);
             int intervalMs = Math.Max(10, (int)options.MinIdleDelay.TotalMilliseconds);
@@ -67,10 +73,13 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
         return messages;
     }
 
-    /// <summary>Whether this consumer's reads wait inside the database for a message.</summary>
-    public bool LongPolls(ConsumerRegistration consumer) => options.LongPollTimeout is not null && !consumer.AtMostOnce;
+    /// <summary>
+    /// Whether this consumer's reads can wait inside the database for a message: long polling is on, and the consumer
+    /// does not read with <c>pop</c>, which pgmq cannot long-poll.
+    /// </summary>
+    public bool CanLongPoll(ConsumerRegistration consumer) => options.LongPollTimeout is not null && !consumer.AtMostOnce;
 
-    private string Sql(ConsumerRegistration consumer)
+    private static string Sql(ConsumerRegistration consumer, bool poll)
     {
         if (consumer.AtMostOnce)
         {
@@ -86,7 +95,6 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
             _ => throw new InvalidOperationException($"Unknown read mode {consumer.ReadMode}."),
         };
 
-        bool poll = LongPolls(consumer);
         string arguments = (poll, consumer.Filter is not null) switch
         {
             (false, false) => "$1, $2, $3",

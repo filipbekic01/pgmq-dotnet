@@ -16,10 +16,14 @@ All notable changes to this project are recorded here. The format follows
 - Consumers: `ReadMode` (`Grouped`, `GroupedRoundRobin`, `GroupedHead` FIFO reads, in order per group),
   `QueueType` with partition settings, `AtMostOnce` (`pgmq.pop`), `Filter` (conditional read) and `[TopicBinding]`.
   `context.GroupId` and `context.Headers` reach the consumer and survive a redelivery.
-- `PgmqOptions.UseInsertNotifications` wakes idle queues through LISTEN/NOTIFY; `PgmqOptions.LongPollTimeout`
-  long-polls in the database.
+- `PgmqOptions.UseInsertNotifications` wakes idle queues through LISTEN/NOTIFY, on by default.
+  `PgmqOptions.LongPollTimeout` (5 s by default) long-polls in the database whenever notifications are not live.
+- `PgmqOptions.AutoSetup` (on by default) creates the extension, queues and triggers on start; off only checks that
+  they exist.
 
 ### Changed
+
+- The README is a short introduction; the details moved to `docs/guide.md`.
 
 - `INpgmqClient`, the worker and the queue manager share one `NpgsqlDataSource`.
 - The worker reads through pgmq's SQL functions directly rather than through Npgmq.

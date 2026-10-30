@@ -4,7 +4,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Npgmq;
-using Npgsql;
 
 namespace Pgmq.Hosting;
 
@@ -43,15 +42,18 @@ namespace Pgmq.Hosting;
 /// the message is gone from the queue once read, so there is no lease to renew and nothing to settle.
 /// </para>
 /// <para>
-/// <b>Waking.</b> An idle queue polls, backing off to <see cref="PgmqOptions.MaxIdleDelay"/>. With insert
-/// notifications on, a notification ends the wait at once; with <see cref="PgmqOptions.LongPollTimeout"/> set, the
-/// database does the waiting.
+/// <b>Waking.</b> An idle queue with live insert notifications (LISTEN/NOTIFY) waits for one, and still reads again
+/// after <see cref="PgmqOptions.MaxIdleDelay"/> at the latest in case a notification was throttled or lost. When its
+/// notifications are not live (turned off, not set up, or the listener is reconnecting) it long-polls in the database
+/// for up to <see cref="PgmqOptions.LongPollTimeout"/>. A queue that cannot long-poll either (an at-most-once consumer,
+/// or <see cref="PgmqOptions.LongPollTimeout"/> null) polls from here, backing off to
+/// <see cref="PgmqOptions.MaxIdleDelay"/>.
 /// </para>
 /// </summary>
 internal sealed class ConsumerWorker(
     INpgmqClient client,
     QueueReader reader,
-    NpgsqlDataSource dataSource,
+    InsertListener listener,
     ConsumerRegistry registry,
     PgmqPublisher publisher,
     IServiceScopeFactory scopeFactory,
@@ -119,11 +121,10 @@ internal sealed class ConsumerWorker(
         ];
 
         Dictionary<string, Action> notified = registry.Consumers
-            .Where(c => c.UseInsertNotifications)
+            .Where(c => listener.IsEnabled(c.QueueName))
             .ToDictionary(c => c.QueueName, c => (Action)_queues[c.QueueName].Wake, StringComparer.Ordinal);
         if (notified.Count > 0)
         {
-            InsertListener listener = new(dataSource, logger);
             running.Add(Task.Run(() => listener.RunAsync(notified, stoppingToken), CancellationToken.None));
         }
 
@@ -188,10 +189,13 @@ internal sealed class ConsumerWorker(
                 free++;
             }
 
+            // Notifications first; long polling only while they are not live.
+            bool longPoll = !listener.IsLive(queue) && reader.CanLongPoll(state.Consumer);
+
             List<QueueMessage> messages;
             try
             {
-                messages = await reader.ReadAsync(state.Consumer, LeaseSeconds, free, stoppingToken);
+                messages = await reader.ReadAsync(state.Consumer, LeaseSeconds, free, longPoll, stoppingToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
             {
@@ -213,7 +217,7 @@ internal sealed class ConsumerWorker(
 
             if (messages.Count == 0)
             {
-                if (reader.LongPolls(state.Consumer))
+                if (longPoll)
                 {
                     // The database already waited for a message.
                     continue;
