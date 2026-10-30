@@ -10,10 +10,13 @@ namespace Pgmq;
 /// </summary>
 public interface IPgmqQueueManager
 {
-    /// <summary>Creates the pgmq extension if it is missing (<c>create extension if not exists pgmq</c>).</summary>
+    /// <summary>
+    /// Installs pgmq, or upgrades it, through <see cref="PgmqMigrator"/>: the extension where the server has it, the
+    /// embedded SQL otherwise. Does nothing when pgmq is current.
+    /// </summary>
     Task InitAsync(CancellationToken cancellationToken = default);
 
-    /// <summary>The installed pgmq version, or null when the extension is not installed.</summary>
+    /// <summary>The installed pgmq version, as an extension or as SQL; null when pgmq is not installed.</summary>
     Task<string?> GetVersionAsync(CancellationToken cancellationToken = default);
 
     /// <summary>

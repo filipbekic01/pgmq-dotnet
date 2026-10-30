@@ -23,13 +23,31 @@ public sealed class PgmqOptions
     public bool RunConsumers { get; set; } = true;
 
     /// <summary>
-    /// Set up the database on start: create the pgmq extension (and pg_partman for partitioned queues), every
-    /// consumer's queue, its FIFO index, topic bindings and insert notification trigger. All of it is idempotent. Turn
-    /// off when the database is managed elsewhere, for example by migrations or a user without the rights to create
-    /// extensions: Pgmq then only checks that the extension and every queue exist, and uses the insert notifications
-    /// that are already there.
+    /// Set up the database on start, so it needs no migrations of its own: create the database if it is missing
+    /// (<see cref="CreateDatabase"/>), install or upgrade pgmq (<see cref="InstallMode"/>; pg_partman too for
+    /// partitioned queues), then create every consumer's queue, its FIFO index, topic bindings and insert notification
+    /// trigger. All of it is idempotent and safe from several instances at once, so every start runs it and keeps the
+    /// schema current. Turn off when the database is managed elsewhere: Pgmq then only checks that pgmq and every
+    /// queue exist, and uses the insert notifications that are already there.
     /// </summary>
     public bool AutoSetup { get; set; } = true;
+
+    /// <summary>
+    /// With <see cref="AutoSetup"/>, create the database named in <see cref="ConnectionString"/> when it does not
+    /// exist, connecting to <see cref="MaintenanceDatabase"/> to do so; the user then needs <c>CREATEDB</c>. Needs
+    /// <see cref="ConnectionString"/>: a <see cref="DataSource"/> does not hand out its password, so with one the
+    /// database must already exist.
+    /// </summary>
+    public bool CreateDatabase { get; set; } = true;
+
+    /// <summary>The database <see cref="CreateDatabase"/> connects to when the target is missing.</summary>
+    public string MaintenanceDatabase { get; set; } = "postgres";
+
+    /// <summary>
+    /// How <see cref="AutoSetup"/> installs pgmq: as the extension where the server has it, as the embedded SQL
+    /// otherwise (<see cref="PgmqInstallMode.Auto"/>), or one of the two only.
+    /// </summary>
+    public PgmqInstallMode InstallMode { get; set; } = PgmqInstallMode.Auto;
 
     /// <summary>
     /// Stop the host from starting when the pgmq extension or the queues cannot be set up. Turn off to run without
@@ -135,6 +153,7 @@ public sealed class PgmqOptions
             throw new InvalidOperationException($"Set exactly one of {nameof(ConnectionString)} and {nameof(DataSource)}.");
         }
 
+        ArgumentException.ThrowIfNullOrEmpty(MaintenanceDatabase, nameof(MaintenanceDatabase));
         ArgumentOutOfRangeException.ThrowIfLessThan(DefaultConcurrency, 1, nameof(DefaultConcurrency));
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxAttempts, 1, nameof(MaxAttempts));
         ArgumentOutOfRangeException.ThrowIfLessThan(Lease, TimeSpan.FromSeconds(1), nameof(Lease));

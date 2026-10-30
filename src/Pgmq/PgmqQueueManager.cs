@@ -12,7 +12,7 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
 
     /// <inheritdoc />
     public async Task InitAsync(CancellationToken cancellationToken = default)
-        => await ExecuteAsync("create extension if not exists pgmq cascade", [], cancellationToken);
+        => await new PgmqMigrator(dataSource).MigrateAsync(PgmqInstallMode.Auto, cancellationToken);
 
     /// <summary>Creates the pg_partman extension that partitioned queues need, if it is missing.</summary>
     internal async Task InitPartmanAsync(CancellationToken cancellationToken = default)
@@ -20,8 +20,7 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
 
     /// <inheritdoc />
     public async Task<string?> GetVersionAsync(CancellationToken cancellationToken = default)
-        => await ScalarAsync<string?>("select extversion from pg_catalog.pg_extension where extname = 'pgmq'", [],
-            cancellationToken);
+        => await new PgmqMigrator(dataSource).GetInstalledVersionAsync(cancellationToken);
 
     /// <inheritdoc />
     public async Task CreateQueueAsync(string queueName, PgmqQueueOptions? options = null,

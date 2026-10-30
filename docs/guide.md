@@ -73,7 +73,7 @@ Npgsql and nothing else in between.
 | Change or stop notifications | `update_notify_insert`, `disable_notify_insert` | ✅ | `IPgmqQueueManager.UpdateInsertNotificationsAsync` / `DisableInsertNotificationsAsync` |
 | List notification throttles | `list_notify_insert_throttles` | ✅ | `IPgmqQueueManager.ListInsertNotificationsAsync` |
 | FIFO indexes | `create_fifo_index`, `create_fifo_indexes_all` | ✅ | Worker setup for grouped consumers, or `IPgmqQueueManager.CreateFifoIndexAsync` / `CreateFifoIndexesAsync` |
-| Extension version | | ✅ | `IPgmqQueueManager.GetVersionAsync` |
+| Extension version | | ✅ | `IPgmqQueueManager.GetVersionAsync` (extension or SQL install) |
 
 ✅ supported · ➖ not needed
 
@@ -140,12 +140,36 @@ await queues.PurgeQueueAsync("order_created");
 await queues.BindTopicAsync("logs.#", "log_sink");
 ```
 
+## Database setup
+
+With `AutoSetup` on (the default), every start runs the same steps. Each is idempotent, so a start that finds
+everything current changes nothing:
+
+1. **Database.** If the database in `ConnectionString` does not exist, it is created through `MaintenanceDatabase`.
+   Two instances racing to create it both succeed.
+2. **pgmq.** Under an advisory lock, in one transaction (`PgmqMigrator`):
+   - Installed as an extension: `alter extension pgmq update` when the server has a newer version.
+   - Installed as SQL: the embedded upgrade scripts from the recorded version on, each recorded in
+     `pgmq.__pgmq_migrations`.
+   - Not installed: `create extension pgmq` where the server has it, otherwise the embedded `pgmq.sql`
+     (`InstallMode` narrows this).
+   - A `pgmq` schema with no version record is refused rather than guessed at.
+3. **Queues.** Each consumer's queue, FIFO index, topic bindings and insert notification trigger.
+
+The SQL install follows what upstream calls a versioned SQL-only install. It uses the same table and lock key as the
+Rust client, so a database installed by either one can be upgraded by both. The embedded scripts are pgmq's own, at
+the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used without the host: call
+`EnsureDatabaseAsync` and `MigrateAsync` from a deploy step.
+
 ## Configuration
 
 | Option | Default | |
 |---|---|---|
 | `ConnectionString` / `DataSource` | | One of the two is required. |
-| `AutoSetup` | `true` | Create the extension, queues and triggers on start. Off to only check they exist. |
+| `AutoSetup` | `true` | Create the database, install or upgrade pgmq, and create queues and triggers on start. Off to only check they exist. |
+| `CreateDatabase` | `true` | With `AutoSetup`, create the database in `ConnectionString` when missing (needs `CREATEDB`). Not with `DataSource`. |
+| `MaintenanceDatabase` | `"postgres"` | Where `CreateDatabase` connects to create it. |
+| `InstallMode` | `Auto` | `Auto`: the extension where available, the embedded SQL otherwise. `Extension` or `Sql` for one only. |
 | `RunConsumers` | `true` | Off for a host that only publishes. |
 | `FailOnSetupError` | `true` | Off to start without Pgmq when the database lacks it; the health check reports it. |
 | `DefaultConcurrency` | `8` | Messages per queue at once, per instance. |

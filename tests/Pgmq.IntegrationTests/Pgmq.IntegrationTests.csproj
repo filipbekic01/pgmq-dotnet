@@ -11,6 +11,11 @@
     </ItemGroup>
 
     <ItemGroup>
+        <!-- pgmq 1.12.0 as plain SQL, the starting point of the upgrade test. -->
+        <None Include="Sql\pgmq-1.12.0.sql" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+    <ItemGroup>
         <Using Include="Xunit" />
     </ItemGroup>
 
