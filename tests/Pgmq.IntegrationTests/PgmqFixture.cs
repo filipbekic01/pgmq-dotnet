@@ -14,12 +14,21 @@ namespace Pgmq.IntegrationTests;
 public sealed class PgmqFixture : IAsyncLifetime
 {
     private readonly PgmqContainer _container = new();
+    private NpgsqlDataSource? _dataSource;
 
     public string ConnectionString => _container.ConnectionString;
 
     public async ValueTask InitializeAsync() => await _container.StartAsync();
 
-    public ValueTask DisposeAsync() => _container.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        if (_dataSource is not null)
+        {
+            await _dataSource.DisposeAsync();
+        }
+
+        await _container.DisposeAsync();
+    }
 
     /// <summary>Empties a queue and its archive, so a test starts from nothing whatever ran before it.</summary>
     public async Task ResetAsync(string queue)
@@ -32,6 +41,18 @@ public sealed class PgmqFixture : IAsyncLifetime
 
     /// <summary>Messages waiting on <paramref name="queue"/>, visible or not.</summary>
     public Task<long> CountAsync(string queue) => ScalarAsync($"select count(*) from pgmq.q_{queue}");
+
+    /// <summary>A queue manager on this database.</summary>
+    public PgmqQueueManager Queues => new(_dataSource ??= NpgsqlDataSource.Create(ConnectionString));
+
+    /// <summary>Runs <paramref name="sql"/> and returns its first value.</summary>
+    public async Task<object?> ScalarObjectAsync(string sql)
+    {
+        await using NpgsqlConnection connection = new(ConnectionString);
+        await connection.OpenAsync();
+        await using NpgsqlCommand command = new(sql, connection);
+        return await command.ExecuteScalarAsync();
+    }
 
     /// <summary>Messages archived from <paramref name="queue"/>.</summary>
     public Task<long> ArchivedAsync(string queue) => ScalarAsync($"select count(*) from pgmq.a_{queue}");
@@ -155,7 +176,7 @@ public sealed class Probe
 
     public void Record(string consumer, object message, PgmqConsumeContext context)
         => Deliveries.Enqueue(new(consumer, message, context.RedeliveryCount, context.MessageId,
-            Activity.Current?.TraceId.ToString()));
+            Activity.Current?.TraceId.ToString(), context.GroupId, context.Headers));
 
     public IReadOnlyList<Delivered> Of(string consumer) => [.. Deliveries.Where(d => d.Consumer == consumer)];
 
@@ -182,7 +203,8 @@ public sealed class Probe
         }
     }
 
-    public sealed record Delivered(string Consumer, object Message, int RedeliveryCount, Guid? MessageId, string? TraceId);
+    public sealed record Delivered(string Consumer, object Message, int RedeliveryCount, Guid? MessageId, string? TraceId,
+        string? GroupId = null, IReadOnlyDictionary<string, string>? Headers = null);
 }
 
 public static class Eventually

@@ -6,18 +6,27 @@ namespace Pgmq.Hosting;
 
 /// <summary>
 /// Puts a message back on the queue it was read from, after a delay, with the given redelivery count. A
-/// <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message.
+/// <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message; a group and headers go
+/// with it.
 /// </summary>
 internal delegate Task SendBack(object message, Type messageType, TimeSpan delay, int redeliveryCount, Guid? messageId,
-    CancellationToken cancellationToken);
+    string? groupId, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken);
 
-/// <summary>How a message reached its consumer: where to publish, how to send it back, and the outbox its sends wait in.</summary>
+/// <summary>
+/// How a message reached its consumer: where to publish, how to send it back, the outbox its sends wait in, and the
+/// group and headers it came with.
+/// </summary>
 internal sealed record Delivery(
     IPgmqPublisher Publisher,
     Guid? MessageId,
     int RedeliveryCount,
     Outbox Outbox,
-    SendBack SendBack);
+    SendBack SendBack)
+{
+    public string? GroupId { get; init; }
+
+    public IReadOnlyDictionary<string, string>? Headers { get; init; }
+}
 
 /// <summary>
 /// Calls <see cref="IPgmqConsumer{TMessage}.HandleAsync"/> when the message type is only known at run time. The
@@ -55,7 +64,7 @@ internal static class ConsumerDispatcher
 
         return consumer.HandleAsync(
             new PgmqConsumeContext<TMessage>((TMessage)message, delivery.Publisher, delivery.SendBack, delivery.Outbox,
-                delivery.MessageId, delivery.RedeliveryCount),
+                delivery.MessageId, delivery.RedeliveryCount, delivery.GroupId, delivery.Headers),
             cancellationToken);
     }
 }

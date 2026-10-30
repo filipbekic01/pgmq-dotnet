@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace Pgmq.Hosting;
 
@@ -18,13 +19,32 @@ internal sealed record ConsumerDescriptor(Type ConsumerType, PgmqConsumerOptions
         ];
 }
 
-/// <summary>A consumer with everything resolved: its queue, the types it takes, its concurrency and timeout.</summary>
+/// <summary>
+/// A consumer with everything resolved: its queue and how it is created and read, the types it takes, its concurrency
+/// and timeout.
+/// </summary>
 internal sealed record ConsumerRegistration(
     Type ConsumerType,
     string QueueName,
     IReadOnlyList<Type> MessageTypes,
     int Concurrency,
-    TimeSpan Timeout);
+    TimeSpan Timeout)
+{
+    public PgmqReadMode ReadMode { get; init; }
+
+    public PgmqQueueOptions Queue { get; init; } = PgmqQueueOptions.Standard;
+
+    public bool AtMostOnce { get; init; }
+
+    /// <summary>The JSON object a message must contain to be read, or null to read everything.</summary>
+    public string? Filter { get; init; }
+
+    public IReadOnlyList<string> TopicBindings { get; init; } = [];
+
+    public bool UseInsertNotifications { get; init; }
+
+    public bool IsGrouped => ReadMode != PgmqReadMode.Standard;
+}
 
 /// <summary>Every registered consumer, resolved against the options, and the topology they make.</summary>
 internal sealed class ConsumerRegistry
@@ -105,6 +125,75 @@ internal sealed class ConsumerRegistry
         ArgumentOutOfRangeException.ThrowIfLessThan(concurrency, 1, $"{type.Name} concurrency");
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero, $"{type.Name} timeout");
 
-        return new(type, queueName, descriptor.MessageTypes, concurrency, timeout);
+        PgmqReadMode readMode = descriptor.Options.ReadMode ?? attribute?.ReadMode ?? PgmqReadMode.Standard;
+        bool atMostOnce = descriptor.Options.AtMostOnce ?? attribute?.AtMostOnce ?? false;
+        string? filter = descriptor.Options.Filter ?? attribute?.Filter;
+
+        if (atMostOnce && readMode != PgmqReadMode.Standard)
+        {
+            throw new InvalidOperationException(
+                $"{type.Name} cannot be at-most-once and read in {readMode} mode: pgmq.pop has no grouped form.");
+        }
+
+        if (filter is not null)
+        {
+            if (readMode != PgmqReadMode.Standard || atMostOnce)
+            {
+                throw new InvalidOperationException(
+                    $"{type.Name} has a filter, which pgmq supports only in the Standard read mode without AtMostOnce.");
+            }
+
+            filter = NormalizeFilter(type, filter);
+        }
+
+        string[] bindings =
+        [
+            .. type.GetCustomAttributes<TopicBindingAttribute>().Select(a => a.Pattern)
+                .Concat(descriptor.Options.TopicBindings)
+                .Distinct(StringComparer.Ordinal),
+        ];
+        foreach (string pattern in bindings)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(pattern, $"{type.Name} topic binding");
+        }
+
+        return new(type, queueName, descriptor.MessageTypes, concurrency, timeout)
+        {
+            ReadMode = readMode,
+            Queue = descriptor.Options.Queue ?? QueueOptionsFrom(attribute),
+            AtMostOnce = atMostOnce,
+            Filter = filter,
+            TopicBindings = bindings,
+            UseInsertNotifications = descriptor.Options.UseInsertNotifications ?? options.UseInsertNotifications,
+        };
+    }
+
+    private static PgmqQueueOptions QueueOptionsFrom(ConsumerOptionsAttribute? attribute)
+        => attribute switch
+        {
+            null or { QueueType: PgmqQueueType.Standard } => PgmqQueueOptions.Standard,
+            { QueueType: PgmqQueueType.Unlogged } => PgmqQueueOptions.Unlogged,
+            _ => PgmqQueueOptions.Partitioned(
+                attribute.PartitionInterval ?? PgmqQueueOptions.Standard.PartitionInterval,
+                attribute.RetentionInterval ?? PgmqQueueOptions.Standard.RetentionInterval),
+        };
+
+    /// <summary>Checks that a filter is a JSON object.</summary>
+    private static string NormalizeFilter(Type consumerType, string filter)
+    {
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(filter);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidOperationException($"The filter of {consumerType.Name} is not a JSON object.");
+            }
+
+            return document.RootElement.GetRawText();
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException($"The filter of {consumerType.Name} is not valid JSON.", ex);
+        }
     }
 }

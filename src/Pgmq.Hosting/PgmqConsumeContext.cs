@@ -13,14 +13,18 @@ public abstract class PgmqConsumeContext
     private readonly SendBack? _sendBack;
     private readonly Outbox? _outbox;
 
+    private static readonly IReadOnlyDictionary<string, string> NoHeaders = new Dictionary<string, string>();
+
     private protected PgmqConsumeContext(IPgmqPublisher? publisher, SendBack? sendBack, Outbox? outbox,
-        Guid? messageId, int redeliveryCount)
+        Guid? messageId, int redeliveryCount, string? groupId, IReadOnlyDictionary<string, string>? headers)
     {
         _publisher = publisher;
         _sendBack = sendBack;
         _outbox = outbox;
         MessageId = messageId;
         RedeliveryCount = redeliveryCount;
+        GroupId = groupId;
+        Headers = headers ?? NoHeaders;
     }
 
     /// <summary>The id the message was published with. It stays the same when the message is redelivered.</summary>
@@ -31,6 +35,22 @@ public abstract class PgmqConsumeContext
     /// <see cref="PgmqConsumeContext{TMessage}.RedeliverAsync"/>. Zero on the first delivery.
     /// </summary>
     public int RedeliveryCount { get; }
+
+    /// <summary>The FIFO group the message was published in (<see cref="PgmqPublishOptions.GroupId"/>), if any.</summary>
+    public string? GroupId { get; }
+
+    /// <summary>The application's own headers the message was published with (<see cref="PgmqPublishOptions.Headers"/>).</summary>
+    public IReadOnlyDictionary<string, string> Headers { get; }
+
+    /// <summary>Publishes <paramref name="message"/> with <paramref name="options"/> once this consumer succeeds.</summary>
+    public Task PublishAsync<TOther>(TOther message, PgmqPublishOptions options,
+        CancellationToken cancellationToken = default) where TOther : class
+        => SendAsync(ct => Publisher.PublishAsync(message, options, ct), cancellationToken);
+
+    /// <summary>Publishes <paramref name="message"/> to a topic once this consumer succeeds.</summary>
+    public Task PublishToTopicAsync<TOther>(string routingKey, TOther message,
+        CancellationToken cancellationToken = default) where TOther : class
+        => SendAsync(ct => Publisher.PublishToTopicAsync(routingKey, message, ct), cancellationToken);
 
     /// <summary>Publishes <paramref name="message"/> once this consumer succeeds.</summary>
     public Task PublishAsync<TOther>(TOther message, CancellationToken cancellationToken = default) where TOther : class
@@ -61,12 +81,13 @@ public abstract class PgmqConsumeContext
         where TOther : class
         => _sendBack is null
             ? SchedulePublishAsync(message, delay, cancellationToken)
-            : SendAsync(ct => _sendBack(message, typeof(TOther), delay, 0, null, ct), cancellationToken);
+            : SendAsync(ct => _sendBack(message, typeof(TOther), delay, 0, null, null, null, ct), cancellationToken);
 
     private protected Task SendBackAsync(object message, Type messageType, TimeSpan delay, int redeliveryCount)
         => _sendBack is null
             ? throw new InvalidOperationException("This message was not read from a queue, so it cannot go back to one.")
-            : SendAsync(ct => _sendBack(message, messageType, delay, redeliveryCount, MessageId, ct), default);
+            : SendAsync(ct => _sendBack(message, messageType, delay, redeliveryCount, MessageId, GroupId,
+                Headers.Count == 0 ? null : Headers, ct), default);
 
     /// <summary>Holds the send in the outbox, or sends it now when there is none (a test calling a consumer).</summary>
     private Task SendAsync(Func<CancellationToken, Task> send, CancellationToken cancellationToken)
@@ -96,15 +117,17 @@ public sealed class PgmqConsumeContext<TMessage> : PgmqConsumeContext where TMes
     /// <param name="publisher">Where the consumer's publishes go; null if it publishes nothing.</param>
     /// <param name="redeliveryCount">What <see cref="PgmqConsumeContext.RedeliveryCount"/> reports.</param>
     /// <param name="messageId">What <see cref="PgmqConsumeContext.MessageId"/> reports.</param>
+    /// <param name="groupId">What <see cref="PgmqConsumeContext.GroupId"/> reports.</param>
+    /// <param name="headers">What <see cref="PgmqConsumeContext.Headers"/> reports.</param>
     public PgmqConsumeContext(TMessage message, IPgmqPublisher? publisher = null, int redeliveryCount = 0,
-        Guid? messageId = null)
-        : this(message, publisher, sendBack: null, outbox: null, messageId, redeliveryCount)
+        Guid? messageId = null, string? groupId = null, IReadOnlyDictionary<string, string>? headers = null)
+        : this(message, publisher, sendBack: null, outbox: null, messageId, redeliveryCount, groupId, headers)
     {
     }
 
     internal PgmqConsumeContext(TMessage message, IPgmqPublisher? publisher, SendBack? sendBack, Outbox? outbox,
-        Guid? messageId, int redeliveryCount)
-        : base(publisher, sendBack, outbox, messageId, redeliveryCount)
+        Guid? messageId, int redeliveryCount, string? groupId = null, IReadOnlyDictionary<string, string>? headers = null)
+        : base(publisher, sendBack, outbox, messageId, redeliveryCount, groupId, headers)
     {
         ArgumentNullException.ThrowIfNull(message);
         Message = message;
@@ -115,8 +138,9 @@ public sealed class PgmqConsumeContext<TMessage> : PgmqConsumeContext where TMes
 
     /// <summary>
     /// Puts this message back on this consumer's queue after <paramref name="delay"/>, with the same
-    /// <see cref="PgmqConsumeContext.MessageId"/> and a <see cref="PgmqConsumeContext.RedeliveryCount"/> one higher.
-    /// The current delivery then completes normally.
+    /// <see cref="PgmqConsumeContext.MessageId"/>, group and headers, and a
+    /// <see cref="PgmqConsumeContext.RedeliveryCount"/> one higher. The current delivery then completes normally. In a
+    /// FIFO group the copy goes to the back of the group.
     /// </summary>
     public Task RedeliverAsync(TimeSpan delay)
         => SendBackAsync(Message, typeof(TMessage), delay, RedeliveryCount + 1);

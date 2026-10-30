@@ -9,29 +9,49 @@ namespace Pgmq;
 /// <summary>
 /// The pgmq headers every message carries. All values are written as strings, so they read back the same whatever
 /// the JSON converter makes of them. <see cref="TraceParent"/> and <see cref="TraceState"/> are the W3C trace context
-/// of the sender, so the consumer's span joins the trace that published the message.
+/// of the sender, so the consumer's span joins the trace that published the message. <see cref="GroupId"/> is pgmq's
+/// own FIFO group header, and <see cref="Custom"/> holds the application's headers.
 /// </summary>
 internal sealed record MessageHeaders(
     string MessageType,
     Guid? MessageId,
     int RedeliveryCount,
     string? TraceParent = null,
-    string? TraceState = null)
+    string? TraceState = null,
+    string? GroupId = null,
+    IReadOnlyDictionary<string, string>? Custom = null)
 {
+    public const string GroupKey = "x-pgmq-group";
     private const string MessageTypeKey = "message-type";
     private const string MessageIdKey = "message-id";
     private const string RedeliveryCountKey = "redelivery-count";
     private const string TraceParentKey = "traceparent";
     private const string TraceStateKey = "tracestate";
 
+    private static readonly HashSet<string> Reserved =
+        new([MessageTypeKey, MessageIdKey, RedeliveryCountKey, TraceParentKey, TraceStateKey, GroupKey],
+            StringComparer.Ordinal);
+
+    private static readonly IReadOnlyDictionary<string, string> NoHeaders = new Dictionary<string, string>();
+
+    /// <summary>The application's headers; empty when there are none.</summary>
+    public IReadOnlyDictionary<string, string> CustomHeaders => Custom ?? NoHeaders;
+
     /// <summary>Fresh headers for a message sent now, under the current trace.</summary>
-    public static MessageHeaders New(Type messageType, int redeliveryCount = 0, Guid? messageId = null)
+    public static MessageHeaders New(Type messageType, int redeliveryCount = 0, Guid? messageId = null,
+        string? groupId = null, IReadOnlyDictionary<string, string>? custom = null)
     {
         Activity? current = Activity.Current;
         bool w3c = current is { IdFormat: ActivityIdFormat.W3C };
 
+        if (custom is not null && custom.Keys.FirstOrDefault(Reserved.Contains) is { } reserved)
+        {
+            throw new ArgumentException($"The header \"{reserved}\" is Pgmq's own and cannot be set.", nameof(custom));
+        }
+
         return new(MessageNames.Of(messageType), messageId ?? Guid.CreateVersion7(), redeliveryCount,
-            w3c ? current!.Id : null, w3c ? current!.TraceStateString : null);
+            w3c ? current!.Id : null, w3c ? current!.TraceStateString : null, groupId,
+            custom is { Count: > 0 } ? new Dictionary<string, string>(custom, StringComparer.Ordinal) : null);
     }
 
     public IReadOnlyDictionary<string, object> ToDictionary()
@@ -41,6 +61,16 @@ internal sealed record MessageHeaders(
             [MessageTypeKey] = MessageType,
             [RedeliveryCountKey] = RedeliveryCount.ToString(CultureInfo.InvariantCulture),
         };
+
+        foreach ((string key, string value) in CustomHeaders)
+        {
+            headers[key] = value;
+        }
+
+        if (GroupId is not null)
+        {
+            headers[GroupKey] = GroupId;
+        }
 
         if (MessageId is { } messageId)
         {
@@ -68,12 +98,23 @@ internal sealed record MessageHeaders(
             return null;
         }
 
+        Dictionary<string, string>? custom = null;
+        foreach ((string key, object value) in headers)
+        {
+            if (!Reserved.Contains(key) && Convert.ToString(value, CultureInfo.InvariantCulture) is { } text)
+            {
+                (custom ??= new(StringComparer.Ordinal))[key] = text;
+            }
+        }
+
         return new(
             messageType,
             Guid.TryParse(Read(headers, MessageIdKey), out Guid messageId) ? messageId : null,
             int.TryParse(Read(headers, RedeliveryCountKey), CultureInfo.InvariantCulture, out int count) ? count : 0,
             Read(headers, TraceParentKey),
-            Read(headers, TraceStateKey));
+            Read(headers, TraceStateKey),
+            Read(headers, GroupKey),
+            custom);
     }
 
     private static string? Read(IReadOnlyDictionary<string, object> headers, string key)

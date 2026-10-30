@@ -16,6 +16,19 @@ public sealed class MessageHeadersTests
     }
 
     [Fact]
+    public void A_group_and_custom_headers_Should_read_back_as_written()
+    {
+        MessageHeaders written = MessageHeaders.New(typeof(Pinned), groupId: "g1",
+            custom: new Dictionary<string, string> { ["tenant"] = "acme" });
+
+        MessageHeaders? read = MessageHeaders.From(written.ToDictionary());
+
+        Assert.Equal("g1", read?.GroupId);
+        Assert.Equal("acme", read?.CustomHeaders["tenant"]);
+        Assert.Single(read!.CustomHeaders);
+    }
+
+    [Fact]
     public void Headers_without_a_message_type_Should_not_read()
     {
         Assert.Null(MessageHeaders.From(null));

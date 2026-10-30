@@ -75,6 +75,25 @@ public sealed class PgmqOptions
     /// <summary>The longest poll delay on an empty queue, and so the longest wait for a new message.</summary>
     public TimeSpan MaxIdleDelay { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// Wake an idle read loop as soon as a message is inserted, through PostgreSQL LISTEN/NOTIFY
+    /// (<c>pgmq.enable_notify_insert</c>), rather than at its next poll. Polling stays as the fallback, so a missed
+    /// notification only costs up to <see cref="MaxIdleDelay"/>. Uses one extra connection per host. A consumer can
+    /// turn it on or off for itself at registration.
+    /// </summary>
+    public bool UseInsertNotifications { get; set; }
+
+    /// <summary>The shortest time between two insert notifications of one queue.</summary>
+    public TimeSpan InsertNotificationThrottle { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Long-poll an empty queue inside PostgreSQL (pgmq's <c>read_with_poll</c> family) for up to this long, checking
+    /// every <see cref="MinIdleDelay"/>, instead of polling from the application. Holds a connection per queue while it
+    /// waits. Null, the default, polls from the application. Not used by <see cref="ConsumerOptionsAttribute.AtMostOnce"/>
+    /// consumers, which pgmq cannot long-poll.
+    /// </summary>
+    public TimeSpan? LongPollTimeout { get; set; }
+
     /// <summary>A queue's read loop silent this long counts as stalled.</summary>
     public TimeSpan StallAfter { get; set; } = TimeSpan.FromMinutes(1);
 
@@ -104,5 +123,13 @@ public sealed class PgmqOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(Lease, TimeSpan.FromSeconds(1), nameof(Lease));
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(RenewEvery, Lease, nameof(RenewEvery));
         ArgumentNullException.ThrowIfNull(IsTransient, nameof(IsTransient));
+        ArgumentOutOfRangeException.ThrowIfLessThan(InsertNotificationThrottle, TimeSpan.Zero,
+            nameof(InsertNotificationThrottle));
+
+        if (LongPollTimeout is { } longPoll)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(longPoll, TimeSpan.FromSeconds(1), nameof(LongPollTimeout));
+            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(longPoll, StallAfter, nameof(LongPollTimeout));
+        }
     }
 }
