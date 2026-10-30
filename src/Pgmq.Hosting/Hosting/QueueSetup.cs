@@ -6,15 +6,17 @@ using Npgsql;
 namespace Pgmq.Hosting;
 
 /// <summary>
-/// Creates the pgmq extension and every consumer's queue before anything publishes or reads, and gives each queue what
-/// its consumer asks for: its type when created, a FIFO index, topic bindings and insert notifications. All of it is
-/// idempotent and safe to run from several instances at once, so every host runs it on start. A queue that already
+/// Creates the database if missing, installs or upgrades pgmq (<see cref="PgmqMigrator"/>) and creates every consumer's
+/// queue before anything publishes or reads, giving each queue what its consumer asks for: its type when created, a
+/// FIFO index, topic bindings and insert notifications. All of it is idempotent and safe to run from several instances
+/// at once, so every host runs it on start. A queue that already
 /// exists keeps the type it has. With <see cref="PgmqOptions.AutoSetup"/> off it changes nothing and only checks that
 /// the extension and the queues are there. A failure stops the host unless <see cref="PgmqOptions.FailOnSetupError"/> is off;
 /// then it is logged and recorded in <see cref="PgmqStatus"/>.
 /// </summary>
 internal sealed class QueueSetup(
     PgmqQueueManager queues,
+    PgmqDatabase database,
     ConsumerRegistry registry,
     InsertListener listener,
     PgmqOptions options,
@@ -56,7 +58,21 @@ internal sealed class QueueSetup(
 
     private async Task SetUpAllAsync(CancellationToken cancellationToken)
     {
-        await queues.InitAsync(cancellationToken);
+        if (options is { CreateDatabase: true, ConnectionString: { } connectionString }
+            && await PgmqMigrator.EnsureDatabaseAsync(connectionString, options.MaintenanceDatabase, cancellationToken))
+        {
+            logger.LogInformation("Created the database {Database} for pgmq",
+                new NpgsqlConnectionStringBuilder(connectionString).Database);
+        }
+
+        PgmqMigrationResult migration =
+            await new PgmqMigrator(database.DataSource).MigrateAsync(options.InstallMode, cancellationToken);
+        if (migration.Changed)
+        {
+            logger.LogInformation("pgmq {From} -> {To} ({Installation}): {Scripts}",
+                migration.PreviousVersion ?? "none", migration.Version, migration.Installation,
+                string.Join(", ", migration.AppliedScripts));
+        }
 
         if (registry.Consumers.Any(c => c.Queue.Type == PgmqQueueType.Partitioned))
         {
@@ -78,7 +94,7 @@ internal sealed class QueueSetup(
         if (await queues.GetVersionAsync(cancellationToken) is null)
         {
             throw new InvalidOperationException(
-                $"The pgmq extension is not installed. Create it, or turn on {nameof(PgmqOptions.AutoSetup)}.");
+                $"pgmq is not installed. Install it, or turn on {nameof(PgmqOptions.AutoSetup)}.");
         }
 
         HashSet<string> existing =

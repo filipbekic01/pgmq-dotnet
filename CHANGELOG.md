@@ -5,6 +5,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-10-30
+
+### Added
+
+- Pgmq sets up its own database, so applications need no migrations. On start, `AutoSetup` creates the database when
+  it is missing (`CreateDatabase`, `MaintenanceDatabase`), installs pgmq, and upgrades it on every later start. All of
+  it is idempotent and serialized across instances.
+- pgmq without the extension: where the server lacks it (managed services), pgmq is installed from its own SQL,
+  embedded in the package (1.13.1), and upgraded with the upstream upgrade scripts. The version is tracked in
+  `pgmq.__pgmq_migrations`, compatible with the Rust client. `PgmqOptions.InstallMode` picks `Auto`, `Extension` or
+  `Sql`.
+- `PgmqMigrator` for the same steps outside the host: `EnsureDatabaseAsync`, `MigrateAsync`,
+  `GetInstalledVersionAsync`.
+
+### Changed
+
+- `IPgmqQueueManager.InitAsync` installs or upgrades pgmq through `PgmqMigrator` instead of only running
+  `create extension if not exists pgmq`. `GetVersionAsync` also reports a SQL install.
+
 ## [0.1.0-alpha.2] - 2026-10-30
 
 ### Added

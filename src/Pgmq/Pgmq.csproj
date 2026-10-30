@@ -10,6 +10,13 @@
         <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     </ItemGroup>
 
+    <!-- pgmq's own SQL (v1.13.1, PostgreSQL License; see Sql/LICENSE): the install and every upgrade script, so the
+         migrator can install pgmq where the extension is unavailable. Refresh from pgmq-extension/sql upstream. -->
+    <ItemGroup>
+        <EmbeddedResource Include="Sql\*.sql;Sql\pgmq.control" LogicalName="Pgmq.Sql.%(Filename)%(Extension)" />
+        <None Include="Sql\LICENSE" Pack="true" PackagePath="licenses\pgmq" />
+    </ItemGroup>
+
     <ItemGroup>
         <InternalsVisibleTo Include="Pgmq.Hosting" />
         <InternalsVisibleTo Include="Pgmq.Tests" />

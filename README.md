@@ -7,7 +7,7 @@ You publish a typed message; every consumer of that type gets its own durable co
 worker, with retries, timeouts and graceful shutdown. Consumers wake up instantly through PostgreSQL LISTEN/NOTIFY,
 with long polling as the fallback.
 
-> Early alpha (`0.1.0-alpha.2`). The API may change before 1.0.
+> Early alpha (`0.1.0-alpha.3`). The API may change before 1.0.
 
 ## Run it
 
@@ -44,8 +44,12 @@ with long polling as the fallback.
    await publisher.PublishAsync(new OrderCreated(Guid.NewGuid()));
    ```
 
-On start, Pgmq sets up the database: it creates the pgmq extension and one queue per consumer. To manage the schema
-yourself, set `o.AutoSetup = false`; Pgmq then only checks that everything exists.
+On start, Pgmq sets up the database, so it needs no migrations of its own. It creates the database named in the
+connection string if it is missing, installs pgmq, and creates one queue per consumer. Every later start brings pgmq
+up to date. pgmq goes in as the extension where the server has it, and as the extension's own SQL, embedded in the
+package, where it does not (RDS, Azure and other managed servers). All of it is idempotent and safe from several
+instances at once. To manage the schema yourself, set `o.AutoSetup = false`; Pgmq then only checks that everything
+exists.
 
 A runnable worker is in [`examples/Pgmq.Examples.Worker`](examples/Pgmq.Examples.Worker). Behavior, all options and
 PGMQ feature support are in [docs/guide.md](docs/guide.md).
