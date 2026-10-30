@@ -23,6 +23,15 @@ public sealed class PgmqOptions
     public bool RunConsumers { get; set; } = true;
 
     /// <summary>
+    /// Set up the database on start: create the pgmq extension (and pg_partman for partitioned queues), every
+    /// consumer's queue, its FIFO index, topic bindings and insert notification trigger. All of it is idempotent. Turn
+    /// off when the database is managed elsewhere, for example by migrations or a user without the rights to create
+    /// extensions: Pgmq then only checks that the extension and every queue exist, and uses the insert notifications
+    /// that are already there.
+    /// </summary>
+    public bool AutoSetup { get; set; } = true;
+
+    /// <summary>
     /// Stop the host from starting when the pgmq extension or the queues cannot be set up. Turn off to run without
     /// Pgmq instead: the failure is logged, the worker stays idle, and <see cref="PgmqStatus"/> and the health check
     /// report it.
@@ -69,30 +78,38 @@ public sealed class PgmqOptions
     /// </summary>
     public TimeSpan DrainGrace { get; set; } = TimeSpan.FromSeconds(20);
 
-    /// <summary>The first poll delay on an empty queue; it doubles up to <see cref="MaxIdleDelay"/>.</summary>
+    /// <summary>
+    /// The first poll delay on an empty queue that polls from the application; it doubles up to
+    /// <see cref="MaxIdleDelay"/>. Also how often a long poll checks the queue inside the database.
+    /// </summary>
     public TimeSpan MinIdleDelay { get; set; } = TimeSpan.FromMilliseconds(200);
 
-    /// <summary>The longest poll delay on an empty queue, and so the longest wait for a new message.</summary>
+    /// <summary>
+    /// The longest poll delay on an empty queue that polls from the application. A queue waiting for an insert
+    /// notification reads again after this long at the latest, in case a notification was throttled or lost.
+    /// </summary>
     public TimeSpan MaxIdleDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Wake an idle read loop as soon as a message is inserted, through PostgreSQL LISTEN/NOTIFY
-    /// (<c>pgmq.enable_notify_insert</c>), rather than at its next poll. Polling stays as the fallback, so a missed
-    /// notification only costs up to <see cref="MaxIdleDelay"/>. Uses one extra connection per host. A consumer can
-    /// turn it on or off for itself at registration.
+    /// (<c>pgmq.enable_notify_insert</c>). On by default. While notifications are not live (the listener connection is
+    /// down or reconnecting, or the database refused to create the trigger), the queue falls back to
+    /// <see cref="LongPollTimeout"/>. Uses one extra connection per host. A consumer can turn it on or off for itself at
+    /// registration.
     /// </summary>
-    public bool UseInsertNotifications { get; set; }
+    public bool UseInsertNotifications { get; set; } = true;
 
     /// <summary>The shortest time between two insert notifications of one queue.</summary>
     public TimeSpan InsertNotificationThrottle { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// Long-poll an empty queue inside PostgreSQL (pgmq's <c>read_with_poll</c> family) for up to this long, checking
-    /// every <see cref="MinIdleDelay"/>, instead of polling from the application. Holds a connection per queue while it
-    /// waits. Null, the default, polls from the application. Not used by <see cref="ConsumerOptionsAttribute.AtMostOnce"/>
-    /// consumers, which pgmq cannot long-poll.
+    /// The fallback when insert notifications are not live for a queue: long-poll it inside PostgreSQL (pgmq's
+    /// <c>read_with_poll</c> family) for up to this long, checking every <see cref="MinIdleDelay"/>. Holds a connection
+    /// per queue while it waits. Null polls from the application instead, backing off to <see cref="MaxIdleDelay"/>.
+    /// Not used by <see cref="ConsumerOptionsAttribute.AtMostOnce"/> consumers, which pgmq cannot long-poll. Must be
+    /// shorter than <see cref="StallAfter"/>.
     /// </summary>
-    public TimeSpan? LongPollTimeout { get; set; }
+    public TimeSpan? LongPollTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>A queue's read loop silent this long counts as stalled.</summary>
     public TimeSpan StallAfter { get; set; } = TimeSpan.FromMinutes(1);

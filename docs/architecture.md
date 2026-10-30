@@ -51,9 +51,10 @@ One read loop per queue, each with its own semaphore of slots:
    consumer.
 4. Free the slot.
 
-An empty queue backs off its polling from `MinIdleDelay` to `MaxIdleDelay`. With insert notifications on, one
-connection per host LISTENs to every such queue and a notification ends the wait; with `LongPollTimeout` the read
-itself waits in the database. A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the
+An empty queue waits for an insert notification: one connection per host LISTENs to every queue, and a notification
+ends the wait (with a safety re-read after `MaxIdleDelay`). While that connection is down or a queue has no trigger,
+the read itself waits in the database for up to `LongPollTimeout`. Only when neither is possible does the loop poll,
+backing off from `MinIdleDelay` to `MaxIdleDelay`. A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the
 health check read.
 
 Each consumer's settings pick the pgmq read function: `read` (with an optional conditional filter), one of the

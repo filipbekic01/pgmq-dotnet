@@ -1,6 +1,7 @@
 using System.Reflection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Npgmq;
 using Pgmq;
 using Pgmq.Hosting;
@@ -37,6 +38,8 @@ public static class PgmqServiceCollectionExtensions
         services.TryAddSingleton(sp => new PgmqQueueManager(sp.GetRequiredService<PgmqDatabase>().DataSource));
         services.TryAddSingleton<IPgmqQueueManager>(sp => sp.GetRequiredService<PgmqQueueManager>());
         services.TryAddSingleton(sp => new QueueReader(sp.GetRequiredService<PgmqDatabase>().DataSource, options));
+        services.TryAddSingleton(sp => new InsertListener(sp.GetRequiredService<PgmqDatabase>().DataSource,
+            sp.GetRequiredService<ILogger<InsertListener>>()));
         services.TryAddSingleton(sp => new ConsumerRegistry(sp.GetServices<ConsumerDescriptor>(), options));
         services.TryAddSingleton(sp => sp.GetRequiredService<ConsumerRegistry>().Topology);
         services.TryAddSingleton<PgmqStatus>();
@@ -48,8 +51,7 @@ public static class PgmqServiceCollectionExtensions
 
         if (options.RunConsumers)
         {
-            services.TryAddSingleton(sp => ActivatorUtilities.CreateInstance<ConsumerWorker>(sp,
-                sp.GetRequiredService<PgmqDatabase>().DataSource));
+            services.TryAddSingleton<ConsumerWorker>();
             services.AddSingleton<IHostedService>(sp => sp.GetRequiredService<ConsumerWorker>());
         }
 

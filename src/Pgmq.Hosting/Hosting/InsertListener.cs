@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Npgsql;
 
@@ -5,12 +6,28 @@ namespace Pgmq.Hosting;
 
 /// <summary>
 /// One connection that LISTENs to the insert notifications of every queue that has them, and wakes that queue's read
-/// loop. It only shortens an idle wait: a notification lost while it reconnects costs at most one poll interval, and
-/// every queue is woken after a reconnect to catch up.
+/// loop. While it listens, those queues wait for a notification; while it does not (before it connects, or between a
+/// lost connection and the next one), <see cref="IsLive"/> is false and they long-poll instead. Every queue is woken
+/// whenever the listener comes up or goes down, so it switches at once, and after a reconnect it catches up on what it
+/// missed.
 /// </summary>
-internal sealed class InsertListener(NpgsqlDataSource dataSource, ILogger logger)
+internal sealed class InsertListener(NpgsqlDataSource dataSource, ILogger<InsertListener> logger)
 {
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+
+    /// <summary>Queues whose insert trigger was set up, so a notification will come for them.</summary>
+    private readonly ConcurrentDictionary<string, byte> _enabled = new(StringComparer.Ordinal);
+
+    private volatile bool _listening;
+
+    /// <summary>Records that <paramref name="queue"/> has its insert trigger.</summary>
+    public void MarkEnabled(string queue) => _enabled[queue] = 0;
+
+    /// <summary>Whether <paramref name="queue"/> has its insert trigger, whether or not the listener is up.</summary>
+    public bool IsEnabled(string queue) => _enabled.ContainsKey(queue);
+
+    /// <summary>Whether an insert into <paramref name="queue"/> wakes its read loop right now.</summary>
+    public bool IsLive(string queue) => _listening && _enabled.ContainsKey(queue);
 
     public async Task RunAsync(IReadOnlyDictionary<string, Action> wakeByQueue, CancellationToken stoppingToken)
     {
@@ -36,10 +53,9 @@ internal sealed class InsertListener(NpgsqlDataSource dataSource, ILogger logger
                     await listen.ExecuteNonQueryAsync(stoppingToken);
                 }
 
-                foreach (Action wake in wakeByChannel.Values)
-                {
-                    wake();
-                }
+                // Live from here: a queue reads once more, then waits for its next notification.
+                _listening = true;
+                WakeAll(wakeByChannel);
 
                 while (!stoppingToken.IsCancellationRequested)
                 {
@@ -52,7 +68,11 @@ internal sealed class InsertListener(NpgsqlDataSource dataSource, ILogger logger
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "Listening for queue inserts failed; polling until it reconnects in {Delay}",
+                // Down: wake every queue so it stops waiting for a notification and long-polls instead.
+                _listening = false;
+                WakeAll(wakeByChannel);
+
+                logger.LogWarning(ex, "Listening for queue inserts failed; long-polling until it reconnects in {Delay}",
                     ReconnectDelay);
 
                 try
@@ -64,6 +84,18 @@ internal sealed class InsertListener(NpgsqlDataSource dataSource, ILogger logger
                     return;
                 }
             }
+            finally
+            {
+                _listening = false;
+            }
+        }
+    }
+
+    private static void WakeAll(Dictionary<string, Action> wakeByChannel)
+    {
+        foreach (Action wake in wakeByChannel.Values)
+        {
+            wake();
         }
     }
 }
