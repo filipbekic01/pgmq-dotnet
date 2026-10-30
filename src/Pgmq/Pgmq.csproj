@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <RootNamespace>Pgmq</RootNamespace>
+        <PackageId>Pgmq</PackageId>
+        <Description>Strongly typed publishing over PGMQ queues in PostgreSQL: fan-out to subscribed queues, delayed delivery, message headers and tracing. The core of Pgmq.NET; see Pgmq.Hosting for consumers.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Npgmq" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="Pgmq.Hosting" />
+        <InternalsVisibleTo Include="Pgmq.Tests" />
+        <InternalsVisibleTo Include="Pgmq.Hosting.Tests" />
+        <InternalsVisibleTo Include="Pgmq.IntegrationTests" />
+        <InternalsVisibleTo Include="Pgmq.Benchmarks" />
+    </ItemGroup>
+</Project>

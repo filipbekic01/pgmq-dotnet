@@ -1,0 +1,109 @@
+name: Publish to NuGet
+
+# Run by hand from the Actions tab. Builds, tests and packs the libraries at the chosen ref, then pushes Pgmq and
+# Pgmq.Hosting (with their symbol packages) to NuGet.org.
+#
+# Needs a repository or environment secret NUGET_API_KEY: a NuGet.org API key with the "Push" scope, limited to the
+# Pgmq and Pgmq.Hosting packages. The job runs in the "nuget" environment, so required reviewers can be added there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version, e.g. 0.1.0-alpha.2. Empty uses <Version> from Directory.Build.props."
+        required: false
+        type: string
+      dry-run:
+        description: "Build, test and pack only; push nothing."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  publish:
+    name: Pack and push
+    runs-on: ubuntu-latest
+    environment: nuget
+    steps:
+      - name: Only from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Publish from main only; this run is on ${{ github.ref }}."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Version
+        id: version
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          if [ -n "$REQUESTED" ]; then
+            if ! echo "$REQUESTED" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+              echo "\"$REQUESTED\" is not a semantic version."
+              exit 1
+            fi
+            echo "property=-p:Version=$REQUESTED" >> "$GITHUB_OUTPUT"
+            echo "Publishing $REQUESTED"
+          else
+            echo "property=" >> "$GITHUB_OUTPUT"
+            echo "Publishing the version in Directory.Build.props"
+          fi
+
+      - name: Restore
+        run: dotnet restore Pgmq.slnx
+
+      - name: Build
+        run: dotnet build Pgmq.slnx -c Release --no-restore ${{ steps.version.outputs.property }}
+
+      - name: Unit tests
+        run: |
+          dotnet test --project tests/Pgmq.Tests -c Release --no-build
+          dotnet test --project tests/Pgmq.Hosting.Tests -c Release --no-build
+
+      - name: Integration tests (PGMQ in Docker; the 100,000-message load tests left out)
+        run: dotnet test --project tests/Pgmq.IntegrationTests -c Release --no-build -- --filter-not-trait "Category=Load"
+
+      - name: Pack
+        run: |
+          dotnet pack src/Pgmq/Pgmq.csproj -c Release --no-build -o artifacts ${{ steps.version.outputs.property }}
+          dotnet pack src/Pgmq.Hosting/Pgmq.Hosting.csproj -c Release --no-build -o artifacts ${{ steps.version.outputs.property }}
+          ls -l artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: Push to NuGet.org
+        if: ${{ !inputs.dry-run }}
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "The NUGET_API_KEY secret is not set."
+            exit 1
+          fi
+          # Pgmq first: Pgmq.Hosting depends on it. Symbol packages beside each .nupkg are pushed with it.
+          for package in artifacts/Pgmq.[0-9]*.nupkg artifacts/Pgmq.Hosting.[0-9]*.nupkg; do
+            dotnet nuget push "$package" --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done

@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    name: Build, unit test and pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore Pgmq.slnx
+
+      - name: Verify formatting
+        run: dotnet format Pgmq.slnx --verify-no-changes --no-restore
+
+      - name: Build
+        run: dotnet build Pgmq.slnx -c Release --no-restore
+
+      - name: Unit tests
+        run: |
+          dotnet test --project tests/Pgmq.Tests -c Release --no-build
+          dotnet test --project tests/Pgmq.Hosting.Tests -c Release --no-build
+
+      - name: Pack
+        run: |
+          dotnet pack src/Pgmq/Pgmq.csproj -c Release --no-build -o artifacts
+          dotnet pack src/Pgmq.Hosting/Pgmq.Hosting.csproj -c Release --no-build -o artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: artifacts/*
+          if-no-files-found: error
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Integration tests (PGMQ in Docker; the 100,000-message load tests left out)
+        run: dotnet test --project tests/Pgmq.IntegrationTests -c Release -- --filter-not-trait "Category=Load"

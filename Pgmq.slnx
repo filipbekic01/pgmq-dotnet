@@ -1,0 +1,17 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Pgmq/Pgmq.csproj" />
+    <Project Path="src/Pgmq.Hosting/Pgmq.Hosting.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Pgmq.Tests/Pgmq.Tests.csproj" />
+    <Project Path="tests/Pgmq.Hosting.Tests/Pgmq.Hosting.Tests.csproj" />
+    <Project Path="tests/Pgmq.IntegrationTests/Pgmq.IntegrationTests.csproj" />
+  </Folder>
+  <Folder Name="/examples/">
+    <Project Path="examples/Pgmq.Examples.Worker/Pgmq.Examples.Worker.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/Pgmq.Benchmarks/Pgmq.Benchmarks.csproj" />
+  </Folder>
+</Solution>

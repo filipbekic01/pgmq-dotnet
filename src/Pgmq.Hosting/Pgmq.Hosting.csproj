@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <RootNamespace>Pgmq.Hosting</RootNamespace>
+        <PackageId>Pgmq.Hosting</PackageId>
+        <Description>Consumers for Pgmq.NET on the .NET Generic Host: dependency injection, a background worker with per-queue concurrency, leases, retries, timeouts, an outbox, graceful shutdown and a health check.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Pgmq\Pgmq.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+        <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="Pgmq.Hosting.Tests" />
+        <InternalsVisibleTo Include="Pgmq.IntegrationTests" />
+        <InternalsVisibleTo Include="Pgmq.Benchmarks" />
+    </ItemGroup>
+</Project>

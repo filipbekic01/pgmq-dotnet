@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="xunit.v3" />
+        <PackageReference Include="Testcontainers" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection" />
+        <PackageReference Include="Microsoft.Extensions.Logging" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Using Include="Xunit" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\src\Pgmq.Hosting\Pgmq.Hosting.csproj" />
+        <!-- The load tests run the benchmark's scenario and assert it behaves. -->
+        <ProjectReference Include="..\..\benchmarks\Pgmq.Benchmarks\Pgmq.Benchmarks.csproj" />
+    </ItemGroup>
+</Project>

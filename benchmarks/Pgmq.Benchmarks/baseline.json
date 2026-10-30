@@ -1,0 +1,19 @@
+{
+  "messages": 100000,
+  "queues": 100,
+  "machine": "10 cores, macOS 27.0.1, Arm64",
+  "date": "2026-10-30",
+  "results": {
+    "drain": {
+      "publishPerSecond": 322902,
+      "consumePerSecond": 9667
+    },
+    "live": {
+      "publishPerSecond": 5179,
+      "consumePerSecond": 5127,
+      "latencyP50Ms": 123,
+      "latencyP95Ms": 223,
+      "latencyP99Ms": 242
+    }
+  }
+}
