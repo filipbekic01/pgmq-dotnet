@@ -132,10 +132,12 @@ public sealed class PublisherTests
     private sealed class FakeSender : IPgmqSender
     {
         public List<(string Queue, string Body, IReadOnlyDictionary<string, object> Headers, DateTimeOffset? DeliverAt)>
-            Sends { get; } = [];
+            Sends
+        { get; } = [];
 
         public List<(string Queue, IReadOnlyList<string> Bodies, IReadOnlyList<IReadOnlyDictionary<string, object>>
-            Headers)> Batches { get; } = [];
+            Headers)> Batches
+        { get; } = [];
 
         public List<(string RoutingKey, string Body, int Delay)> TopicSends { get; } = [];
 
