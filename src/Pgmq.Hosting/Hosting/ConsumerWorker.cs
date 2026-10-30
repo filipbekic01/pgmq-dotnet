@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Npgmq;
+using Npgsql;
 
 namespace Pgmq.Hosting;
 
@@ -32,9 +33,25 @@ namespace Pgmq.Hosting;
 /// <b>Survival.</b> A read loop that fails is logged and started again; it never ends while the host runs. Every loop
 /// records when it last ran, and <see cref="PgmqStatus.StalledQueues"/> names those that went quiet.
 /// </para>
+/// <para>
+/// <b>FIFO.</b> A queue read in a grouped <see cref="PgmqReadMode"/> may get several messages of one group in one
+/// read. They run one after another, in order; when one does not succeed, the rest go back to the queue unhandled,
+/// and pgmq holds the group until the failed one is settled.
+/// </para>
+/// <para>
+/// <b>At most once.</b> A consumer with <see cref="ConsumerOptionsAttribute.AtMostOnce"/> reads with <c>pgmq.pop</c>:
+/// the message is gone from the queue once read, so there is no lease to renew and nothing to settle.
+/// </para>
+/// <para>
+/// <b>Waking.</b> An idle queue polls, backing off to <see cref="PgmqOptions.MaxIdleDelay"/>. With insert
+/// notifications on, a notification ends the wait at once; with <see cref="PgmqOptions.LongPollTimeout"/> set, the
+/// database does the waiting.
+/// </para>
 /// </summary>
 internal sealed class ConsumerWorker(
     INpgmqClient client,
+    QueueReader reader,
+    NpgsqlDataSource dataSource,
     ConsumerRegistry registry,
     PgmqPublisher publisher,
     IServiceScopeFactory scopeFactory,
@@ -53,6 +70,9 @@ internal sealed class ConsumerWorker(
     private readonly CancellationTokenSource _abort = new();
 
     private readonly ConcurrentDictionary<string, QueueState> _queues = new();
+
+    /// <summary>The host's stopping token, once running: a FIFO chain stops starting messages when it fires.</summary>
+    private CancellationToken _stopping;
 
     private int LeaseSeconds => Math.Max(1, (int)Math.Ceiling(options.Lease.TotalSeconds));
 
@@ -83,11 +103,31 @@ internal sealed class ConsumerWorker(
             return;
         }
 
+        _stopping = stoppingToken;
         await using CancellationTokenRegistration onStop =
             stoppingToken.Register(() => _abort.CancelAfter(options.DrainGrace));
 
-        await Task.WhenAll(registry.Consumers.Select(consumer =>
-            Task.Run(() => RunQueueAsync(consumer, stoppingToken), CancellationToken.None)));
+        foreach (ConsumerRegistration consumer in registry.Consumers)
+        {
+            _queues[consumer.QueueName] = new(consumer);
+        }
+
+        List<Task> running =
+        [
+            .. registry.Consumers.Select(consumer =>
+                Task.Run(() => RunQueueAsync(_queues[consumer.QueueName], stoppingToken), CancellationToken.None)),
+        ];
+
+        Dictionary<string, Action> notified = registry.Consumers
+            .Where(c => c.UseInsertNotifications)
+            .ToDictionary(c => c.QueueName, c => (Action)_queues[c.QueueName].Wake, StringComparer.Ordinal);
+        if (notified.Count > 0)
+        {
+            InsertListener listener = new(dataSource, logger);
+            running.Add(Task.Run(() => listener.RunAsync(notified, stoppingToken), CancellationToken.None));
+        }
+
+        await Task.WhenAll(running);
     }
 
     public override void Dispose()
@@ -97,9 +137,9 @@ internal sealed class ConsumerWorker(
     }
 
     /// <summary>One queue for the life of the host: its read loop, kept alive, its lease renewal, and the drain.</summary>
-    private async Task RunQueueAsync(ConsumerRegistration consumer, CancellationToken stoppingToken)
+    private async Task RunQueueAsync(QueueState state, CancellationToken stoppingToken)
     {
-        QueueState state = _queues[consumer.QueueName] = new(consumer);
+        ConsumerRegistration consumer = state.Consumer;
         using CancellationTokenSource renewalStop = new();
         Task renewal = RenewLeasesAsync(state, renewalStop.Token);
 
@@ -148,10 +188,10 @@ internal sealed class ConsumerWorker(
                 free++;
             }
 
-            List<NpgmqMessage<string>> messages;
+            List<QueueMessage> messages;
             try
             {
-                messages = await client.ReadBatchAsync<string>(queue, LeaseSeconds, free, stoppingToken);
+                messages = await reader.ReadAsync(state.Consumer, LeaseSeconds, free, stoppingToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
             {
@@ -173,53 +213,102 @@ internal sealed class ConsumerWorker(
 
             if (messages.Count == 0)
             {
-                await Task.Delay(idleDelay, stoppingToken);
-                idleDelay = TimeSpan.FromTicks(Math.Min(idleDelay.Ticks * 2, options.MaxIdleDelay.Ticks));
+                if (reader.LongPolls(state.Consumer))
+                {
+                    // The database already waited for a message.
+                    continue;
+                }
+
+                if (await state.Woken.WaitAsync(idleDelay, stoppingToken))
+                {
+                    idleDelay = options.MinIdleDelay;
+                }
+                else
+                {
+                    idleDelay = TimeSpan.FromTicks(Math.Min(idleDelay.Ticks * 2, options.MaxIdleDelay.Ticks));
+                }
+
                 continue;
             }
 
             idleDelay = options.MinIdleDelay;
 
-            foreach (NpgmqMessage<string> message in messages)
+            if (state.Consumer.IsGrouped)
             {
-                Start(state, message);
+                // One chain per FIFO group, in message order, so a group never runs two of its messages at once.
+                foreach (IGrouping<string?, QueueMessage> group in messages.GroupBy(m => m.GroupId))
+                {
+                    Start(state, [.. group]);
+                }
+            }
+            else
+            {
+                foreach (QueueMessage message in messages)
+                {
+                    Start(state, [message]);
+                }
             }
         }
     }
 
-    /// <summary>Runs one message on its own, and frees its slot when it is settled, whatever happened.</summary>
-    private void Start(QueueState state, NpgmqMessage<string> message)
+    /// <summary>
+    /// Runs messages one after another on their own task, freeing each one's slot when it is settled, whatever
+    /// happened. Once one does not succeed, or the host is stopping, the rest go back to the queue unhandled.
+    /// </summary>
+    private void Start(QueueState state, QueueMessage[] chain)
     {
-        state.Leased[message.MsgId] = 0;
+        if (!state.Consumer.AtMostOnce)
+        {
+            foreach (QueueMessage message in chain)
+            {
+                state.Leased[message.MsgId] = 0;
+            }
+        }
 
         Task handling = Task.Run(async () =>
         {
-            try
+            int next = 0;
+            bool carryOn = true;
+
+            for (; next < chain.Length && carryOn; next++)
             {
-                await HandleAsync(state, message);
+                QueueMessage message = chain[next];
+                try
+                {
+                    carryOn = await HandleAsync(state, message) == SettlementKind.Delete;
+                }
+                catch (Exception ex)
+                {
+                    // HandleAsync settles every outcome itself; reaching here is a bug in it. The lease lapses and
+                    // the message comes back, so nothing is lost.
+                    carryOn = false;
+                    logger.LogCritical(ex, "Handling message {MsgId} on {Queue} failed unexpectedly", message.MsgId,
+                        state.Consumer.QueueName);
+                }
+                finally
+                {
+                    state.Leased.TryRemove(message.MsgId, out _);
+                    state.Slots.Release();
+                }
+
+                carryOn &= !_stopping.IsCancellationRequested;
             }
-            catch (Exception ex)
+
+            for (; next < chain.Length; next++)
             {
-                // HandleAsync settles every outcome itself; reaching here is a bug in it. The lease lapses and the
-                // message comes back, so nothing is lost.
-                logger.LogCritical(ex, "Handling message {MsgId} on {Queue} failed unexpectedly", message.MsgId,
-                    state.Consumer.QueueName);
-            }
-            finally
-            {
+                QueueMessage message = chain[next];
                 state.Leased.TryRemove(message.MsgId, out _);
+                await SettleAsync(state, message, Settlement.Release);
+                state.Slots.Release();
             }
         }, CancellationToken.None);
 
         state.InFlight.TryAdd(handling, 0);
-        handling.ContinueWith(done =>
-        {
-            state.InFlight.TryRemove(done, out _);
-            state.Slots.Release();
-        }, TaskScheduler.Default);
+        handling.ContinueWith(done => state.InFlight.TryRemove(done, out _), TaskScheduler.Default);
     }
 
-    private async Task HandleAsync(QueueState state, NpgmqMessage<string> message)
+    /// <summary>Handles one message to its end, and says how it was settled.</summary>
+    private async Task<SettlementKind> HandleAsync(QueueState state, QueueMessage message)
     {
         ConsumerRegistration consumer = state.Consumer;
         MessageHeaders? headers = MessageHeaders.From(message.Headers);
@@ -234,13 +323,15 @@ internal sealed class ConsumerWorker(
             ["Attempt"] = message.ReadCt,
         });
 
-        if (headers is null || messageType is null || message.Message is null)
+        if (headers is null || messageType is null || message.Body is null)
         {
             logger.LogError("Message on {Queue} has no known type ({MessageType}); archiving it",
                 consumer.QueueName, headers?.MessageType);
             state.Leased.TryRemove(message.MsgId, out _);
             await SettleAsync(state, message, Settlement.Archive);
-            return;
+
+            // Archiving takes it out of its group, so the group's next message may run.
+            return SettlementKind.Delete;
         }
 
         using Activity? activity =
@@ -252,10 +343,11 @@ internal sealed class ConsumerWorker(
         // the message to come back within one lease rather than sit hidden.
         state.Leased.TryRemove(message.MsgId, out _);
         await SettleAsync(state, message, settlement);
+        return settlement.Kind;
     }
 
     /// <summary>Runs the consumer under its deadline and flushes its outbox, and says what to do with the message.</summary>
-    private async Task<Settlement> RunConsumerAsync(QueueState state, NpgmqMessage<string> message,
+    private async Task<Settlement> RunConsumerAsync(QueueState state, QueueMessage message,
         MessageHeaders headers, Type messageType, Activity? activity)
     {
         ConsumerRegistration consumer = state.Consumer;
@@ -284,8 +376,17 @@ internal sealed class ConsumerWorker(
         }
         catch (OperationCanceledException) when (_abort.IsCancellationRequested)
         {
-            logger.LogInformation("{Consumer} stopped for shutdown; its message goes back to the queue",
-                consumer.ConsumerType.Name);
+            if (consumer.AtMostOnce)
+            {
+                logger.LogWarning("{Consumer} stopped for shutdown; its at-most-once message is lost",
+                    consumer.ConsumerType.Name);
+            }
+            else
+            {
+                logger.LogInformation("{Consumer} stopped for shutdown; its message goes back to the queue",
+                    consumer.ConsumerType.Name);
+            }
+
             return Settlement.Release;
         }
         catch (OperationCanceledException ex) when (deadline.IsCancellationRequested)
@@ -320,27 +421,39 @@ internal sealed class ConsumerWorker(
         return Settlement.Delete;
     }
 
-    private async Task DispatchAsync(ConsumerRegistration consumer, NpgmqMessage<string> message,
+    private async Task DispatchAsync(ConsumerRegistration consumer, QueueMessage message,
         MessageHeaders headers, Type messageType, Outbox outbox, CancellationToken cancellationToken)
     {
-        object body = MessageSerializer.Deserialize(message.Message!, messageType);
+        object body = MessageSerializer.Deserialize(message.Body!, messageType);
 
         // A failed attempt counts as a redelivery, as does an explicit RedeliverAsync (which writes a new message with
         // the count in its headers, so its reads start again from one).
         Delivery delivery = new(publisher, headers.MessageId,
             RedeliveryCount: headers.RedeliveryCount + Math.Max(0, message.ReadCt - 1),
             outbox,
-            SendBack: (m, type, delay, count, messageId, ct) =>
-                publisher.SendAsync(consumer.QueueName, m, type, delay, count, messageId, ct));
+            SendBack: (m, type, delay, count, messageId, groupId, custom, ct) =>
+                publisher.SendAsync(consumer.QueueName, m, type, delay, count, messageId, groupId, custom, ct))
+        {
+            GroupId = headers.GroupId,
+            Headers = headers.CustomHeaders,
+        };
 
         await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();
         await ConsumerDispatcher.DispatchAsync(scope.ServiceProvider, consumer, body, messageType, delivery,
             cancellationToken);
     }
 
-    private Settlement Failed(ConsumerRegistration consumer, NpgmqMessage<string> message, Type messageType,
+    private Settlement Failed(ConsumerRegistration consumer, QueueMessage message, Type messageType,
         Exception ex, Activity? activity)
     {
+        if (consumer.AtMostOnce)
+        {
+            logger.LogError(ex, "{Consumer} failed at-most-once {MessageType}; the message is lost",
+                consumer.ConsumerType.Name, messageType.Name);
+            PgmqTelemetry.Fail(activity, ex, "lost");
+            return Settlement.Archive;
+        }
+
         if (!options.IsTransient(ex) || message.ReadCt >= options.MaxAttempts)
         {
             logger.LogError(ex, "{Consumer} failed {MessageType} (attempt {Attempt}); archiving the message",
@@ -362,9 +475,15 @@ internal sealed class ConsumerWorker(
             options.MaxRetryBackoff.Ticks));
 
     /// <summary>Writes the outcome to the queue, retrying a failed write; a write that never lands leaves the lease to lapse.</summary>
-    private async Task SettleAsync(QueueState state, NpgmqMessage<string> message, Settlement settlement)
+    private async Task SettleAsync(QueueState state, QueueMessage message, Settlement settlement)
     {
         string queue = state.Consumer.QueueName;
+
+        if (state.Consumer.AtMostOnce)
+        {
+            // pgmq.pop deleted it as it was read; there is nothing left to settle.
+            return;
+        }
 
         try
         {
@@ -386,7 +505,7 @@ internal sealed class ConsumerWorker(
     }
 
     private async Task RetryAsync(Func<CancellationToken, Task> write, string what, QueueState state,
-        NpgmqMessage<string> message)
+        QueueMessage message)
     {
         for (int attempt = 0; ; attempt++)
         {
@@ -457,7 +576,22 @@ internal sealed class ConsumerWorker(
         /// <summary>Every running handler, awaited on shutdown.</summary>
         public ConcurrentDictionary<Task, byte> InFlight { get; } = new();
 
+        /// <summary>Released by an insert notification, to end an idle wait early.</summary>
+        public SemaphoreSlim Woken { get; } = new(0, 1);
+
         public void Beat() => Volatile.Write(ref LastBeat, Stopwatch.GetTimestamp());
+
+        public void Wake()
+        {
+            try
+            {
+                Woken.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // Already woken; one wake-up is enough.
+            }
+        }
     }
 
     private enum SettlementKind

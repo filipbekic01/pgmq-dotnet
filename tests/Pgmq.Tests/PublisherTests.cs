@@ -86,5 +86,74 @@ public sealed class PublisherTests
             It.IsAny<CancellationToken>()), Times.Once);
     }
 
+    [Fact]
+    public async Task A_publish_with_options_Should_carry_the_group_and_headers()
+    {
+        _topology.Subscribe(typeof(Ping), "first");
+        IReadOnlyDictionary<string, object>? headers = null;
+        _client.Setup(c => c.SendAsync("first", It.IsAny<string>(), It.IsAny<IReadOnlyDictionary<string, object>>(),
+                It.IsAny<CancellationToken>()))
+            .Callback((string _, string _, IReadOnlyDictionary<string, object> h, CancellationToken _) => headers = h)
+            .ReturnsAsync(1);
+
+        await Publisher.PublishAsync(new Ping(1), new PgmqPublishOptions
+        {
+            GroupId = "customer-7",
+            Headers = new Dictionary<string, string> { ["tenant"] = "acme" },
+        }, Ct);
+
+        Assert.NotNull(headers);
+        Assert.Equal("customer-7", headers["x-pgmq-group"]);
+        Assert.Equal("acme", headers["tenant"]);
+        Assert.Equal(typeof(Ping).FullName, headers["message-type"]);
+    }
+
+    [Fact]
+    public async Task A_header_Pgmq_uses_itself_Should_be_refused()
+    {
+        _topology.Subscribe(typeof(Ping), "first");
+
+        await Assert.ThrowsAsync<ArgumentException>(() => Publisher.PublishAsync(new Ping(1), new PgmqPublishOptions
+        {
+            Headers = new Dictionary<string, string> { ["x-pgmq-group"] = "sneaky" },
+        }, Ct));
+    }
+
+    [Fact]
+    public async Task Both_a_delay_and_a_delivery_time_Should_be_refused()
+        => await Assert.ThrowsAsync<ArgumentException>(() => Publisher.PublishAsync(new Ping(1),
+            new PgmqPublishOptions { Delay = TimeSpan.FromSeconds(1), DeliverAt = DateTimeOffset.UtcNow }, Ct));
+
+    [Fact]
+    public async Task A_topic_publish_Should_be_one_send_topic_with_the_delay_rounded_up()
+    {
+        int? delay = null;
+        _client.Setup(c => c.SendTopicAsync("orders.eu.created", """{"id":3}""",
+                It.IsAny<IReadOnlyDictionary<string, object>>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+            .Callback((string _, string _, IReadOnlyDictionary<string, object> _, int d, CancellationToken _) => delay = d)
+            .ReturnsAsync(2);
+
+        int queues = await Publisher.PublishToTopicAsync("orders.eu.created", new Ping(3),
+            new PgmqPublishOptions { Delay = TimeSpan.FromMilliseconds(1500) }, Ct);
+
+        Assert.Equal(2, queues);
+        Assert.Equal(2, delay);
+    }
+
+    [Fact]
+    public async Task A_topic_batch_Should_count_the_queues_it_reached()
+    {
+        _client.Setup(c => c.SendBatchTopicAsync("logs.app", It.Is<IReadOnlyList<string>>(b => b.Count == 2),
+                It.IsAny<IReadOnlyList<IReadOnlyDictionary<string, object>>>(), 0, It.IsAny<CancellationToken>()))
+            .ReturnsAsync([
+                new NpgmqSendTopicResult { QueueName = "a", MsgId = 1 },
+                new NpgmqSendTopicResult { QueueName = "a", MsgId = 2 },
+                new NpgmqSendTopicResult { QueueName = "b", MsgId = 1 },
+                new NpgmqSendTopicResult { QueueName = "b", MsgId = 2 },
+            ]);
+
+        Assert.Equal(2, await Publisher.PublishBatchToTopicAsync("logs.app", [new Ping(1), new Ping(2)], Ct));
+    }
+
     public sealed record Ping(int Id);
 }

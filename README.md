@@ -5,7 +5,9 @@ Publish a message, and every consumer subscribed to its type gets its own durabl
 worker handles them with per-queue concurrency, leases, retries, timeouts and graceful shutdown.
 
 The aim is a small, predictable alternative to full messaging frameworks such as MassTransit, Wolverine and Rebus:
-publish and subscribe, nothing more. There are no sagas, workflow engines or middleware pipelines.
+publish and subscribe, nothing more. There are no sagas, workflow engines or middleware pipelines. Every feature of
+PGMQ itself is available, though: FIFO groups, topic routing, unlogged and partitioned queues, LISTEN/NOTIFY, long
+polling, metrics and more (see [PGMQ feature support](#pgmq-feature-support)).
 
 > **Status: early alpha (`0.1.0-alpha.1`), on NuGet.org as `Pgmq` and `Pgmq.Hosting`.** The features below are
 > implemented and tested, including against a real PGMQ database. The public API may still change before 1.0. Pgmq.NET is an
@@ -15,7 +17,7 @@ publish and subscribe, nothing more. There are no sagas, workflow engines or mid
 
 | Package | What it does |
 |---|---|
-| `Pgmq` | Publishing (`IPgmqPublisher`), the topology that decides which queues a message goes to, message headers, serialization and tracing. No hosting dependencies. |
+| `Pgmq` | Publishing (`IPgmqPublisher`), the topology that decides which queues a message goes to, queue management (`IPgmqQueueManager`), message headers, serialization and tracing. No hosting dependencies. |
 | `Pgmq.Hosting` | Consumers (`IPgmqConsumer<T>`), the background worker, dependency injection, a health check and status reporting on the .NET Generic Host. References `Pgmq`. |
 
 Both target .NET 10 and build on [Npgmq](https://github.com/brianpursley/Npgmq) and Npgsql.
@@ -77,6 +79,122 @@ At start-up Pgmq creates the pgmq extension (if it can) and one queue per consum
 - **Tracing.** Spans follow the OpenTelemetry messaging conventions under the `Pgmq` source. The trace continues from
   publisher to consumer through the message headers.
 
+## PGMQ feature support
+
+Every function in the [PGMQ 1.13 SQL API](https://pgmq.github.io/pgmq/latest/api/sql/functions/) and where to find
+it. "Worker" means the consumer worker in `Pgmq.Hosting` uses it for you. `INpgmqClient`, the
+[Npgmq](https://github.com/brianpursley/Npgmq) client underneath, resolves from dependency injection for direct
+access to a queue.
+
+| PGMQ feature | Function | Supported | How |
+|---|---|:---:|---|
+| **Sending** | | | |
+| Send a message | `send` | ✅ | `IPgmqPublisher.PublishAsync` |
+| Send with headers | `send(…, headers)` | ✅ | Pgmq's own headers on every message; yours with `PgmqPublishOptions.Headers` |
+| Delayed send (seconds or timestamp) | `send(…, delay)` | ✅ | `SchedulePublishAsync`, or `PgmqPublishOptions.Delay` / `DeliverAt` |
+| Send a batch | `send_batch` | ✅ | `PublishBatchAsync`, one write per queue |
+| **Topic routing** | | | |
+| Bind a pattern to a queue | `bind_topic` | ✅ | `[TopicBinding("orders.*")]` on a consumer, or `IPgmqQueueManager.BindTopicAsync` |
+| Unbind a pattern | `unbind_topic` | ✅ | `IPgmqQueueManager.UnbindTopicAsync` |
+| List bindings | `list_topic_bindings` | ✅ | `IPgmqQueueManager.ListTopicBindingsAsync` |
+| Test a routing key | `test_routing` | ✅ | `IPgmqQueueManager.TestRoutingAsync` |
+| Send to a topic | `send_topic` | ✅ | `IPgmqPublisher.PublishToTopicAsync` |
+| Send a batch to a topic | `send_batch_topic` | ✅ | `IPgmqPublisher.PublishBatchToTopicAsync` |
+| **Reading** | | | |
+| Read with a visibility timeout | `read` | ✅ | Worker, renewing the lease while the consumer runs |
+| Conditional read (experimental) | `read(…, conditional)` | ✅ | `[ConsumerOptions(Filter = """{"region":"eu"}""")]` |
+| Long poll | `read_with_poll` | ✅ | `PgmqOptions.LongPollTimeout` |
+| FIFO, fill from the oldest group | `read_grouped`, `read_grouped_with_poll` | ✅ | `ReadMode = PgmqReadMode.Grouped`, group with `PgmqPublishOptions.GroupId` |
+| FIFO, round robin across groups | `read_grouped_rr`, `read_grouped_rr_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedRoundRobin` |
+| FIFO, head of each group | `read_grouped_head`, `read_grouped_head_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedHead` |
+| Read and delete (at most once) | `pop` | ✅ | `[ConsumerOptions(AtMostOnce = true)]` |
+| **Deleting and archiving** | | | |
+| Delete a message | `delete` | ✅ | Worker, when a consumer succeeds |
+| Delete a batch | `delete(…, msg_ids[])` | ✅ | `INpgmqClient.DeleteBatchAsync` |
+| Archive a message | `archive` | ✅ | Worker, on a permanent failure, timeout or the last attempt |
+| Archive a batch | `archive(…, msg_ids[])` | ✅ | `INpgmqClient.ArchiveBatchAsync` |
+| Purge a queue | `purge_queue` | ✅ | `IPgmqQueueManager.PurgeQueueAsync` |
+| **Queue management** | | | |
+| Create a queue | `create`, `create_non_partitioned` | ✅ | Worker setup for every consumer, or `IPgmqQueueManager.CreateQueueAsync` / `EnsureQueueAsync` |
+| Create an unlogged queue | `create_unlogged` | ✅ | `[ConsumerOptions(QueueType = PgmqQueueType.Unlogged)]`, or `PgmqQueueOptions.Unlogged` |
+| Create a partitioned queue (pg_partman) | `create_partitioned` | ✅ | `QueueType = PgmqQueueType.Partitioned`, or `PgmqQueueOptions.Partitioned(...)` |
+| Partition an archive (pg_partman) | `convert_archive_partitioned` | ✅ | `IPgmqQueueManager.ConvertArchivePartitionedAsync` |
+| Drop a queue | `drop_queue` | ✅ | `IPgmqQueueManager.DropQueueAsync` |
+| Detach an archive | `detach_archive` | ➖ | A deprecated no-op in PGMQ, so left out |
+| **Utilities** | | | |
+| Set the visibility timeout | `set_vt` (one or many, seconds or timestamp) | ✅ | Worker for leases, retries and releases; `INpgmqClient.SetVtAsync` / `SetVtBatchAsync` |
+| List queues | `list_queues` | ✅ | `IPgmqQueueManager.ListQueuesAsync` |
+| Metrics for a queue / all queues | `metrics`, `metrics_all` | ✅ | `IPgmqQueueManager.GetMetricsAsync` / `GetAllMetricsAsync` |
+| Notify on insert (LISTEN/NOTIFY) | `enable_notify_insert` | ✅ | `PgmqOptions.UseInsertNotifications` wakes idle consumers; or `IPgmqQueueManager.EnableInsertNotificationsAsync` |
+| Change or stop notifications | `update_notify_insert`, `disable_notify_insert` | ✅ | `IPgmqQueueManager.UpdateInsertNotificationsAsync` / `DisableInsertNotificationsAsync` |
+| List notification throttles | `list_notify_insert_throttles` | ✅ | `IPgmqQueueManager.ListInsertNotificationsAsync` |
+| FIFO indexes | `create_fifo_index`, `create_fifo_indexes_all` | ✅ | Worker setup for grouped consumers, or `IPgmqQueueManager.CreateFifoIndexAsync` / `CreateFifoIndexesAsync` |
+| Extension version | | ✅ | `IPgmqQueueManager.GetVersionAsync` |
+
+✅ supported · ➖ not needed
+
+## Using PGMQ features
+
+### FIFO groups
+
+Messages of one group are handled one at a time, in the order they were published. Different groups run in
+parallel, up to the consumer's concurrency. When a message fails and is retried, the rest of its group waits for it.
+
+```csharp
+[ConsumerOptions(ReadMode = PgmqReadMode.Grouped, Concurrency = 8)]
+public sealed class LedgerHandler : IPgmqConsumer<LedgerEntry> { ... }
+
+await publisher.PublishAsync(entry, new PgmqPublishOptions { GroupId = entry.AccountId.ToString() });
+```
+
+### Topics
+
+Topic routing works next to the type-based fan-out. A consumer binds patterns to its queue (`*` is one word, `#` is
+any number), and a publish to a routing key reaches every queue whose pattern matches.
+
+```csharp
+[TopicBinding("orders.*.created")]
+public sealed class OrderAuditHandler : IPgmqConsumer<OrderCreated> { ... }
+
+int queues = await publisher.PublishToTopicAsync("orders.eu.created", new OrderCreated(orderId));
+```
+
+### Queue types, filters and at-most-once
+
+```csharp
+// Alternatives: a consumer has one [ConsumerOptions], and these settings combine in it.
+[ConsumerOptions(QueueType = PgmqQueueType.Unlogged)]          // fast, but lost on a crash
+[ConsumerOptions(QueueType = PgmqQueueType.Partitioned,        // needs pg_partman; old partitions are dropped
+                 PartitionInterval = "1 day", RetentionInterval = "7 days")]
+[ConsumerOptions(Filter = """{"region":"eu"}""")]              // reads only bodies that contain this JSON
+[ConsumerOptions(AtMostOnce = true)]                           // pgmq.pop: no retries, a failure loses the message
+```
+
+A queue gets its type when it is created. An existing queue keeps its type, and a warning is logged if the consumer
+asks for a different one. Filters match the JSON body as it is serialized, with camelCase property names.
+
+### Waking up: notifications and long polling
+
+`UseInsertNotifications = true` makes each queue send a PostgreSQL notification on insert and wakes the idle consumer
+at once, over one extra connection per host. Polling continues in the background, so a missed notification costs at
+most `MaxIdleDelay`. `LongPollTimeout` instead lets the database wait for messages (`read_with_poll`), holding one
+connection per idle queue.
+
+### Headers
+
+`PgmqPublishOptions.Headers` travel with the message and reach the consumer as `context.Headers`, next to
+`context.GroupId`. Redelivered messages keep both.
+
+### Queue management
+
+`IPgmqQueueManager` resolves from dependency injection, or create a `new PgmqQueueManager(dataSource)` without hosting:
+
+```csharp
+PgmqQueueMetrics metrics = await queues.GetMetricsAsync("order_created");
+await queues.PurgeQueueAsync("order_created");
+await queues.BindTopicAsync("logs.#", "log_sink");
+```
+
 ## Configuration
 
 | Option | Default | |
@@ -92,21 +210,26 @@ At start-up Pgmq creates the pgmq extension (if it can) and one queue per consum
 | `RetryBackoff` / `MaxRetryBackoff` | 30 s / 30 min | |
 | `DrainGrace` / `AbandonAfter` | 20 s / 30 s | |
 | `MinIdleDelay` / `MaxIdleDelay` | 200 ms / 5 s | Polling of an empty queue. |
+| `UseInsertNotifications` / `InsertNotificationThrottle` | `false` / 250 ms | Wake idle queues through LISTEN/NOTIFY. |
+| `LongPollTimeout` | `null` | Long-poll empty queues in the database instead. |
 | `UnavailableHealthStatus` / `StalledHealthStatus` | `Unhealthy` | Use `Degraded` to keep a pod in service. |
 
-A consumer's queue, concurrency and timeout come from `AddPgmqConsumer<T>(c => ...)`, then `[QueueName]` and
-`[ConsumerOptions]`, then these defaults. Pin queue names with `[QueueName]` and message names with `[MessageName]`
+A consumer's queue, concurrency, timeout, read mode, queue type, filter and at-most-once setting come from
+`AddPgmqConsumer<T>(c => ...)`, then `[QueueName]`, `[ConsumerOptions]` and `[TopicBinding]`, then these defaults. Pin queue names with `[QueueName]` and message names with `[MessageName]`
 before renaming or moving a class: the names live in the database.
 
 Add `services.AddHealthChecks().AddPgmq()` for the health check, and the `Pgmq` source to your tracer for spans.
 
 ## Limitations
 
-- **Polling, not push.** An idle queue picks up a new message within `MaxIdleDelay`. LISTEN/NOTIFY is not used yet.
+- **Polling by default.** An idle queue picks up a new message within `MaxIdleDelay` unless insert notifications or
+  long polling are turned on.
 - **Separate writes per queue.** Publishing to several queues is not one transaction, and there is no transactional
-  outbox with your own database writes.
-- **Archives grow.** Nothing trims `pgmq.a_*` tables.
-- **No ordering guarantees** within a queue under concurrency.
+  outbox with your own database writes. A topic publish is one statement.
+- **Archives grow** on standard and unlogged queues. Partitioned queues drop old partitions; `ConvertArchivePartitionedAsync`
+  partitions an existing archive.
+- **No ordering guarantees** within a queue under concurrency, except per group in the grouped read modes.
+- **PGMQ 1.13 or later** for every feature here; older versions lack the FIFO, topic and notification functions.
 
 ## Repository
 

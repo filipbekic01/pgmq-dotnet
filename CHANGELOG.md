@@ -5,6 +5,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Support for every function of the PGMQ 1.13 SQL API; the README has a table of what maps where.
+- `IPgmqQueueManager` / `PgmqQueueManager`: create (standard, unlogged, partitioned), ensure, drop, purge, list and
+  check queues; metrics; topic bindings and routing tests; insert notifications; FIFO indexes; archive partitioning;
+  the extension version.
+- `PgmqPublishOptions` with a delay or delivery time, a FIFO `GroupId` and custom `Headers`, and `PublishToTopicAsync`
+  / `PublishBatchToTopicAsync` for topic routing.
+- Consumers: `ReadMode` (`Grouped`, `GroupedRoundRobin`, `GroupedHead` FIFO reads, in order per group),
+  `QueueType` with partition settings, `AtMostOnce` (`pgmq.pop`), `Filter` (conditional read) and `[TopicBinding]`.
+  `context.GroupId` and `context.Headers` reach the consumer and survive a redelivery.
+- `PgmqOptions.UseInsertNotifications` wakes idle queues through LISTEN/NOTIFY; `PgmqOptions.LongPollTimeout`
+  long-polls in the database.
+
+### Changed
+
+- `INpgmqClient`, the worker and the queue manager share one `NpgsqlDataSource`.
+- The worker reads through pgmq's SQL functions directly rather than through Npgmq.
+
 ## [0.1.0-alpha.1] - 2026-10-30
 
 ### Added

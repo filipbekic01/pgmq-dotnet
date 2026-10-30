@@ -22,6 +22,8 @@
   an arbitrary type to deserialize.
 - Message headers: message type, message id, redelivery count, and the W3C trace context.
 - `PgmqTelemetry`: the `Pgmq` activity source.
+- `IPgmqQueueManager` / `PgmqQueueManager`: the rest of the pgmq API (queue types, metrics, topics, notifications,
+  FIFO indexes), called as SQL over an `NpgsqlDataSource`.
 
 `Pgmq.Hosting` owns everything that runs in a host:
 
@@ -49,8 +51,15 @@ One read loop per queue, each with its own semaphore of slots:
    consumer.
 4. Free the slot.
 
-An empty queue backs off its polling from `MinIdleDelay` to `MaxIdleDelay`. A loop that fails restarts itself and
-reports a heartbeat, which `PgmqStatus` and the health check read.
+An empty queue backs off its polling from `MinIdleDelay` to `MaxIdleDelay`. With insert notifications on, one
+connection per host LISTENs to every such queue and a notification ends the wait; with `LongPollTimeout` the read
+itself waits in the database. A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the
+health check read.
+
+Each consumer's settings pick the pgmq read function: `read` (with an optional conditional filter), one of the
+grouped FIFO reads, or `pop` for at-most-once. A grouped read can return several messages of one group; they run one
+after another on one task, and when one does not succeed the rest are released unhandled, so a group never runs out of
+order. pgmq itself holds back a group while one of its messages is invisible.
 
 Timeouts cancel the consumer's token; a consumer that ignores it is abandoned after `AbandonAfter` so its slot frees.
 On shutdown the loops stop reading, running consumers get `DrainGrace`, and a message that stops on cancellation is
@@ -60,8 +69,6 @@ made visible again at once.
 
 Not implemented yet, and open to design:
 
-- **LISTEN/NOTIFY as a wake-up.** Polling stays as the fallback for missed notifications; a notification only shortens
-  the wait on an idle queue.
 - **Transactional publishing** together with the application's own writes.
-- **Archive retention.**
+- **Archive retention** for queues that are not partitioned.
 - **Metrics** for queue depth, age of the oldest message, and outcomes.

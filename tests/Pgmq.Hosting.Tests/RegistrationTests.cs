@@ -81,6 +81,78 @@ public sealed class RegistrationTests
     }
 
     [Fact]
+    public void Queue_type_read_mode_bindings_and_notifications_Should_come_from_attributes_then_registration()
+    {
+        using ServiceProvider services = Build(o =>
+        {
+            o.ConnectionString = Unreachable;
+            o.UseInsertNotifications = true;
+        }, s => s
+            .AddPgmqConsumer<FifoConsumer>()
+            .AddPgmqConsumer<SecondConsumer>(c =>
+            {
+                c.Queue = PgmqQueueOptions.Partitioned("1 day", "7 days");
+                c.Filter = """{ "region": "eu" }""";
+                c.TopicBindings.Add("orders.#");
+                c.UseInsertNotifications = false;
+            }));
+
+        ConsumerRegistration[] consumers = [.. services.GetRequiredService<ConsumerRegistry>().Consumers];
+        ConsumerRegistration fifo = consumers.Single(c => c.ConsumerType == typeof(FifoConsumer));
+        ConsumerRegistration second = consumers.Single(c => c.ConsumerType == typeof(SecondConsumer));
+
+        Assert.Equal(PgmqReadMode.GroupedRoundRobin, fifo.ReadMode);
+        Assert.Equal(PgmqQueueType.Unlogged, fifo.Queue.Type);
+        Assert.Equal(["orders.*.created", "audit.#"], fifo.TopicBindings);
+        Assert.True(fifo.UseInsertNotifications);
+
+        Assert.Equal(PgmqQueueType.Partitioned, second.Queue.Type);
+        Assert.Equal(("1 day", "7 days"), (second.Queue.PartitionInterval, second.Queue.RetentionInterval));
+        Assert.Equal(["orders.#"], second.TopicBindings);
+        Assert.False(second.UseInsertNotifications);
+        Assert.Equal("""{ "region": "eu" }""", second.Filter);
+    }
+
+    [Theory]
+    [InlineData("not json")]
+    [InlineData("[1, 2]")]
+    public void A_filter_that_is_not_a_json_object_Should_be_refused(string filter)
+    {
+        using ServiceProvider services = Build(o => o.ConnectionString = Unreachable,
+            s => s.AddPgmqConsumer<SecondConsumer>(c => c.Filter = filter));
+
+        Assert.Throws<InvalidOperationException>(() => services.GetRequiredService<ConsumerRegistry>());
+    }
+
+    [Fact]
+    public void Settings_pgmq_cannot_combine_Should_be_refused()
+    {
+        using ServiceProvider popGrouped = Build(o => o.ConnectionString = Unreachable,
+            s => s.AddPgmqConsumer<FifoConsumer>(c => c.AtMostOnce = true));
+        using ServiceProvider filterGrouped = Build(o => o.ConnectionString = Unreachable,
+            s => s.AddPgmqConsumer<FifoConsumer>(c => c.Filter = "{}"));
+        using ServiceProvider filterPop = Build(o => o.ConnectionString = Unreachable,
+            s => s.AddPgmqConsumer<SecondConsumer>(c =>
+            {
+                c.AtMostOnce = true;
+                c.Filter = "{}";
+            }));
+
+        Assert.Throws<InvalidOperationException>(() => popGrouped.GetRequiredService<ConsumerRegistry>());
+        Assert.Throws<InvalidOperationException>(() => filterGrouped.GetRequiredService<ConsumerRegistry>());
+        Assert.Throws<InvalidOperationException>(() => filterPop.GetRequiredService<ConsumerRegistry>());
+    }
+
+    [Fact]
+    public void The_queue_manager_and_client_Should_resolve_from_the_registrations()
+    {
+        using ServiceProvider services = Build(o => o.ConnectionString = Unreachable, _ => { });
+
+        Assert.IsType<PgmqQueueManager>(services.GetRequiredService<IPgmqQueueManager>());
+        Assert.NotNull(services.GetRequiredService<Npgmq.INpgmqClient>());
+    }
+
+    [Fact]
     public void A_queue_name_formatter_Should_name_consumers_without_a_pinned_name()
     {
         using ServiceProvider services = Build(o =>
@@ -179,6 +251,15 @@ public sealed class RegistrationTests
 
     [QueueName("second_queue")]
     public sealed class SecondConsumer : IPgmqConsumer<Ping>
+    {
+        public Task HandleAsync(PgmqConsumeContext<Ping> context, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    [QueueName("fifo_queue")]
+    [ConsumerOptions(ReadMode = PgmqReadMode.GroupedRoundRobin, QueueType = PgmqQueueType.Unlogged)]
+    [TopicBinding("orders.*.created")]
+    [TopicBinding("audit.#")]
+    public sealed class FifoConsumer : IPgmqConsumer<Ping>
     {
         public Task HandleAsync(PgmqConsumeContext<Ping> context, CancellationToken cancellationToken) => Task.CompletedTask;
     }

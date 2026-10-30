@@ -18,7 +18,7 @@ public sealed class ConsumeContextTests
         Mock<IPgmqPublisher> publisher = new(MockBehavior.Strict);
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), publisher.Object,
-            sendBack: (_, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+            sendBack: (_, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
 
         await context.PublishAsync(new Ping(), Ct);
         await context.SchedulePublishAsync(new Ping(), TimeSpan.FromMinutes(1), Ct);
@@ -35,7 +35,7 @@ public sealed class ConsumeContextTests
         (int Count, Guid? Id)? sentBack = null;
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
-            sendBack: (_, _, _, count, id, _) =>
+            sendBack: (_, _, _, count, id, _, _, _) =>
             {
                 sentBack = (count, id);
                 return Task.CompletedTask;
@@ -45,6 +45,28 @@ public sealed class ConsumeContextTests
         await outbox.FlushAsync(Ct);
 
         Assert.Equal((3, messageId), sentBack);
+    }
+
+    [Fact]
+    public async Task A_redelivery_Should_keep_the_group_and_headers()
+    {
+        (string? Group, IReadOnlyDictionary<string, string>? Headers)? sentBack = null;
+        Outbox outbox = new();
+        Dictionary<string, string> headers = new() { ["tenant"] = "acme" };
+        PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
+            sendBack: (_, _, _, _, _, group, sent, _) =>
+            {
+                sentBack = (group, sent);
+                return Task.CompletedTask;
+            }, outbox, Guid.NewGuid(), redeliveryCount: 0, groupId: "customer-1", headers: headers);
+
+        await context.RedeliverAsync(TimeSpan.FromSeconds(1));
+        await outbox.FlushAsync(Ct);
+
+        Assert.Equal("customer-1", sentBack?.Group);
+        Assert.Equal("acme", sentBack?.Headers?["tenant"]);
+        Assert.Equal("customer-1", context.GroupId);
+        Assert.Equal("acme", context.Headers["tenant"]);
     }
 
     [Fact]
