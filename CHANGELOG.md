@@ -5,6 +5,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-10-30
+
+### Added
+
+- `PgmqOptions.Database`: the database to use instead of the one in `ConnectionString`, so an application can pass
+  its own connection string and keep pgmq in a database of its own. It is created on start when missing.
+- README: which database and schema Pgmq uses, and how to override them. The `pgmq` schema is fixed by pgmq.
+
 ## [0.1.0-alpha.3] - 2026-10-30
 
 ### Added

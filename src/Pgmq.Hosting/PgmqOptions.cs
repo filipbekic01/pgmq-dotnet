@@ -10,8 +10,18 @@ namespace Pgmq;
 /// </summary>
 public sealed class PgmqOptions
 {
-    /// <summary>The PostgreSQL database with the pgmq extension. Set this or <see cref="DataSource"/>.</summary>
+    /// <summary>
+    /// The PostgreSQL server, credentials and database Pgmq uses. Set this or <see cref="DataSource"/>. Pgmq works in
+    /// the database it names, or in <see cref="Database"/> when that is set.
+    /// </summary>
     public string? ConnectionString { get; set; }
+
+    /// <summary>
+    /// The database to use instead of the one in <see cref="ConnectionString"/>, so an application can hand over its
+    /// own connection string and still keep pgmq apart, for example <c>"transport"</c>. Null uses the connection
+    /// string's. Created on start when missing (<see cref="CreateDatabase"/>). Not with <see cref="DataSource"/>.
+    /// </summary>
+    public string? Database { get; set; }
 
     /// <summary>A data source to share with the rest of the application. Set this or <see cref="ConnectionString"/>.</summary>
     public NpgsqlDataSource? DataSource { get; set; }
@@ -146,11 +156,26 @@ public sealed class PgmqOptions
     /// <summary>The queue name of a consumer without <see cref="QueueNameAttribute"/>. Null uses the default derivation.</summary>
     public Func<Type, string>? QueueNameFormatter { get; set; }
 
+    /// <summary><see cref="ConnectionString"/> with <see cref="Database"/> applied; null with a data source.</summary>
+    internal string? EffectiveConnectionString => ConnectionString is null || Database is null
+        ? ConnectionString
+        : new NpgsqlConnectionStringBuilder(ConnectionString) { Database = Database }.ConnectionString;
+
     internal void Validate()
     {
         if (ConnectionString is null == (DataSource is null))
         {
             throw new InvalidOperationException($"Set exactly one of {nameof(ConnectionString)} and {nameof(DataSource)}.");
+        }
+
+        if (Database is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(Database, nameof(Database));
+            if (DataSource is not null)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(Database)} needs {nameof(ConnectionString)}; a {nameof(DataSource)} names its own database.");
+            }
         }
 
         ArgumentException.ThrowIfNullOrEmpty(MaintenanceDatabase, nameof(MaintenanceDatabase));

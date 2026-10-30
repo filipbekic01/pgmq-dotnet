@@ -166,6 +166,7 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | Option | Default | |
 |---|---|---|
 | `ConnectionString` / `DataSource` | | One of the two is required. |
+| `Database` | | The database to use instead of the connection string's, e.g. `"transport"`. Not with `DataSource`. |
 | `AutoSetup` | `true` | Create the database, install or upgrade pgmq, and create queues and triggers on start. Off to only check they exist. |
 | `CreateDatabase` | `true` | With `AutoSetup`, create the database in `ConnectionString` when missing (needs `CREATEDB`). Not with `DataSource`. |
 | `MaintenanceDatabase` | `"postgres"` | Where `CreateDatabase` connects to create it. |

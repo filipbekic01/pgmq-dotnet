@@ -73,6 +73,22 @@ public sealed class MigrationTests(MigrationServers servers) : IClassFixture<Mig
     }
 
     [Fact]
+    public async Task Database_Should_set_pgmq_up_in_that_database_and_leave_the_connection_strings_alone()
+    {
+        string application = servers.NewOnExtensionServer();
+        string transport = new NpgsqlConnectionStringBuilder(application)
+        { Database = "own_" + Guid.NewGuid().ToString("N")[..12] }.ConnectionString;
+        await PgmqMigrator.EnsureDatabaseAsync(application, cancellationToken: Ct);
+
+        await StartSetupAsync(application, o => o.Database = new NpgsqlConnectionStringBuilder(transport).Database);
+
+        Assert.Equal("1.13.1", await ScalarAsync<string>(transport,
+            "select extversion from pg_extension where extname = 'pgmq'"));
+        Assert.Equal(0L, await ScalarAsync<long>(application,
+            "select count(*) from pg_namespace where nspname = 'pgmq'"));
+    }
+
+    [Fact]
     public async Task Without_the_extension_Should_install_the_embedded_sql_record_it_and_carry_messages()
     {
         string connectionString = servers.NewOnPlainServer();
@@ -173,11 +189,15 @@ public sealed class MigrationTests(MigrationServers servers) : IClassFixture<Mig
     }
 
     /// <summary>Runs Pgmq's start-up setup, as a host does, over one consumer, and requires it to succeed.</summary>
-    private static async Task StartSetupAsync(string connectionString)
+    private static async Task StartSetupAsync(string connectionString, Action<PgmqOptions>? configure = null)
     {
         ServiceCollection collection = new();
         collection.AddLogging(b => b.SetMinimumLevel(LogLevel.Warning));
-        collection.AddPgmq(options => options.ConnectionString = connectionString);
+        collection.AddPgmq(options =>
+        {
+            options.ConnectionString = connectionString;
+            configure?.Invoke(options);
+        });
         collection.AddPgmqConsumer<MigrationPingConsumer>();
 
         await using ServiceProvider services = collection.BuildServiceProvider(validateScopes: true);

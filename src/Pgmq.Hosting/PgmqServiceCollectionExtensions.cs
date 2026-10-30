@@ -32,7 +32,7 @@ public static class PgmqServiceCollectionExtensions
 
         // One pool for everything Pgmq does. A data source Pgmq builds is its own and disposed with the container;
         // one handed in belongs to the application.
-        services.TryAddSingleton(_ => new PgmqDatabase(options.DataSource, options.ConnectionString));
+        services.TryAddSingleton(_ => new PgmqDatabase(options.DataSource, options.EffectiveConnectionString));
         services.TryAddSingleton(sp => new PgmqQueueManager(sp.GetRequiredService<PgmqDatabase>().DataSource));
         services.TryAddSingleton<IPgmqQueueManager>(sp => sp.GetRequiredService<PgmqQueueManager>());
         services.TryAddSingleton(sp => new QueueReader(sp.GetRequiredService<PgmqDatabase>().DataSource, options));
