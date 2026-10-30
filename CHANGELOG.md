@@ -18,6 +18,8 @@ All notable changes to this project are recorded here. The format follows
   `context.GroupId` and `context.Headers` reach the consumer and survive a redelivery.
 - `PgmqOptions.UseInsertNotifications` wakes idle queues through LISTEN/NOTIFY, on by default.
   `PgmqOptions.LongPollTimeout` (5 s by default) long-polls in the database whenever notifications are not live.
+- The benchmark's `--matrix` runs the same messages over 1 to 200 queues and draws `docs/benchmark.svg`, shown in
+  the README.
 - `PgmqOptions.AutoSetup` (on by default) creates the extension, queues and triggers on start; off only checks that
   they exist.
 

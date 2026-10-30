@@ -26,6 +26,7 @@ issues.
 - Keep a pull request to one change, with tests: unit tests where the logic allows, integration tests for anything that
   depends on PGMQ.
 - If it can change throughput, run the benchmark before and after on the same machine and include both results.
+  `-- --matrix` reruns it across 1 to 200 queues and redraws the README chart, `docs/benchmark.svg`.
 - Add a line to the `Unreleased` section of `CHANGELOG.md`.
 - Do not add a dependency or a public abstraction until a feature needs it.
 
