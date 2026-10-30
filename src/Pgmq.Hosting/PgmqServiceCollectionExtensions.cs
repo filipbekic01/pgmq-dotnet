@@ -2,7 +2,6 @@ using System.Reflection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Npgmq;
 using Pgmq;
 using Pgmq.Hosting;
 
@@ -14,8 +13,8 @@ public static class PgmqServiceCollectionExtensions
     /// <summary>
     /// Adds the publisher (<see cref="IPgmqPublisher"/>), the queue manager (<see cref="IPgmqQueueManager"/>), the
     /// queue setup that runs at start, <see cref="PgmqStatus"/>, and, unless <see cref="PgmqOptions.RunConsumers"/> is
-    /// off, the worker that runs the consumers registered with <see cref="AddPgmqConsumer{TConsumer}"/>. The pgmq
-    /// client underneath (<see cref="INpgmqClient"/>) resolves too, for direct access to a queue.
+    /// off, the worker that runs the consumers registered with <see cref="AddPgmqConsumer{TConsumer}"/>. The queue
+    /// manager also deletes, archives and hides messages by id, for direct access to a queue.
     /// <code>
     /// services.AddPgmq(options => options.ConnectionString = connectionString);
     /// services.AddPgmqConsumer&lt;OrderCreatedHandler&gt;();
@@ -34,7 +33,6 @@ public static class PgmqServiceCollectionExtensions
         // One pool for everything Pgmq does. A data source Pgmq builds is its own and disposed with the container;
         // one handed in belongs to the application.
         services.TryAddSingleton(_ => new PgmqDatabase(options.DataSource, options.ConnectionString));
-        services.TryAddSingleton<INpgmqClient>(sp => new NpgmqClient(sp.GetRequiredService<PgmqDatabase>().DataSource));
         services.TryAddSingleton(sp => new PgmqQueueManager(sp.GetRequiredService<PgmqDatabase>().DataSource));
         services.TryAddSingleton<IPgmqQueueManager>(sp => sp.GetRequiredService<PgmqQueueManager>());
         services.TryAddSingleton(sp => new QueueReader(sp.GetRequiredService<PgmqDatabase>().DataSource, options));
@@ -43,7 +41,8 @@ public static class PgmqServiceCollectionExtensions
         services.TryAddSingleton(sp => new ConsumerRegistry(sp.GetServices<ConsumerDescriptor>(), options));
         services.TryAddSingleton(sp => sp.GetRequiredService<ConsumerRegistry>().Topology);
         services.TryAddSingleton<PgmqStatus>();
-        services.TryAddSingleton<PgmqPublisher>();
+        services.TryAddSingleton(sp => new PgmqPublisher(sp.GetRequiredService<PgmqDatabase>().DataSource,
+            sp.GetRequiredService<PgmqTopology>(), sp.GetRequiredService<ILogger<PgmqPublisher>>()));
         services.TryAddSingleton<IPgmqPublisher>(sp => sp.GetRequiredService<PgmqPublisher>());
 
         // Setup first: hosted services start in order, so the worker knows whether Pgmq is there.

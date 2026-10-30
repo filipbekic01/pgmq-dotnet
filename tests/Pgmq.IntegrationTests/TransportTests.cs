@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using Npgmq;
 
 namespace Pgmq.IntegrationTests;
 
@@ -166,8 +165,7 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await harness.StopAsync();
 
         // Released, not left to its lease: it can be read again at once.
-        NpgmqMessage<string>? again = await harness.Client.ReadAsync<string>("t_hanging", 30, Ct);
-        Assert.NotNull(again);
+        Assert.Equal(1, (await harness.Queues.GetMetricsAsync("t_hanging", Ct)).VisibleLength);
         await harness.DisposeAsync();
     }
 

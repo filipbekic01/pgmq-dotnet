@@ -26,9 +26,8 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
 ## PGMQ feature support
 
 Every function in the [PGMQ 1.13 SQL API](https://pgmq.github.io/pgmq/latest/api/sql/functions/) and where to find
-it. "Worker" means the consumer worker in `Pgmq.Hosting` uses it for you. `INpgmqClient`, the
-[Npgmq](https://github.com/brianpursley/Npgmq) client underneath, resolves from dependency injection for direct
-access to a queue.
+it. "Worker" means the consumer worker in `Pgmq.Hosting` uses it for you. Pgmq calls these functions itself, with
+Npgsql and nothing else in between.
 
 | PGMQ feature | Function | Supported | How |
 |---|---|:---:|---|
@@ -53,10 +52,10 @@ access to a queue.
 | FIFO, head of each group | `read_grouped_head`, `read_grouped_head_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedHead` |
 | Read and delete (at most once) | `pop` | ✅ | `[ConsumerOptions(AtMostOnce = true)]` |
 | **Deleting and archiving** | | | |
-| Delete a message | `delete` | ✅ | Worker, when a consumer succeeds |
-| Delete a batch | `delete(…, msg_ids[])` | ✅ | `INpgmqClient.DeleteBatchAsync` |
-| Archive a message | `archive` | ✅ | Worker, on a permanent failure, timeout or the last attempt |
-| Archive a batch | `archive(…, msg_ids[])` | ✅ | `INpgmqClient.ArchiveBatchAsync` |
+| Delete a message | `delete` | ✅ | Worker, when a consumer succeeds; or `IPgmqQueueManager.DeleteMessageAsync` |
+| Delete a batch | `delete(…, msg_ids[])` | ✅ | `IPgmqQueueManager.DeleteMessagesAsync` |
+| Archive a message | `archive` | ✅ | Worker, on a permanent failure, timeout or the last attempt; or `IPgmqQueueManager.ArchiveMessageAsync` |
+| Archive a batch | `archive(…, msg_ids[])` | ✅ | `IPgmqQueueManager.ArchiveMessagesAsync` |
 | Purge a queue | `purge_queue` | ✅ | `IPgmqQueueManager.PurgeQueueAsync` |
 | **Queue management** | | | |
 | Create a queue | `create`, `create_non_partitioned` | ✅ | Worker setup for every consumer, or `IPgmqQueueManager.CreateQueueAsync` / `EnsureQueueAsync` |
@@ -66,7 +65,7 @@ access to a queue.
 | Drop a queue | `drop_queue` | ✅ | `IPgmqQueueManager.DropQueueAsync` |
 | Detach an archive | `detach_archive` | ➖ | A deprecated no-op in PGMQ, so left out |
 | **Utilities** | | | |
-| Set the visibility timeout | `set_vt` (one or many, seconds or timestamp) | ✅ | Worker for leases, retries and releases; `INpgmqClient.SetVtAsync` / `SetVtBatchAsync` |
+| Set the visibility timeout | `set_vt` (one or many) | ✅ | Worker for leases, retries and releases; or `IPgmqQueueManager.SetVisibilityTimeoutAsync` |
 | List queues | `list_queues` | ✅ | `IPgmqQueueManager.ListQueuesAsync` |
 | Metrics for a queue / all queues | `metrics`, `metrics_all` | ✅ | `IPgmqQueueManager.GetMetricsAsync` / `GetAllMetricsAsync`, with `DefaultPartitionLength` to spot failing pg_partman maintenance |
 | Lock a queue for a transaction | `acquire_queue_lock` | ✅ | `EnsureQueueAsync` uses it; or `IPgmqQueueManager.AcquireQueueLockAsync(queue, transaction)` |

@@ -3,7 +3,6 @@ using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Npgmq;
 using Npgsql;
 using Pgmq.Benchmarks;
 using Pgmq.Hosting;
@@ -54,6 +53,27 @@ public sealed class PgmqFixture : IAsyncLifetime
         return await command.ExecuteScalarAsync();
     }
 
+    /// <summary>Sends <paramref name="count"/> small messages straight to <paramref name="queue"/>; their ids, oldest first.</summary>
+    public async Task<long[]> SendAsync(string queue, int count)
+    {
+        await using NpgsqlConnection connection = new(ConnectionString);
+        await connection.OpenAsync();
+        await using NpgsqlCommand command = new(
+            "select * from pgmq.send_batch($1, array(select jsonb_build_object('n', i) from generate_series(1, $2) i))",
+            connection);
+        command.Parameters.AddWithValue(queue);
+        command.Parameters.AddWithValue(count);
+
+        List<long> ids = [];
+        await using NpgsqlDataReader reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            ids.Add(reader.GetInt64(0));
+        }
+
+        return [.. ids.Order()];
+    }
+
     /// <summary>Messages archived from <paramref name="queue"/>.</summary>
     public Task<long> ArchivedAsync(string queue) => ScalarAsync($"select count(*) from pgmq.a_{queue}");
 
@@ -85,7 +105,7 @@ public sealed class TransportHarness : IAsyncDisposable
 
     public IPgmqPublisher Bus => _services.GetRequiredService<IPgmqPublisher>();
     public PgmqStatus Status => _services.GetRequiredService<PgmqStatus>();
-    public INpgmqClient Client => _services.GetRequiredService<INpgmqClient>();
+    public IPgmqQueueManager Queues => _services.GetRequiredService<IPgmqQueueManager>();
     private ConsumerWorker Worker => _services.GetRequiredService<ConsumerWorker>();
 
     /// <param name="reset">Empty the queues first. False for a second instance joining queues already in use.</param>

@@ -3,7 +3,6 @@ using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Npgmq;
 
 namespace Pgmq.Hosting;
 
@@ -51,7 +50,7 @@ namespace Pgmq.Hosting;
 /// </para>
 /// </summary>
 internal sealed class ConsumerWorker(
-    INpgmqClient client,
+    PgmqQueueManager queues,
     QueueReader reader,
     InsertListener listener,
     ConsumerRegistry registry,
@@ -493,11 +492,11 @@ internal sealed class ConsumerWorker(
         {
             await RetryAsync(ct => settlement.Kind switch
             {
-                SettlementKind.Delete => client.DeleteAsync(queue, message.MsgId, ct),
-                SettlementKind.Archive => client.ArchiveAsync(queue, message.MsgId, ct),
-                SettlementKind.Retry => client.SetVtAsync(queue, message.MsgId,
-                    Math.Max(1, (int)Math.Ceiling(settlement.Delay.TotalSeconds)), ct),
-                SettlementKind.Release => client.SetVtAsync(queue, message.MsgId, 0, ct),
+                SettlementKind.Delete => queues.DeleteMessageAsync(queue, message.MsgId, ct),
+                SettlementKind.Archive => queues.ArchiveMessageAsync(queue, message.MsgId, ct),
+                SettlementKind.Retry => queues.SetVisibilityTimeoutAsync(queue, message.MsgId,
+                    TimeSpan.FromSeconds(Math.Max(1, (int)Math.Ceiling(settlement.Delay.TotalSeconds))), ct),
+                SettlementKind.Release => queues.SetVisibilityTimeoutAsync(queue, message.MsgId, TimeSpan.Zero, ct),
                 _ => Task.CompletedTask,
             }, settlement.Kind.ToString().ToLowerInvariant(), state, message);
         }
@@ -539,7 +538,8 @@ internal sealed class ConsumerWorker(
                 long[] leased = [.. state.Leased.Keys];
                 if (leased.Length > 0)
                 {
-                    await client.SetVtBatchAsync(state.Consumer.QueueName, leased, LeaseSeconds, CancellationToken.None);
+                    await queues.SetVisibilityTimeoutAsync(state.Consumer.QueueName, leased,
+                        TimeSpan.FromSeconds(LeaseSeconds), CancellationToken.None);
                 }
             }
             catch (OperationCanceledException) when (stop.IsCancellationRequested)

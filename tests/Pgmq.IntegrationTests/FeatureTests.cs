@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using Npgmq;
 using Npgsql;
 
 namespace Pgmq.IntegrationTests;
@@ -227,6 +226,7 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     public async Task The_queue_manager_Should_create_inspect_and_drop_queues()
     {
         PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
 
         Assert.Equal("1.13.1", await queues.GetVersionAsync(Ct));
 
@@ -242,8 +242,8 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         Assert.Contains(listed, q => q is { QueueName: "m_partitioned", IsPartitioned: true });
         Assert.Contains(listed, q => q is { QueueName: "m_unlogged", IsUnlogged: true });
 
-        NpgmqClient client = new(db.ConnectionString);
-        await client.SendBatchAsync("m_standard", ["""{"a":1}""", """{"a":2}""", """{"a":3}"""], Ct);
+        await db.ScalarObjectAsync(
+            """select count(*) from pgmq.send_batch('m_standard', array['{"a":1}', '{"a":2}', '{"a":3}']::jsonb[])""");
 
         PgmqQueueMetrics metrics = await queues.GetMetricsAsync("m_standard", Ct);
         Assert.Equal((3L, 3L), (metrics.QueueLength, metrics.VisibleLength));
@@ -261,9 +261,40 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task The_queue_manager_Should_delete_archive_and_hide_messages_by_id()
+    {
+        PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
+        await queues.EnsureQueueAsync("m_messages", cancellationToken: Ct);
+        await db.ResetAsync("m_messages");
+
+        long[] ids = await db.SendAsync("m_messages", 6);
+
+        Assert.True(await queues.SetVisibilityTimeoutAsync("m_messages", ids[0], TimeSpan.FromMinutes(5), Ct));
+        Assert.Equal([ids[1], ids[2]],
+            (await queues.SetVisibilityTimeoutAsync("m_messages", [ids[1], ids[2]], TimeSpan.FromMinutes(5), Ct))
+            .Order());
+        Assert.Equal(3, (await queues.GetMetricsAsync("m_messages", Ct)).VisibleLength);
+        Assert.True(await queues.SetVisibilityTimeoutAsync("m_messages", ids[0], TimeSpan.Zero, Ct));
+        Assert.Equal(4, (await queues.GetMetricsAsync("m_messages", Ct)).VisibleLength);
+
+        Assert.True(await queues.DeleteMessageAsync("m_messages", ids[0], Ct));
+        Assert.False(await queues.DeleteMessageAsync("m_messages", ids[0], Ct));
+        Assert.Equal([ids[1]], await queues.DeleteMessagesAsync("m_messages", [ids[1], ids[0]], Ct));
+
+        Assert.True(await queues.ArchiveMessageAsync("m_messages", ids[2], Ct));
+        Assert.Equal([ids[3], ids[4]], (await queues.ArchiveMessagesAsync("m_messages", [ids[3], ids[4]], Ct)).Order());
+
+        Assert.Equal(1, await db.CountAsync("m_messages"));
+        Assert.Equal(3, await db.ArchivedAsync("m_messages"));
+        Assert.False(await queues.SetVisibilityTimeoutAsync("m_messages", ids[0], TimeSpan.Zero, Ct));
+    }
+
+    [Fact]
     public async Task The_queue_manager_Should_hold_a_queue_lock_until_the_transaction_ends()
     {
         PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
         await queues.EnsureQueueAsync("m_lock", cancellationToken: Ct);
 
         await using NpgsqlConnection holder = new(db.ConnectionString);
@@ -296,6 +327,7 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     public async Task The_queue_manager_Should_bind_topics_and_test_routing()
     {
         PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
         await queues.EnsureQueueAsync("m_topics", cancellationToken: Ct);
 
         await queues.BindTopicAsync("m.logs.#", "m_topics", Ct);
@@ -314,6 +346,7 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     public async Task The_queue_manager_Should_turn_insert_notifications_on_change_them_and_off()
     {
         PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
         await queues.EnsureQueueAsync("m_notify", cancellationToken: Ct);
 
         await queues.EnableInsertNotificationsAsync("m_notify", TimeSpan.FromMilliseconds(100), Ct);
@@ -337,6 +370,7 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     public async Task The_queue_manager_Should_index_fifo_headers_and_partition_an_archive()
     {
         PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
         await queues.EnsureQueueAsync("m_fifo", cancellationToken: Ct);
         await queues.EnsureQueueAsync("m_archive", cancellationToken: Ct);
         await queues.InitPartmanAsync(Ct);

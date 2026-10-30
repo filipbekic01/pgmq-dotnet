@@ -5,12 +5,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-10-30
+
 ### Added
 
 - Support for every function of the PGMQ 1.13 SQL API; the README has a table of what maps where.
 - `IPgmqQueueManager` / `PgmqQueueManager`: create (standard, unlogged, partitioned), ensure, drop, purge, list and
   check queues; metrics; topic bindings and routing tests; insert notifications; FIFO indexes; archive partitioning;
-  the extension version; `AcquireQueueLockAsync` (`pgmq.acquire_queue_lock`) to lock a queue for a transaction.
+  the extension version; deleting, archiving and hiding messages by id, one or many at a time;
+  `AcquireQueueLockAsync` (`pgmq.acquire_queue_lock`) to lock a queue for a transaction.
 - `PgmqQueueMetrics.DefaultPartitionLength`: how many messages of a partitioned queue sit in its default partition,
   which means pg_partman maintenance is failing.
 - `PgmqPublishOptions` with a delay or delivery time, a FIFO `GroupId` and custom `Headers`, and `PublishToTopicAsync`
@@ -26,9 +29,14 @@ All notable changes to this project are recorded here. The format follows
 ### Changed
 
 - The README is a short introduction; the details moved to `docs/guide.md`.
+- The publisher, the worker and the queue manager share one `NpgsqlDataSource`.
+- Pgmq calls pgmq's SQL functions directly and no longer depends on Npgmq. `PgmqPublisher` takes an
+  `NpgsqlDataSource`.
 
-- `INpgmqClient`, the worker and the queue manager share one `NpgsqlDataSource`.
-- The worker reads through pgmq's SQL functions directly rather than through Npgmq.
+### Removed
+
+- `INpgmqClient` is no longer registered. Its message operations are on `IPgmqQueueManager`: `DeleteMessageAsync`,
+  `DeleteMessagesAsync`, `ArchiveMessageAsync`, `ArchiveMessagesAsync` and `SetVisibilityTimeoutAsync`.
 
 ## [0.1.0-alpha.1] - 2026-10-30
 
