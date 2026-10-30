@@ -16,6 +16,31 @@ public sealed class RegistrationTests
         => Assert.Throws<InvalidOperationException>(() => new ServiceCollection().AddPgmq(_ => { }));
 
     [Fact]
+    public void Database_Should_replace_the_database_of_the_connection_string_and_keep_the_rest()
+    {
+        PgmqOptions options = new() { ConnectionString = Unreachable, Database = "transport" };
+
+        Npgsql.NpgsqlConnectionStringBuilder effective = new(options.EffectiveConnectionString);
+
+        Assert.Equal("transport", effective.Database);
+        Assert.Equal("127.0.0.1", effective.Host);
+        Assert.Equal("u", effective.Username);
+        Assert.Equal(Unreachable, new PgmqOptions { ConnectionString = Unreachable }.EffectiveConnectionString);
+    }
+
+    [Fact]
+    public void Database_with_a_data_source_Should_be_refused()
+    {
+        using Npgsql.NpgsqlDataSource dataSource = Npgsql.NpgsqlDataSource.Create(Unreachable);
+
+        Assert.Throws<InvalidOperationException>(() => new ServiceCollection().AddPgmq(o =>
+        {
+            o.DataSource = dataSource;
+            o.Database = "transport";
+        }));
+    }
+
+    [Fact]
     public void A_class_that_consumes_nothing_Should_be_refused()
         => Assert.Throws<ArgumentException>(() => new ServiceCollection().AddPgmqConsumer<NotAConsumer>());
 

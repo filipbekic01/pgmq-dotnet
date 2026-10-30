@@ -58,7 +58,7 @@ internal sealed class QueueSetup(
 
     private async Task SetUpAllAsync(CancellationToken cancellationToken)
     {
-        if (options is { CreateDatabase: true, ConnectionString: { } connectionString }
+        if (options is { CreateDatabase: true, EffectiveConnectionString: { } connectionString }
             && await PgmqMigrator.EnsureDatabaseAsync(connectionString, options.MaintenanceDatabase, cancellationToken))
         {
             logger.LogInformation("Created the database {Database} for pgmq",
