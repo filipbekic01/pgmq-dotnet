@@ -23,7 +23,7 @@
     <PropertyGroup Condition="$(MSBuildProjectDirectory.Contains('$([System.IO.Path]::DirectorySeparatorChar)src$([System.IO.Path]::DirectorySeparatorChar)'))">
         <IsPackable>true</IsPackable>
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
-        <Version>0.1.0-alpha.4</Version>
+        <Version>0.1.0-beta.1</Version>
         <Authors>Filip Bekić</Authors>
         <Copyright>Copyright (c) Filip Bekić</Copyright>
         <PackageLicenseExpression>MIT</PackageLicenseExpression>
