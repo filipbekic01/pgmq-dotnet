@@ -74,6 +74,29 @@ public sealed class PgmqFixture : IAsyncLifetime
         return [.. ids.Order()];
     }
 
+    /// <summary>
+    ///     Whether a connection to this database is calling <c>pgmq.<paramref name="function"/></c>, or did last. An
+    ///     idle pooled connection still shows its last query, and a long poll shows while it waits.
+    /// </summary>
+    public async Task<bool> CallsAsync(string function)
+    {
+        await using NpgsqlConnection connection = new(ConnectionString);
+        await connection.OpenAsync();
+        await using NpgsqlCommand command = new(
+            "select count(*) from pg_stat_activity " +
+            "where datname = current_database() and pid <> pg_backend_pid() and position($1 in query) > 0",
+            connection);
+        command.Parameters.AddWithValue($"pgmq.{function}(");
+        return (long)(await command.ExecuteScalarAsync())! > 0;
+    }
+
+    /// <summary>The column <paramref name="table"/> is partitioned by, or null when it is not partitioned.</summary>
+    public async Task<string?> PartitionColumnAsync(string table)
+        => (string?)await ScalarObjectAsync(
+            "select a.attname::text from pg_partitioned_table p " +
+            "join pg_attribute a on a.attrelid = p.partrelid and a.attnum = p.partattrs[0] " +
+            $"where p.partrelid = 'pgmq.{table}'::regclass");
+
     /// <summary>Messages archived from <paramref name="queue"/>.</summary>
     public Task<long> ArchivedAsync(string queue) => ScalarAsync($"select count(*) from pgmq.a_{queue}");
 
@@ -109,8 +132,10 @@ public sealed class TransportHarness : IAsyncDisposable
     private ConsumerWorker Worker => _services.GetRequiredService<ConsumerWorker>();
 
     /// <param name="reset">Empty the queues first. False for a second instance joining queues already in use.</param>
+    /// <param name="configureConsumers">Settings applied to every consumer, over its attributes.</param>
     public static async Task<TransportHarness> StartAsync(PgmqFixture db, Probe probe, Type[] consumers,
-        Action<PgmqOptions>? configure = null, bool reset = true)
+        Action<PgmqOptions>? configure = null, bool reset = true,
+        Action<PgmqConsumerOptions>? configureConsumers = null)
     {
         ServiceCollection collection = new();
         collection.AddLogging(b => b.SetMinimumLevel(LogLevel.Warning));
@@ -124,7 +149,7 @@ public sealed class TransportHarness : IAsyncDisposable
 
         foreach (Type consumer in consumers)
         {
-            collection.AddPgmqConsumer(consumer);
+            collection.AddPgmqConsumer(consumer, configureConsumers);
         }
 
         ServiceProvider services = collection.BuildServiceProvider(validateScopes: true);

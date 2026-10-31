@@ -182,6 +182,57 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task Every_way_to_delay_a_publish_Should_hold_the_message_until_its_time()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(OptionsConsumer));
+        TimeSpan delay = TimeSpan.FromSeconds(4);
+        PgmqPublishOptions delayed = new() { Delay = delay };
+
+        // send with a delivery time, send_batch with one, and send_topic / send_batch_topic with a delay in seconds.
+        await harness.Bus.SchedulePublishAsync(new OptionsMessage(1), DateTimeOffset.UtcNow + delay, Ct);
+        await harness.Bus.PublishAsync(new OptionsMessage(2),
+            new PgmqPublishOptions { DeliverAt = DateTimeOffset.UtcNow + delay }, Ct);
+        await harness.Bus.PublishAsync(new OptionsMessage(3), delayed, Ct);
+        await harness.Bus.PublishBatchAsync([new OptionsMessage(4), new OptionsMessage(5)], delayed, Ct);
+        Assert.Equal(1, await harness.Bus.PublishToTopicAsync("t.options.one", new OptionsMessage(6), delayed, Ct));
+        Assert.Equal(1, await harness.Bus.PublishBatchToTopicAsync("t.options.many",
+            [new OptionsMessage(7), new OptionsMessage(8)], delayed, Ct));
+
+        await Task.Delay(TimeSpan.FromSeconds(2), Ct);
+        Assert.Empty(_probe.Deliveries);
+        PgmqQueueMetrics waiting = await harness.Queues.GetMetricsAsync("t_options", Ct);
+        Assert.Equal((8L, 0L), (waiting.QueueLength, waiting.VisibleLength));
+
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 8, Within, "all arrived after the delay");
+        Assert.Equal(Enumerable.Range(1, 8),
+            _probe.Deliveries.Select(d => ((OptionsMessage)d.Message).Id).Order());
+    }
+
+    [Fact]
+    public async Task Headers_and_a_group_Should_travel_with_batch_and_topic_publishes()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(OptionsConsumer));
+        PgmqPublishOptions options = new()
+        {
+            GroupId = "g-1",
+            Headers = new Dictionary<string, string> { ["tenant"] = "acme" },
+        };
+
+        await harness.Bus.PublishBatchAsync([new OptionsMessage(1), new OptionsMessage(2)], options, Ct);
+        await harness.Bus.PublishToTopicAsync("t.options.one", new OptionsMessage(3), options, Ct);
+        await harness.Bus.PublishBatchToTopicAsync("t.options.many",
+            [new OptionsMessage(4), new OptionsMessage(5)], options, Ct);
+
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 5, Within, "every publish handled");
+        Assert.All(_probe.Deliveries, d =>
+        {
+            Assert.Equal("g-1", d.GroupId);
+            Assert.Equal("acme", d.Headers?["tenant"]);
+            Assert.NotNull(d.MessageId);
+        });
+    }
+
+    [Fact]
     public async Task A_redelivery_Should_keep_the_message_id_and_count_up()
     {
         await using TransportHarness harness = await StartAsync(typeof(RedeliveringConsumer));
@@ -266,6 +317,19 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         public Task HandleAsync(PgmqConsumeContext<FanOutMessage> context, CancellationToken cancellationToken)
         {
             probe.Record(nameof(FanOutSecondConsumer), context.Message, context);
+            return Task.CompletedTask;
+        }
+    }
+
+    public sealed record OptionsMessage(int Id);
+
+    [QueueName("t_options")]
+    [TopicBinding("t.options.#")]
+    public sealed class OptionsConsumer(Probe probe) : IPgmqConsumer<OptionsMessage>
+    {
+        public Task HandleAsync(PgmqConsumeContext<OptionsMessage> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(OptionsConsumer), context.Message, context);
             return Task.CompletedTask;
         }
     }
