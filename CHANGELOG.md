@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-10-31
+
 ### Added
 
 - Metrics on the `Pgmq` meter (`PgmqTelemetry.MeterName`), following the OpenTelemetry messaging conventions:

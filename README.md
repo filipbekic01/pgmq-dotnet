@@ -7,7 +7,7 @@ You publish a typed message; every consumer of that type gets its own durable co
 worker, with retries, timeouts and graceful shutdown. Consumers wake up instantly through PostgreSQL LISTEN/NOTIFY,
 with long polling as the fallback.
 
-> Early alpha (`0.1.0-alpha.4`). The API may change before 1.0.
+> Beta (`0.1.0-beta.1`). The API may still change before 1.0.
 
 ## Run it
 
