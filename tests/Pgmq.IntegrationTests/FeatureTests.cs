@@ -1,12 +1,11 @@
-using System.Collections.Concurrent;
 using Npgsql;
 
 namespace Pgmq.IntegrationTests;
 
 /// <summary>
-///     The pgmq features beyond plain send and read, against real PGMQ: queue types, FIFO groups, topics, insert
-///     notifications, long polling, at-most-once reads, filters, headers, and the queue manager. Needs a running
-///     Docker daemon.
+///     The pgmq features beyond plain send and read, against real PGMQ: queue types, topics, insert notifications,
+///     long polling, at-most-once reads, headers, and the queue manager. The read modes are in
+///     <see cref="ReadModeTests"/>. Needs a running Docker daemon.
 /// </summary>
 public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
 {
@@ -20,43 +19,21 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     public async Task A_consumer_Should_get_its_queue_created_as_the_type_it_asks_for()
     {
         await using TransportHarness harness =
-            await StartAsync(typeof(UnloggedConsumer), typeof(PartitionedConsumer));
+            await StartAsync(typeof(UnloggedConsumer), typeof(PartitionedConsumer), typeof(TimePartitionedConsumer));
 
         IReadOnlyList<PgmqQueueInfo> queues = await db.Queues.ListQueuesAsync(Ct);
 
         Assert.Contains(queues, q => q is { QueueName: "t_unlogged", IsUnlogged: true, IsPartitioned: false });
         Assert.Contains(queues, q => q is { QueueName: "t_partitioned", IsPartitioned: true });
+        Assert.Contains(queues, q => q is { QueueName: "t_partitioned_time", IsPartitioned: true });
+
+        // A numeric interval partitions by message id, a time interval by when the message was sent.
+        Assert.Null(await db.PartitionColumnAsync("q_t_unlogged"));
+        Assert.Equal("msg_id", await db.PartitionColumnAsync("q_t_partitioned"));
+        Assert.Equal("enqueued_at", await db.PartitionColumnAsync("q_t_partitioned_time"));
 
         await harness.Bus.PublishAsync(new TypedQueueMessage(1), Ct);
-        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 2, Within, "both queue types delivered");
-    }
-
-    [Fact]
-    public async Task A_grouped_queue_Should_handle_each_group_in_order_and_one_at_a_time()
-    {
-        FifoConsumer.Reset();
-        await using TransportHarness harness = await StartAsync(typeof(FifoConsumer));
-
-        for (int seq = 1; seq <= 5; seq++)
-        {
-            foreach (string group in new[] { "a", "b", "c" })
-            {
-                // b3 fails once: the rest of b must wait for it, and still come in order.
-                await harness.Bus.PublishAsync(new FifoMessage(group, seq, FailOnce: group == "b" && seq == 3),
-                    new PgmqPublishOptions { GroupId = group }, Ct);
-            }
-        }
-
-        await Eventually.HoldsAsync(() => FifoConsumer.Done.Count == 15, Within, "every message handled");
-
-        foreach (string group in new[] { "a", "b", "c" })
-        {
-            Assert.Equal([1, 2, 3, 4, 5], FifoConsumer.Done.Where(d => d.Group == group).Select(d => d.Seq));
-        }
-
-        Assert.Equal(0, FifoConsumer.Overlaps);
-        Assert.True(FifoConsumer.MaxGroupsAtOnce > 1, "groups should run in parallel");
-        Assert.All(_probe.Deliveries, d => Assert.Equal(((FifoMessage)d.Message).Group, d.GroupId));
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 3, Within, "every queue type delivered");
     }
 
     [Fact]
@@ -187,20 +164,6 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         Assert.Single(_probe.Deliveries);
         Assert.Equal(0, await db.CountAsync("t_at_most_once"));
         Assert.Equal(0, await db.ArchivedAsync("t_at_most_once"));
-    }
-
-    [Fact]
-    public async Task A_filtered_consumer_Should_read_only_the_messages_that_match()
-    {
-        await using TransportHarness harness = await StartAsync(typeof(FilteredConsumer));
-
-        await harness.Bus.PublishAsync(new FilteredMessage("us", 1), Ct);
-        await harness.Bus.PublishAsync(new FilteredMessage("eu", 2), Ct);
-
-        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "the match handled");
-        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
-        Assert.Equal(2, Assert.IsType<FilteredMessage>(Assert.Single(_probe.Deliveries).Message).Id);
-        Assert.Equal(1, await db.CountAsync("t_filtered"));
     }
 
     [Fact]
@@ -418,65 +381,14 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         }
     }
 
-    public sealed record FifoMessage(string Group, int Seq, bool FailOnce);
-
-    [QueueName("t_fifo")]
-    [ConsumerOptions(ReadMode = PgmqReadMode.Grouped, Concurrency = 6)]
-    public sealed class FifoConsumer(Probe probe) : IPgmqConsumer<FifoMessage>
+    [QueueName("t_partitioned_time")]
+    [ConsumerOptions(QueueType = PgmqQueueType.Partitioned, PartitionInterval = "1 day", RetentionInterval = "7 days")]
+    public sealed class TimePartitionedConsumer(Probe probe) : IPgmqConsumer<TypedQueueMessage>
     {
-        private static readonly ConcurrentDictionary<string, int> Running = new();
-        private static int _groupsRunning;
-        private static int _maxGroupsAtOnce;
-        private static int _overlaps;
-
-        public static ConcurrentQueue<(string Group, int Seq)> Done { get; private set; } = new();
-
-        public static int Overlaps => Volatile.Read(ref _overlaps);
-
-        public static int MaxGroupsAtOnce => Volatile.Read(ref _maxGroupsAtOnce);
-
-        public static void Reset()
+        public Task HandleAsync(PgmqConsumeContext<TypedQueueMessage> context, CancellationToken cancellationToken)
         {
-            Running.Clear();
-            Done = new();
-            _groupsRunning = 0;
-            _maxGroupsAtOnce = 0;
-            _overlaps = 0;
-        }
-
-        public async Task HandleAsync(PgmqConsumeContext<FifoMessage> context, CancellationToken cancellationToken)
-        {
-            FifoMessage message = context.Message;
-            probe.Record(nameof(FifoConsumer), message, context);
-
-            if (Running.AddOrUpdate(message.Group, 1, (_, n) => n + 1) > 1)
-            {
-                Interlocked.Increment(ref _overlaps);
-            }
-
-            int groups = Interlocked.Increment(ref _groupsRunning);
-            int seen;
-            while (groups > (seen = Volatile.Read(ref _maxGroupsAtOnce))
-                   && Interlocked.CompareExchange(ref _maxGroupsAtOnce, groups, seen) != seen)
-            {
-            }
-
-            try
-            {
-                await Task.Delay(100, cancellationToken);
-
-                if (message.FailOnce && context.RedeliveryCount == 0)
-                {
-                    throw new TimeoutException("transient");
-                }
-
-                Done.Enqueue((message.Group, message.Seq));
-            }
-            finally
-            {
-                Interlocked.Decrement(ref _groupsRunning);
-                Running.AddOrUpdate(message.Group, 0, (_, n) => n - 1);
-            }
+            probe.Record(nameof(TimePartitionedConsumer), context.Message, context);
+            return Task.CompletedTask;
         }
     }
 
@@ -539,19 +451,6 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         {
             probe.Record(nameof(AtMostOnceConsumer), context.Message, context);
             throw new TimeoutException("transient, but there is no second chance");
-        }
-    }
-
-    public sealed record FilteredMessage(string Region, int Id);
-
-    [QueueName("t_filtered")]
-    [ConsumerOptions(Filter = """{"region":"eu"}""")]
-    public sealed class FilteredConsumer(Probe probe) : IPgmqConsumer<FilteredMessage>
-    {
-        public Task HandleAsync(PgmqConsumeContext<FilteredMessage> context, CancellationToken cancellationToken)
-        {
-            probe.Record(nameof(FilteredConsumer), context.Message, context);
-            return Task.CompletedTask;
         }
     }
 
