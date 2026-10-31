@@ -20,8 +20,9 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   goes straight back to the queue.
 - **Survival.** A failed read loop restarts itself. `PgmqStatus.StalledQueues` and the health check report a loop
   that went quiet.
-- **Tracing.** Spans follow the OpenTelemetry messaging conventions under the `Pgmq` source. The trace continues from
-  publisher to consumer through the message headers.
+- **Telemetry.** Traces, metrics and logs through the .NET diagnostics APIs, following the OpenTelemetry messaging
+  conventions. The trace continues from publisher to consumer through the message headers. Your application's
+  OpenTelemetry setup decides what is collected and where it goes; see [Telemetry](#telemetry).
 
 ## PGMQ feature support
 
@@ -183,13 +184,91 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `MinIdleDelay` / `MaxIdleDelay` | 200 ms / 5 s | Polling of an empty queue; `MaxIdleDelay` is also the safety re-read while waiting for a notification. |
 | `UseInsertNotifications` / `InsertNotificationThrottle` | `true` / 250 ms | Wake idle queues through LISTEN/NOTIFY. |
 | `LongPollTimeout` | 5 s | Long-poll empty queues in the database while notifications are not live. `null` polls from the application. |
+| `QueueMetricsInterval` | `null` | How often to read queue depth and oldest message age for the `pgmq.queue.*` gauges. Off by default. |
 | `UnavailableHealthStatus` / `StalledHealthStatus` | `Unhealthy` | Use `Degraded` to keep a pod in service. |
 
 A consumer's queue, concurrency, timeout, read mode, queue type, filter and at-most-once setting come from
 `AddPgmqConsumer<T>(c => ...)`, then `[QueueName]`, `[ConsumerOptions]` and `[TopicBinding]`, then these defaults. Pin queue names with `[QueueName]` and message names with `[MessageName]`
 before renaming or moving a class: the names live in the database.
 
-Add `services.AddHealthChecks().AddPgmq()` for the health check, and the `Pgmq` source to your tracer for spans.
+Add `services.AddHealthChecks().AddPgmq()` for the health check.
+
+## Telemetry
+
+Pgmq emits traces and metrics through `System.Diagnostics` (`ActivitySource` and `Meter`, both named `Pgmq`) and logs
+through `ILogger`. It references no OpenTelemetry package and exports nothing. Your application's OpenTelemetry setup
+decides what is collected, how it is sampled and where it goes. Until the application listens, no spans are created
+and no measurements are taken.
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t => t.AddSource(PgmqTelemetry.SourceName))
+    .WithMetrics(m => m.AddMeter(PgmqTelemetry.MeterName))
+    .UseOtlpExporter();
+```
+
+### Spans
+
+| Span | Kind | When |
+|---|---|---|
+| `send {destination}` | Producer | Each publish. `{destination}` is the queue, the routing key, or, for a fan-out, the message type; a fan-out lists the queues it reached in `messaging.pgmq.queues`. |
+| `process {queue}` | Consumer | Handling one message, as a child of the `send` span that wrote it. Your consumer's own spans and logs are inside it. |
+| `delete` / `archive` / `set_vt {queue}` | Client | Writing the outcome back to the queue, as a child of `process`. |
+
+Spans carry the standard `messaging.*` attributes (`system`, `operation.type`, `operation.name`, `destination.name`,
+`consumer.group.name` (the consumer class), `message.type`, `message.id`), `server.address` and `server.port`, plus
+`messaging.pgmq.msg_id`, `messaging.pgmq.attempt` and `messaging.pgmq.outcome`. A failure sets the span's status to
+error, sets `error.type`, and records the exception.
+
+The trace context travels in the `traceparent` and `tracestate` headers of each message. When the application does
+not listen to `Pgmq`, the headers carry the application's own current span instead, such as the incoming HTTP request,
+so a trace still continues into the consumer.
+
+### Metrics
+
+| Instrument | Type | Unit | Attributes |
+|---|---|---|---|
+| `messaging.client.sent.messages` | Counter | `{message}` | queue (or routing key) |
+| `messaging.client.operation.duration` | Histogram | `s` | `send` per publish; `delete` / `archive` / `set_vt` per settle; `error.type` on failure |
+| `messaging.client.consumed.messages` | Counter | `{message}` | queue, consumer, `read` or `pop` |
+| `messaging.process.duration` | Histogram | `s` | queue, consumer, `messaging.pgmq.outcome`, `error.type` on failure |
+| `pgmq.consumer.messages.active` | UpDownCounter | `{message}` | queue, consumer |
+| `pgmq.consumer.read.failures` | Counter | `{failure}` | queue, consumer, `error.type` |
+| `pgmq.consumer.read_loop.restarts` | Counter | `{restart}` | queue, consumer |
+| `pgmq.consumer.lease_renewal.failures` | Counter | `{failure}` | queue, consumer, `error.type` |
+| `pgmq.consumer.settle.failures` | Counter | `{failure}` | queue, consumer, operation, `error.type` |
+| `pgmq.queue.messages` | Gauge | `{message}` | queue; needs `QueueMetricsInterval` |
+| `pgmq.queue.messages.visible` | Gauge | `{message}` | queue; needs `QueueMetricsInterval` |
+| `pgmq.queue.oldest_message.age` | Gauge | `s` | queue; needs `QueueMetricsInterval` |
+
+`messaging.pgmq.outcome` is what happened to a handled message: `success`, `retry`, `archived`, `released` (shutdown;
+it goes back to the queue) or `lost` (an at-most-once message that did not succeed). `error.type` says why: the
+exception's type, `timeout`, `pgmq.abandoned`, `pgmq.shutdown` or `pgmq.unknown_message_type`. Histograms suggest the
+bucket boundaries the OpenTelemetry messaging conventions recommend; your views can override them.
+
+The queue gauges come from `pgmq.metrics_all`, which counts the rows of every queue in the database. That query costs
+more on large queues, and every instance runs it, so the gauges are off until `QueueMetricsInterval` is set. Even then
+they query only while the application collects them.
+
+### Logs
+
+Logs go through `ILogger` with the categories `Pgmq.*`, so your log levels, filters and providers apply. While a
+message is handled, its log scope holds `Queue`, `PgmqMsgId`, `MessageType`, `MessageId` and `Attempt`, and the
+`process` span is current, so the logs carry its trace and span ids.
+
+### Npgsql spans
+
+If you also trace Npgsql (`AddNpgsql()`), the data source Pgmq builds from `ConnectionString` traces a command only
+inside a trace that is already running, such as a publish or a handled message. The worker's polls and lease renewals
+run outside any trace, many times a second, and would otherwise each become a trace of their own. A data source you
+pass in through `DataSource` is yours to configure; to get the same behavior:
+
+```csharp
+NpgsqlDataSourceBuilder builder = new(connectionString);
+builder.ConfigureTracing(t => t
+    .ConfigureCommandFilter(_ => Activity.Current is not null)
+    .ConfigureBatchFilter(_ => Activity.Current is not null));
+```
 
 ## Limitations
 

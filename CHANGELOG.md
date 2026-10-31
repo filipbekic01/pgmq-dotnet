@@ -5,6 +5,27 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Metrics on the `Pgmq` meter (`PgmqTelemetry.MeterName`), following the OpenTelemetry messaging conventions:
+  `messaging.client.sent.messages`, `messaging.client.operation.duration`, `messaging.client.consumed.messages` and
+  `messaging.process.duration` (tagged with the outcome), plus worker health counters (`pgmq.consumer.*`).
+- Queue depth and oldest message age as `pgmq.queue.*` gauges, off until `PgmqOptions.QueueMetricsInterval` is set.
+- Spans for settling a handled message (`delete`, `archive`, `set_vt`), as children of its `process` span.
+- Spans carry `error.type`, `messaging.operation.name`, `messaging.consumer.group.name` (the consumer class),
+  `server.address` and `server.port`. A failed publish now marks its span as failed.
+- A message of unknown type gets a `process` span too.
+- The data source Pgmq builds traces Npgsql commands only inside a running trace, so the worker's polls no longer
+  start a trace each when the application traces Npgsql.
+
+### Changed
+
+- Span names follow `{operation} {destination}`: `process {queue}` instead of `process {message type}`. A fan-out
+  publish is `send {message type}` and lists its queues in `messaging.pgmq.queues`.
+- The outcome tag is `messaging.pgmq.outcome` instead of `messaging.outcome`, with the values `success`, `retry`,
+  `archived`, `released` and `lost`. Why a message failed is in `error.type` (`timeout`, `pgmq.abandoned`, ...).
+- The `Pgmq` activity source has the package version.
+
 ## [0.1.0-alpha.4] - 2026-10-30
 
 ### Added

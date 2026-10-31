@@ -21,7 +21,7 @@
   headers. Only subscribed types and types deriving from them resolve, so a value read from the database never picks
   an arbitrary type to deserialize.
 - Message headers: message type, message id, redelivery count, and the W3C trace context.
-- `PgmqTelemetry`: the `Pgmq` activity source.
+- `PgmqTelemetry`: the `Pgmq` activity source and meter, and the instruments the publisher and the worker record to.
 - `IPgmqQueueManager` / `PgmqQueueManager`: the rest of the pgmq API (queue types, metrics, topics, notifications,
   FIFO indexes), called as SQL over an `NpgsqlDataSource`.
 
@@ -72,4 +72,3 @@ Not implemented yet, and open to design:
 
 - **Transactional publishing** together with the application's own writes.
 - **Archive retention** for queues that are not partitioned.
-- **Metrics** for queue depth, age of the oldest message, and outcomes.

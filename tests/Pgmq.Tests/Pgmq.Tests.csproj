@@ -14,4 +14,8 @@
     <ItemGroup>
         <ProjectReference Include="..\..\src\Pgmq\Pgmq.csproj" />
     </ItemGroup>
+    <ItemGroup>
+        <Compile Include="..\Shared\TelemetryCapture.cs" Link="Shared\TelemetryCapture.cs" />
+        <Using Include="Pgmq.Testing" />
+    </ItemGroup>
 </Project>

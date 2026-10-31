@@ -220,6 +220,85 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task A_handled_message_Should_trace_send_process_and_delete_as_one_tree_and_be_measured()
+    {
+        using TelemetryCapture telemetry = new();
+        await using TransportHarness harness = await StartAsync(typeof(FanOutFirstConsumer));
+
+        await harness.Bus.PublishAsync(new FanOutMessage(4), Ct);
+
+        await Eventually.HoldsAsync(() => telemetry.Spans("t_fanout_first").Count == 2, Within, "process and delete");
+        Activity send = Assert.Single(telemetry.Spans(MessageNames.Of(typeof(FanOutMessage))));
+        Activity process = telemetry.Spans("t_fanout_first").Single(a => a.Kind == ActivityKind.Consumer);
+        Activity delete = telemetry.Spans("t_fanout_first").Single(a => a.Kind == ActivityKind.Client);
+
+        Assert.Equal("process t_fanout_first", process.DisplayName);
+        Assert.Equal(send.SpanId, process.ParentSpanId);
+        Assert.Equal(nameof(FanOutFirstConsumer), process.GetTagItem("messaging.consumer.group.name"));
+        Assert.Equal("success", process.GetTagItem("messaging.pgmq.outcome"));
+        Assert.Equal(ActivityStatusCode.Unset, process.Status);
+        Assert.Equal(new Npgsql.NpgsqlConnectionStringBuilder(db.ConnectionString).Host,
+            process.GetTagItem("server.address"));
+
+        Assert.Equal("delete t_fanout_first", delete.DisplayName);
+        Assert.Equal(process.SpanId, delete.ParentSpanId);
+        Assert.Equal("settle", delete.GetTagItem("messaging.operation.type"));
+
+        Assert.Equal(1, telemetry.Sum("messaging.client.consumed.messages", "t_fanout_first"));
+        Assert.Equal(1, telemetry.Sum("messaging.client.sent.messages", "t_fanout_first"));
+        TelemetryCapture.Measured processed =
+            Assert.Single(telemetry.Of("messaging.process.duration", "t_fanout_first"));
+        Assert.Equal("success", processed.Tags["messaging.pgmq.outcome"]);
+        Assert.Equal(0, telemetry.Sum("pgmq.consumer.messages.active", "t_fanout_first"));
+        Assert.Contains(telemetry.Of("messaging.client.operation.duration", "t_fanout_first"),
+            m => m.Tags["messaging.operation.name"] as string == "delete");
+    }
+
+    [Fact]
+    public async Task A_failed_message_Should_report_its_outcome_and_error_type()
+    {
+        using TelemetryCapture telemetry = new();
+        await using TransportHarness harness = await StartAsync(typeof(BrokenConsumer));
+
+        await harness.Bus.PublishAsync(new BrokenMessage(), Ct);
+
+        await Eventually.HoldsAsync(() => telemetry.Spans("t_broken").Count == 2, Within, "process and archive");
+        Activity process = telemetry.Spans("t_broken").Single(a => a.Kind == ActivityKind.Consumer);
+        Assert.Equal(ActivityStatusCode.Error, process.Status);
+        Assert.Equal("archived", process.GetTagItem("messaging.pgmq.outcome"));
+        Assert.Equal(typeof(InvalidOperationException).FullName, process.GetTagItem("error.type"));
+        Assert.Contains(process.Events, e => e.Name == "exception");
+        Assert.Contains(telemetry.Spans("t_broken"), a => a.DisplayName == "archive t_broken");
+
+        TelemetryCapture.Measured processed = Assert.Single(telemetry.Of("messaging.process.duration", "t_broken"));
+        Assert.Equal("archived", processed.Tags["messaging.pgmq.outcome"]);
+        Assert.Equal(typeof(InvalidOperationException).FullName, processed.Tags["error.type"]);
+    }
+
+    [Fact]
+    public async Task Queue_gauges_Should_report_depth_and_oldest_age_when_turned_on()
+    {
+        using TelemetryCapture telemetry = new();
+        await using TransportHarness harness = await StartAsync(
+            o => o.QueueMetricsInterval = TimeSpan.FromSeconds(1), typeof(FanOutFirstConsumer));
+
+        await harness.Queues.CreateQueueAsync("t_gauged", cancellationToken: Ct);
+        await harness.Queues.PurgeQueueAsync("t_gauged", Ct);
+        await ((PgmqPublisher)harness.Bus).SendAsync("t_gauged", new FanOutMessage(5), typeof(FanOutMessage),
+            TimeSpan.Zero, 0, null, null, null, Ct);
+        await harness.StartHostedAsync<Pgmq.Hosting.QueueMetricsCollector>();
+
+        await Eventually.HoldsAsync(() =>
+        {
+            telemetry.Collect();
+            return telemetry.Of("pgmq.queue.messages", "t_gauged").Any(m => m.Value == 1);
+        }, Within, "depth reported");
+
+        Assert.Contains(telemetry.Of("pgmq.queue.messages.visible", "t_gauged"), m => m.Value == 1);
+        Assert.Contains(telemetry.Of("pgmq.queue.oldest_message.age", "t_gauged"), m => m.Value >= 0);
+    }
+
+    [Fact]
     public async Task Every_read_loop_Should_stay_alive_while_running()
     {
         await using TransportHarness harness =
