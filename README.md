@@ -77,18 +77,18 @@ Azure and other managed servers). All of it is idempotent and safe from several 
 
 ## Telemetry
 
-Pgmq emits traces and metrics through the built-in .NET diagnostics APIs, following the OpenTelemetry messaging
-conventions, and logs through `ILogger`. It has no OpenTelemetry dependency: add its source and meter to your own
-setup, and your sampling and exporters apply.
+Pgmq has no OpenTelemetry dependency. Add its source and meter to your app's OpenTelemetry setup, and your exporters
+and sampling apply:
 
 ```csharp
 builder.Services.AddOpenTelemetry()
     .WithTracing(t => t.AddSource(PgmqTelemetry.SourceName))
-    .WithMetrics(m => m.AddMeter(PgmqTelemetry.MeterName));
+    .WithMetrics(m => m.AddMeter(PgmqTelemetry.MeterName))
+    .UseOtlpExporter(); // or any exporter you already use
 ```
 
-One trace runs from the code that publishes a message through every consumer that handles it. Spans, metrics and the
-opt-in queue depth gauges are listed in [docs/guide.md](docs/guide.md#telemetry).
+Logs go through `ILogger`. For queue depth gauges, also set `o.QueueMetricsInterval = TimeSpan.FromSeconds(15)`.
+Everything Pgmq emits is listed in [docs/guide.md](docs/guide.md#telemetry).
 
 A runnable worker is in [`examples/Pgmq.Examples.Worker`](examples/Pgmq.Examples.Worker). Behavior, all options and
 PGMQ feature support are in [docs/guide.md](docs/guide.md).
