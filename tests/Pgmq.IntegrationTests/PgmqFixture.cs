@@ -170,6 +170,10 @@ public sealed class TransportHarness : IAsyncDisposable
         return new(services);
     }
 
+    /// <summary>Starts one of the other hosted services Pgmq registered, such as the queue metrics collector.</summary>
+    public Task StartHostedAsync<T>() where T : IHostedService
+        => _services.GetServices<IHostedService>().OfType<T>().Single().StartAsync(CancellationToken.None);
+
     /// <summary>What a host does on shutdown: stop the worker and wait for its drain.</summary>
     public async Task StopAsync()
     {

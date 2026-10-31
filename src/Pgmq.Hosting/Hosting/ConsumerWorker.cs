@@ -58,6 +58,7 @@ internal sealed class ConsumerWorker(
     IServiceScopeFactory scopeFactory,
     PgmqOptions options,
     PgmqStatus status,
+    PgmqDatabase database,
     ILogger<ConsumerWorker> logger
 ) : BackgroundService
 {
@@ -155,6 +156,8 @@ internal sealed class ConsumerWorker(
             catch (Exception ex)
             {
                 logger.LogCritical(ex, "Read loop for {Queue} failed; starting it again", consumer.QueueName);
+                PgmqTelemetry.ReadLoopRestarts.Add(1,
+                    PgmqTelemetry.ConsumerTags(consumer.QueueName, consumer.ConsumerType.Name));
                 await DelayQuietlyAsync(RestartDelay, stoppingToken);
             }
         }
@@ -200,6 +203,9 @@ internal sealed class ConsumerWorker(
             {
                 state.Slots.Release(free);
                 logger.LogError(ex, "Reading {Queue} failed; trying again in {Delay}", queue, options.MaxIdleDelay);
+                TagList failed = state.Tags;
+                failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
+                PgmqTelemetry.ReadFailures.Add(1, failed);
                 await Task.Delay(options.MaxIdleDelay, stoppingToken);
                 continue;
             }
@@ -235,6 +241,13 @@ internal sealed class ConsumerWorker(
             }
 
             idleDelay = options.MinIdleDelay;
+
+            if (PgmqTelemetry.ConsumedMessages.Enabled)
+            {
+                TagList consumed = state.Tags;
+                consumed.Add("messaging.operation.name", state.Consumer.AtMostOnce ? "pop" : "read");
+                PgmqTelemetry.ConsumedMessages.Add(messages.Count, consumed);
+            }
 
             if (state.Consumer.IsGrouped)
             {
@@ -314,6 +327,7 @@ internal sealed class ConsumerWorker(
     private async Task<SettlementKind> HandleAsync(QueueState state, QueueMessage message)
     {
         ConsumerRegistration consumer = state.Consumer;
+        string consumerName = consumer.ConsumerType.Name;
         MessageHeaders? headers = MessageHeaders.From(message.Headers);
         Type? messageType = headers is null ? null : registry.Topology.ResolveMessageType(headers.MessageType);
 
@@ -326,32 +340,52 @@ internal sealed class ConsumerWorker(
             ["Attempt"] = message.ReadCt,
         });
 
-        if (headers is null || messageType is null || message.Body is null)
-        {
-            logger.LogError("Message on {Queue} has no known type ({MessageType}); archiving it",
-                consumer.QueueName, headers?.MessageType);
-            state.Leased.TryRemove(message.MsgId, out _);
-            await SettleAsync(state, message, Settlement.Archive);
+        long start = Stopwatch.GetTimestamp();
+        using Activity? activity = PgmqTelemetry.StartProcess(consumer.QueueName, consumerName, headers,
+            message.MsgId, message.ReadCt, database.Server);
 
-            // Archiving takes it out of its group, so the group's next message may run.
-            return SettlementKind.Delete;
+        bool known = headers is not null && messageType is not null && message.Body is not null;
+        Outcome outcome;
+
+        PgmqTelemetry.ActiveMessages.Add(1, state.Tags);
+        try
+        {
+            if (known)
+            {
+                outcome = await RunConsumerAsync(state, message, headers!, messageType!);
+            }
+            else
+            {
+                logger.LogError("Message on {Queue} has no known type ({MessageType}); archiving it",
+                    consumer.QueueName, headers?.MessageType);
+                outcome = Outcome.Archived("pgmq.unknown_message_type");
+            }
+        }
+        finally
+        {
+            PgmqTelemetry.ActiveMessages.Add(-1, state.Tags);
         }
 
-        using Activity? activity =
-            PgmqTelemetry.StartProcess(headers, consumer.QueueName, message.MsgId, message.ReadCt);
+        activity?.SetTag("messaging.pgmq.outcome", outcome.Name);
+        if (outcome.ErrorType is { } errorType)
+        {
+            PgmqTelemetry.Fail(activity, errorType, outcome.Error);
+        }
 
-        Settlement settlement = await RunConsumerAsync(state, message, headers, messageType, activity);
+        PgmqTelemetry.RecordProcess(consumer.QueueName, consumerName, outcome.Name, outcome.ErrorType, start);
 
         // Decided; from here only the queue is written. Stop renewing first, so a settle that cannot be written leaves
         // the message to come back within one lease rather than sit hidden.
         state.Leased.TryRemove(message.MsgId, out _);
-        await SettleAsync(state, message, settlement);
-        return settlement.Kind;
+        await SettleAsync(state, message, outcome.Settlement);
+
+        // An unknown message is archived, which takes it out of its group, so the group's next message may run.
+        return known ? outcome.Settlement.Kind : SettlementKind.Delete;
     }
 
     /// <summary>Runs the consumer under its deadline and flushes its outbox, and says what to do with the message.</summary>
-    private async Task<Settlement> RunConsumerAsync(QueueState state, QueueMessage message,
-        MessageHeaders headers, Type messageType, Activity? activity)
+    private async Task<Outcome> RunConsumerAsync(QueueState state, QueueMessage message,
+        MessageHeaders headers, Type messageType)
     {
         ConsumerRegistration consumer = state.Consumer;
         TimeSpan timeout = consumer.Timeout;
@@ -374,8 +408,7 @@ internal sealed class ConsumerWorker(
             _ = run.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
             logger.LogError(ex, "{Consumer} ignored its timeout of {Timeout}; abandoned it and archiving the message",
                 consumer.ConsumerType.Name, timeout);
-            PgmqTelemetry.Fail(activity, ex, "abandoned");
-            return Settlement.Archive;
+            return Outcome.Archived("pgmq.abandoned", ex);
         }
         catch (OperationCanceledException) when (_abort.IsCancellationRequested)
         {
@@ -383,25 +416,22 @@ internal sealed class ConsumerWorker(
             {
                 logger.LogWarning("{Consumer} stopped for shutdown; its at-most-once message is lost",
                     consumer.ConsumerType.Name);
-            }
-            else
-            {
-                logger.LogInformation("{Consumer} stopped for shutdown; its message goes back to the queue",
-                    consumer.ConsumerType.Name);
+                return Outcome.Lost("pgmq.shutdown");
             }
 
-            return Settlement.Release;
+            logger.LogInformation("{Consumer} stopped for shutdown; its message goes back to the queue",
+                consumer.ConsumerType.Name);
+            return Outcome.Released;
         }
         catch (OperationCanceledException ex) when (deadline.IsCancellationRequested)
         {
             logger.LogError(ex, "{Consumer} ran past its timeout of {Timeout}; archiving the message",
                 consumer.ConsumerType.Name, timeout);
-            PgmqTelemetry.Fail(activity, ex, "timeout");
-            return Settlement.Archive;
+            return Outcome.Archived("timeout", ex);
         }
         catch (Exception ex)
         {
-            return Failed(consumer, message, messageType, ex, activity);
+            return Failed(consumer, message, messageType, ex);
         }
 
         try
@@ -414,14 +444,12 @@ internal sealed class ConsumerWorker(
             // to send the rest, so treat it as transient; what already went out may then go twice.
             logger.LogError(ex, "{Consumer} succeeded but {Count} of its publishes did not go out",
                 consumer.ConsumerType.Name, outbox.Count);
-            PgmqTelemetry.Fail(activity, ex, "outbox");
             return message.ReadCt >= options.MaxAttempts
-                ? Settlement.Archive
-                : Settlement.RetryAfter(Backoff(message.ReadCt));
+                ? Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex)
+                : Outcome.Retry(Backoff(message.ReadCt), ex);
         }
 
-        activity?.SetTag("messaging.outcome", "success");
-        return Settlement.Delete;
+        return Outcome.Success;
     }
 
     private async Task DispatchAsync(ConsumerRegistration consumer, QueueMessage message,
@@ -446,30 +474,26 @@ internal sealed class ConsumerWorker(
             cancellationToken);
     }
 
-    private Settlement Failed(ConsumerRegistration consumer, QueueMessage message, Type messageType,
-        Exception ex, Activity? activity)
+    private Outcome Failed(ConsumerRegistration consumer, QueueMessage message, Type messageType, Exception ex)
     {
         if (consumer.AtMostOnce)
         {
             logger.LogError(ex, "{Consumer} failed at-most-once {MessageType}; the message is lost",
                 consumer.ConsumerType.Name, messageType.Name);
-            PgmqTelemetry.Fail(activity, ex, "lost");
-            return Settlement.Archive;
+            return Outcome.Lost(PgmqTelemetry.ErrorType(ex), ex);
         }
 
         if (!options.IsTransient(ex) || message.ReadCt >= options.MaxAttempts)
         {
             logger.LogError(ex, "{Consumer} failed {MessageType} (attempt {Attempt}); archiving the message",
                 consumer.ConsumerType.Name, messageType.Name, message.ReadCt);
-            PgmqTelemetry.Fail(activity, ex, "archived");
-            return Settlement.Archive;
+            return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
         }
 
         TimeSpan backoff = Backoff(message.ReadCt);
         logger.LogWarning(ex, "{Consumer} failed {MessageType} (attempt {Attempt}); retrying in {Delay}",
             consumer.ConsumerType.Name, messageType.Name, message.ReadCt, backoff);
-        PgmqTelemetry.Fail(activity, ex, "retry");
-        return Settlement.RetryAfter(backoff);
+        return Outcome.Retry(backoff, ex);
     }
 
     /// <summary>By default 30s, 2m, 8m, 30m.</summary>
@@ -488,6 +512,17 @@ internal sealed class ConsumerWorker(
             return;
         }
 
+        string operation = settlement.Kind switch
+        {
+            SettlementKind.Delete => "delete",
+            SettlementKind.Archive => "archive",
+            _ => "set_vt",
+        };
+
+        long start = Stopwatch.GetTimestamp();
+        using Activity? activity = PgmqTelemetry.StartSettle(operation, queue, message.MsgId, database.Server);
+        string? errorType = null;
+
         try
         {
             await RetryAsync(ct => settlement.Kind switch
@@ -504,6 +539,17 @@ internal sealed class ConsumerWorker(
         {
             logger.LogError(ex, "Could not {Settlement} message {MsgId} on {Queue}; it comes back after the lease",
                 settlement.Kind, message.MsgId, queue);
+            errorType = PgmqTelemetry.ErrorType(ex);
+            PgmqTelemetry.Fail(activity, errorType, ex);
+
+            TagList failed = state.Tags;
+            failed.Add("messaging.operation.name", operation);
+            failed.Add("error.type", errorType);
+            PgmqTelemetry.SettleFailures.Add(1, failed);
+        }
+        finally
+        {
+            PgmqTelemetry.RecordOperation("settle", operation, queue, start, errorType, database.Server);
         }
     }
 
@@ -550,6 +596,9 @@ internal sealed class ConsumerWorker(
             {
                 // One missed renewal is covered: the lease is three renewals long.
                 logger.LogWarning(ex, "Could not renew leases on {Queue}", state.Consumer.QueueName);
+                TagList failed = state.Tags;
+                failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
+                PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
             }
         }
     }
@@ -571,6 +620,9 @@ internal sealed class ConsumerWorker(
         public volatile bool Stopped;
 
         public ConsumerRegistration Consumer { get; } = consumer;
+
+        /// <summary>The queue and consumer, as tags of the worker's metrics.</summary>
+        public TagList Tags { get; } = PgmqTelemetry.ConsumerTags(consumer.QueueName, consumer.ConsumerType.Name);
 
         public SemaphoreSlim Slots { get; } = new(consumer.Concurrency, consumer.Concurrency);
 
@@ -613,5 +665,25 @@ internal sealed class ConsumerWorker(
         public static readonly Settlement Release = new(SettlementKind.Release, TimeSpan.Zero);
 
         public static Settlement RetryAfter(TimeSpan delay) => new(SettlementKind.Retry, delay);
+    }
+
+    /// <summary>
+    /// How handling a message ended: what to write to the queue, the <c>messaging.pgmq.outcome</c> it is reported
+    /// under (success, retry, archived, released or lost), and, for a failure, its <c>error.type</c> and exception.
+    /// </summary>
+    private readonly record struct Outcome(Settlement Settlement, string Name, string? ErrorType, Exception? Error)
+    {
+        public static readonly Outcome Success = new(Settlement.Delete, "success", null, null);
+        public static readonly Outcome Released = new(Settlement.Release, "released", null, null);
+
+        public static Outcome Retry(TimeSpan delay, Exception error)
+            => new(Settlement.RetryAfter(delay), "retry", PgmqTelemetry.ErrorType(error), error);
+
+        public static Outcome Archived(string errorType, Exception? error = null)
+            => new(Settlement.Archive, "archived", errorType, error);
+
+        /// <summary>An at-most-once message that did not succeed: pgmq already deleted it, so nothing is written.</summary>
+        public static Outcome Lost(string errorType, Exception? error = null)
+            => new(Settlement.Archive, "lost", errorType, error);
     }
 }

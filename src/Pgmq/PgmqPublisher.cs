@@ -14,17 +14,21 @@ public sealed class PgmqPublisher : IPgmqPublisher
     private readonly IPgmqSender _client;
     private readonly PgmqTopology _topology;
     private readonly ILogger<PgmqPublisher> _logger;
+    private readonly ServerEndpoint _server;
 
     /// <param name="dataSource">The database with the pgmq extension.</param>
     /// <param name="topology">Which queues each message type goes to.</param>
     /// <param name="logger">Notes messages that no queue is subscribed to.</param>
     public PgmqPublisher(NpgsqlDataSource dataSource, PgmqTopology topology, ILogger<PgmqPublisher> logger)
-        : this(new PgmqSender(dataSource ?? throw new ArgumentNullException(nameof(dataSource))), topology, logger)
+        : this(new PgmqSender(dataSource ?? throw new ArgumentNullException(nameof(dataSource))), topology, logger,
+            ServerEndpoint.Of(dataSource))
     {
     }
 
-    internal PgmqPublisher(IPgmqSender client, PgmqTopology topology, ILogger<PgmqPublisher> logger)
+    internal PgmqPublisher(IPgmqSender client, PgmqTopology topology, ILogger<PgmqPublisher> logger,
+        ServerEndpoint server = default)
     {
+        _server = server;
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _topology = topology ?? throw new ArgumentNullException(nameof(topology));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -70,18 +74,24 @@ public sealed class PgmqPublisher : IPgmqPublisher
         }
 
         TimeSpan? delay = options.ResolveDelay();
-        using Activity? activity = PgmqTelemetry.StartSend(MessageNames.Of(typeof(TMessage)));
-        activity?.SetTag("messaging.batch.message_count", batch.Length);
+        string messageName = MessageNames.Of(typeof(TMessage));
+        IReadOnlyList<string> queues = QueuesFor(typeof(TMessage));
 
-        string[] bodies = [.. batch.Select(m => MessageSerializer.Serialize(m, typeof(TMessage)))];
-
-        foreach (string queue in QueuesFor(typeof(TMessage)))
+        await TraceSendAsync(messageName, messageName, batch.Length, queues, async () =>
         {
-            IReadOnlyDictionary<string, object>[] headers =
-                [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
+            string[] bodies = [.. batch.Select(m => MessageSerializer.Serialize(m, typeof(TMessage)))];
 
-            await _client.SendBatchAsync(queue, bodies, headers, DeliverAt(delay), cancellationToken);
-        }
+            foreach (string queue in queues)
+            {
+                IReadOnlyDictionary<string, object>[] headers =
+                    [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
+
+                await _client.SendBatchAsync(queue, bodies, headers, DeliverAt(delay), cancellationToken);
+                PgmqTelemetry.RecordSent(queue, batch.Length, _server);
+            }
+
+            return 0;
+        });
     }
 
     /// <inheritdoc />
@@ -108,10 +118,16 @@ public sealed class PgmqPublisher : IPgmqPublisher
         ArgumentNullException.ThrowIfNull(options);
 
         int delaySeconds = Seconds(options.ResolveDelay());
-        using Activity? activity = PgmqTelemetry.StartSend(MessageNames.Of(typeof(TMessage)), routingKey);
 
-        return await _client.SendTopicAsync(routingKey, MessageSerializer.Serialize(message, typeof(TMessage)),
-            NewHeaders(typeof(TMessage), options).ToDictionary(), delaySeconds, cancellationToken);
+        return await TraceSendAsync(routingKey, MessageNames.Of(typeof(TMessage)), 1, queues: null, async () =>
+        {
+            int sent = await _client.SendTopicAsync(routingKey, MessageSerializer.Serialize(message, typeof(TMessage)),
+                NewHeaders(typeof(TMessage), options).ToDictionary(), delaySeconds, cancellationToken);
+
+            // pgmq says how many queues matched, not which: count the copies under the routing key.
+            PgmqTelemetry.RecordSent(routingKey, sent, _server);
+            return sent;
+        });
     }
 
     /// <inheritdoc />
@@ -134,17 +150,24 @@ public sealed class PgmqPublisher : IPgmqPublisher
         }
 
         int delaySeconds = Seconds(options.ResolveDelay());
-        using Activity? activity = PgmqTelemetry.StartSend(MessageNames.Of(typeof(TMessage)), routingKey);
-        activity?.SetTag("messaging.batch.message_count", batch.Length);
 
-        string[] bodies = [.. batch.Select(m => MessageSerializer.Serialize(m, typeof(TMessage)))];
-        IReadOnlyDictionary<string, object>[] headers =
-            [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
+        return await TraceSendAsync(routingKey, MessageNames.Of(typeof(TMessage)), batch.Length, queues: null,
+            async () =>
+            {
+                string[] bodies = [.. batch.Select(m => MessageSerializer.Serialize(m, typeof(TMessage)))];
+                IReadOnlyDictionary<string, object>[] headers =
+                    [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
 
-        IReadOnlyList<string> sent =
-            await _client.SendBatchTopicAsync(routingKey, bodies, headers, delaySeconds, cancellationToken);
+                IReadOnlyList<string> sent =
+                    await _client.SendBatchTopicAsync(routingKey, bodies, headers, delaySeconds, cancellationToken);
 
-        return sent.Distinct(StringComparer.Ordinal).Count();
+                foreach (IGrouping<string, string> queue in sent.GroupBy(q => q, StringComparer.Ordinal))
+                {
+                    PgmqTelemetry.RecordSent(queue.Key, queue.Count(), _server);
+                }
+
+                return sent.Distinct(StringComparer.Ordinal).Count();
+            });
     }
 
     /// <summary>
@@ -156,10 +179,13 @@ public sealed class PgmqPublisher : IPgmqPublisher
         int redeliveryCount, Guid? messageId, string? groupId, IReadOnlyDictionary<string, string>? headers,
         CancellationToken cancellationToken)
     {
-        using Activity? activity = PgmqTelemetry.StartSend(MessageNames.Of(messageType), queueName);
-
-        await SendAsync(queueName, MessageSerializer.Serialize(message, messageType),
-            MessageHeaders.New(messageType, redeliveryCount, messageId, groupId, headers), delay, cancellationToken);
+        await TraceSendAsync(queueName, MessageNames.Of(messageType), 1, queues: null, async () =>
+        {
+            await SendAsync(queueName, MessageSerializer.Serialize(message, messageType),
+                MessageHeaders.New(messageType, redeliveryCount, messageId, groupId, headers), delay,
+                cancellationToken);
+            return 0;
+        });
     }
 
     private async Task PublishCoreAsync(object message, Type messageType, PgmqPublishOptions options,
@@ -170,13 +196,59 @@ public sealed class PgmqPublisher : IPgmqPublisher
         ArgumentNullException.ThrowIfNull(options);
 
         TimeSpan? delay = options.ResolveDelay();
-        using Activity? activity = PgmqTelemetry.StartSend(MessageNames.Of(messageType));
+        string messageName = MessageNames.Of(messageType);
+        IReadOnlyList<string> queues = QueuesFor(messageType);
 
-        string body = MessageSerializer.Serialize(message, messageType);
-
-        foreach (string queue in QueuesFor(messageType))
+        await TraceSendAsync(messageName, messageName, 1, queues, async () =>
         {
-            await SendAsync(queue, body, NewHeaders(messageType, options), delay, cancellationToken);
+            string body = MessageSerializer.Serialize(message, messageType);
+
+            foreach (string queue in queues)
+            {
+                await SendAsync(queue, body, NewHeaders(messageType, options), delay, cancellationToken);
+            }
+
+            return 0;
+        });
+    }
+
+    /// <summary>
+    /// Runs one send under its span and records its duration. The span is current while <paramref name="send"/>
+    /// builds headers, so each message carries it as its parent. A fan-out names the message type as its destination
+    /// and lists the queues it reached in <c>messaging.pgmq.queues</c>.
+    /// </summary>
+    private async Task<T> TraceSendAsync<T>(string destination, string messageType, int count,
+        IReadOnlyList<string>? queues, Func<Task<T>> send)
+    {
+        long start = Stopwatch.GetTimestamp();
+        using Activity? activity = PgmqTelemetry.StartSend(destination, messageType, _server);
+        if (activity is not null)
+        {
+            if (count > 1)
+            {
+                activity.SetTag("messaging.batch.message_count", count);
+            }
+
+            if (queues is not null)
+            {
+                activity.SetTag("messaging.pgmq.queues", queues.ToArray());
+            }
+        }
+
+        string? errorType = null;
+        try
+        {
+            return await send();
+        }
+        catch (Exception ex)
+        {
+            errorType = PgmqTelemetry.ErrorType(ex);
+            PgmqTelemetry.Fail(activity, errorType, ex);
+            throw;
+        }
+        finally
+        {
+            PgmqTelemetry.RecordOperation("send", "send", destination, start, errorType, _server);
         }
     }
 
@@ -187,9 +259,12 @@ public sealed class PgmqPublisher : IPgmqPublisher
     private static int Seconds(TimeSpan? delay)
         => delay is { } d && d > TimeSpan.Zero ? (int)Math.Ceiling(d.TotalSeconds) : 0;
 
-    private Task<long> SendAsync(string queueName, string body, MessageHeaders headers, TimeSpan? delay,
+    private async Task SendAsync(string queueName, string body, MessageHeaders headers, TimeSpan? delay,
         CancellationToken cancellationToken)
-        => _client.SendAsync(queueName, body, headers.ToDictionary(), DeliverAt(delay), cancellationToken);
+    {
+        await _client.SendAsync(queueName, body, headers.ToDictionary(), DeliverAt(delay), cancellationToken);
+        PgmqTelemetry.RecordSent(queueName, 1, _server);
+    }
 
     /// <summary>When a delayed message becomes visible, or null to send it visible at once.</summary>
     private static DateTimeOffset? DeliverAt(TimeSpan? delay)

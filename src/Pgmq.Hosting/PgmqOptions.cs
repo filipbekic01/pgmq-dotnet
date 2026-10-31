@@ -139,6 +139,15 @@ public sealed class PgmqOptions
     /// </summary>
     public TimeSpan? LongPollTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>
+    /// How often to read every queue's depth and oldest message age (<c>pgmq.metrics_all</c>) for the
+    /// <c>pgmq.queue.*</c> gauges of the <see cref="PgmqTelemetry.MeterName"/> meter. Off (null) by default: the query
+    /// counts each queue's rows, which costs on large queues, and every instance runs it. Turn it on in one host, or in
+    /// all of them and read the gauges as a maximum. Even when on, it queries only while the application collects the
+    /// gauges.
+    /// </summary>
+    public TimeSpan? QueueMetricsInterval { get; set; }
+
     /// <summary>A queue's read loop silent this long counts as stalled.</summary>
     public TimeSpan StallAfter { get; set; } = TimeSpan.FromMinutes(1);
 
@@ -186,6 +195,12 @@ public sealed class PgmqOptions
         ArgumentNullException.ThrowIfNull(IsTransient, nameof(IsTransient));
         ArgumentOutOfRangeException.ThrowIfLessThan(InsertNotificationThrottle, TimeSpan.Zero,
             nameof(InsertNotificationThrottle));
+
+        if (QueueMetricsInterval is { } metricsInterval)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(metricsInterval, TimeSpan.FromSeconds(1),
+                nameof(QueueMetricsInterval));
+        }
 
         if (LongPollTimeout is { } longPoll)
         {

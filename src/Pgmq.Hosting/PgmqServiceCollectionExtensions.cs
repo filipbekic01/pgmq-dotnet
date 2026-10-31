@@ -48,6 +48,11 @@ public static class PgmqServiceCollectionExtensions
         // Setup first: hosted services start in order, so the worker knows whether Pgmq is there.
         services.AddHostedService<QueueSetup>();
 
+        if (options.QueueMetricsInterval is not null)
+        {
+            services.AddHostedService<QueueMetricsCollector>();
+        }
+
         if (options.RunConsumers)
         {
             services.TryAddSingleton<ConsumerWorker>();

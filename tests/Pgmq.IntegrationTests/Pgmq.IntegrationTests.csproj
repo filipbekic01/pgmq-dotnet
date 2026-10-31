@@ -24,4 +24,8 @@
         <!-- The load tests run the benchmark's scenario and assert it behaves. -->
         <ProjectReference Include="..\..\benchmarks\Pgmq.Benchmarks\Pgmq.Benchmarks.csproj" />
     </ItemGroup>
+    <ItemGroup>
+        <Compile Include="..\Shared\TelemetryCapture.cs" Link="Shared\TelemetryCapture.cs" />
+        <Using Include="Pgmq.Testing" />
+    </ItemGroup>
 </Project>

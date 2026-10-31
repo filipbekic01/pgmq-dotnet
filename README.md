@@ -75,6 +75,21 @@ Azure and other managed servers). All of it is idempotent and safe from several 
 - `o.InstallMode = PgmqInstallMode.Extension` or `Sql`: allow only one way of installing pgmq.
 - `o.AutoSetup = false`: manage the schema yourself. Pgmq then only checks that everything exists.
 
+## Telemetry
+
+Pgmq has no OpenTelemetry dependency. Add its source and meter to your app's OpenTelemetry setup, and your exporters
+and sampling apply:
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t => t.AddSource(PgmqTelemetry.SourceName))
+    .WithMetrics(m => m.AddMeter(PgmqTelemetry.MeterName))
+    .UseOtlpExporter(); // or any exporter you already use
+```
+
+Logs go through `ILogger`. For queue depth gauges, also set `o.QueueMetricsInterval = TimeSpan.FromSeconds(15)`.
+Everything Pgmq emits is listed in [docs/guide.md](docs/guide.md#telemetry).
+
 A runnable worker is in [`examples/Pgmq.Examples.Worker`](examples/Pgmq.Examples.Worker). Behavior, all options and
 PGMQ feature support are in [docs/guide.md](docs/guide.md).
 
