@@ -113,7 +113,7 @@ public sealed class PgmqPublisher : IPgmqPublisher
     public async Task<int> PublishToTopicAsync<TMessage>(string routingKey, TMessage message,
         PgmqPublishOptions options, CancellationToken cancellationToken = default) where TMessage : class
     {
-        ArgumentException.ThrowIfNullOrEmpty(routingKey);
+        RoutingKeys.ThrowIfInvalid(routingKey);
         ArgumentNullException.ThrowIfNull(message);
         ArgumentNullException.ThrowIfNull(options);
 
@@ -139,7 +139,7 @@ public sealed class PgmqPublisher : IPgmqPublisher
     public async Task<int> PublishBatchToTopicAsync<TMessage>(string routingKey, IEnumerable<TMessage> messages,
         PgmqPublishOptions options, CancellationToken cancellationToken = default) where TMessage : class
     {
-        ArgumentException.ThrowIfNullOrEmpty(routingKey);
+        RoutingKeys.ThrowIfInvalid(routingKey);
         ArgumentNullException.ThrowIfNull(messages);
         ArgumentNullException.ThrowIfNull(options);
 

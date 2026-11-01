@@ -450,17 +450,23 @@ internal sealed class ConsumerWorker(
 
         try
         {
-            await RetryAsync(outbox.FlushAsync, "flush the outbox of", state, message);
+            await RetryAsync(outbox.FlushAsync, "flush the outbox of", state, message, options.IsTransient);
         }
         catch (Exception ex)
         {
             // The consumer's work is done but some of what it published is not out. Running it again is the only way
-            // to send the rest, so treat it as transient; what already went out may then go twice.
-            logger.LogError(ex, "{Consumer} succeeded but {Count} of its publishes did not go out",
+            // to send the rest, and what already went out may then go twice. That is worth it only when the failure
+            // can pass: a send that can never succeed would fail the same way on every run, so archive instead.
+            if (!options.IsTransient(ex) || message.ReadCt >= options.MaxAttempts)
+            {
+                logger.LogError(ex, "{Consumer} succeeded but {Count} of its publishes did not go out; archiving the message",
+                    consumer.ConsumerType.Name, outbox.Count);
+                return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
+            }
+
+            logger.LogError(ex, "{Consumer} succeeded but {Count} of its publishes did not go out; running it again",
                 consumer.ConsumerType.Name, outbox.Count);
-            return message.ReadCt >= options.MaxAttempts
-                ? Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex)
-                : Outcome.Retry(Backoff(message.ReadCt), ex);
+            return Outcome.Retry(Backoff(message.ReadCt), ex);
         }
 
         return Outcome.Success;
@@ -567,8 +573,9 @@ internal sealed class ConsumerWorker(
         }
     }
 
+    /// <summary>Runs <paramref name="write"/>, trying again after a failure that <paramref name="retryIf"/> allows (any, by default).</summary>
     private async Task RetryAsync(Func<CancellationToken, Task> write, string what, QueueState state,
-        QueueMessage message)
+        QueueMessage message, Func<Exception, bool>? retryIf = null)
     {
         for (int attempt = 0; ; attempt++)
         {
@@ -577,7 +584,7 @@ internal sealed class ConsumerWorker(
                 await write(CancellationToken.None);
                 return;
             }
-            catch (Exception ex) when (attempt < SettleRetries.Length)
+            catch (Exception ex) when (attempt < SettleRetries.Length && (retryIf?.Invoke(ex) ?? true))
             {
                 logger.LogWarning(ex, "Could not {What} message {MsgId} on {Queue}; trying again", what,
                     message.MsgId, state.Consumer.QueueName);

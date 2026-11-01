@@ -5,6 +5,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `examples/Pgmq.Examples.WebApi`: a Web API to try every feature from HTTP requests, with its own Postgres in Docker.
+
+### Fixed
+
+- A topic publish with an invalid routing key (a space, a wildcard, an empty word) throws `ArgumentException` before
+  sending, with pgmq's own rules. Inside a consumer it used to fail only when the outbox flushed, after the consumer
+  succeeded, so the consumer ran again until `MaxAttempts` and resent its other publishes each time.
+- A consumer whose outbox fails to flush for a reason `IsTransient` rejects is archived at once, instead of running
+  again and resending what already went out.
+
 ## [0.1.0-beta.2] - 2026-11-01
 
 ### Added

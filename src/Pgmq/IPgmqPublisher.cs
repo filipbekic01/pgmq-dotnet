@@ -50,8 +50,11 @@ public interface IPgmqPublisher
     /// Publishes <paramref name="message"/> to every queue with a topic binding that matches
     /// <paramref name="routingKey"/> (<c>pgmq.send_topic</c>), instead of to the queues subscribed to its type. Bind
     /// queues with <c>[TopicBinding]</c> on a consumer or <see cref="IPgmqQueueManager.BindTopicAsync"/>.
+    /// A routing key is 1 to 255 letters, digits, dots, hyphens and underscores, with no dot at either end and no two
+    /// dots in a row. Every topic publish checks it before sending.
     /// </summary>
     /// <returns>How many queues the message was written to.</returns>
+    /// <exception cref="ArgumentException">The routing key breaks those rules.</exception>
     Task<int> PublishToTopicAsync<TMessage>(string routingKey, TMessage message,
         CancellationToken cancellationToken = default) where TMessage : class;
 

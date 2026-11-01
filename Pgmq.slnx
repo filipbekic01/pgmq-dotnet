@@ -9,6 +9,7 @@
     <Project Path="tests/Pgmq.IntegrationTests/Pgmq.IntegrationTests.csproj" />
   </Folder>
   <Folder Name="/examples/">
+    <Project Path="examples/Pgmq.Examples.WebApi/Pgmq.Examples.WebApi.csproj" />
     <Project Path="examples/Pgmq.Examples.Worker/Pgmq.Examples.Worker.csproj" />
   </Folder>
   <Folder Name="/benchmarks/">

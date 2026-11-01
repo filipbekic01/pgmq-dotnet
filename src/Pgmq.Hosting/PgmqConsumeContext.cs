@@ -47,10 +47,17 @@ public abstract class PgmqConsumeContext
         CancellationToken cancellationToken = default) where TOther : class
         => SendAsync(ct => Publisher.PublishAsync(message, options, ct), cancellationToken);
 
-    /// <summary>Publishes <paramref name="message"/> to a topic once this consumer succeeds.</summary>
+    /// <summary>
+    /// Publishes <paramref name="message"/> to a topic once this consumer succeeds. An invalid routing key throws here,
+    /// in the consumer, so the message fails before anything it published goes out.
+    /// </summary>
+    /// <exception cref="ArgumentException">The routing key breaks pgmq's rules (see <c>pgmq.validate_routing_key</c>).</exception>
     public Task PublishToTopicAsync<TOther>(string routingKey, TOther message,
         CancellationToken cancellationToken = default) where TOther : class
-        => SendAsync(ct => Publisher.PublishToTopicAsync(routingKey, message, ct), cancellationToken);
+    {
+        RoutingKeys.ThrowIfInvalid(routingKey);
+        return SendAsync(ct => Publisher.PublishToTopicAsync(routingKey, message, ct), cancellationToken);
+    }
 
     /// <summary>Publishes <paramref name="message"/> once this consumer succeeds.</summary>
     public Task PublishAsync<TOther>(TOther message, CancellationToken cancellationToken = default) where TOther : class

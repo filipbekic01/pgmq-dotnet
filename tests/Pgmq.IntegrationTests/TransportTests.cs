@@ -350,6 +350,36 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task A_topic_publish_with_an_invalid_routing_key_Should_fail_the_consumer_and_publish_nothing()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(BadTopicConsumer), typeof(DownstreamConsumer));
+
+        await harness.Bus.PublishAsync(new BadTopicMessage(), Ct);
+
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_bad_topic") == 1, Within, "archived");
+        await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
+        Assert.Single(_probe.Of(nameof(BadTopicConsumer)));
+        Assert.Empty(_probe.Of(nameof(DownstreamConsumer)));
+    }
+
+    [Fact]
+    public async Task A_publish_that_can_never_go_out_Should_archive_without_running_the_consumer_again()
+    {
+        await using TransportHarness harness = await StartAsync(
+            typeof(UnsendableConsumer), typeof(UnsendableSink), typeof(DownstreamConsumer));
+
+        await harness.Bus.PublishAsync(new UnsendableTrigger(), Ct);
+
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_unsendable") == 1, Within, "archived");
+        await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
+
+        // It ran once, and what it published before the bad send went out once, not once per attempt.
+        Assert.Single(_probe.Of(nameof(UnsendableConsumer)));
+        Assert.Single(_probe.Of(nameof(DownstreamConsumer)));
+        Assert.Empty(_probe.Of(nameof(UnsendableSink)));
+    }
+
+    [Fact]
     public async Task Every_read_loop_Should_stay_alive_while_running()
     {
         await using TransportHarness harness =
@@ -531,6 +561,49 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
             {
                 throw new InvalidOperationException("failed after publishing");
             }
+        }
+    }
+
+    public sealed record BadTopicMessage;
+
+    [QueueName("t_bad_topic")]
+    public sealed class BadTopicConsumer(Probe probe) : IPgmqConsumer<BadTopicMessage>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<BadTopicMessage> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(BadTopicConsumer), context.Message, context);
+            await context.PublishAsync(new DownstreamMessage("bad topic"), cancellationToken);
+            await context.PublishToTopicAsync("t.notify.big spender", new DownstreamMessage("bad topic"),
+                cancellationToken);
+        }
+    }
+
+    public sealed record UnsendableTrigger;
+
+    /// <summary>Fails to serialize, so publishing it fails the same way every time.</summary>
+    public sealed record UnsendableMessage
+    {
+        public string Value => throw new NotSupportedException("cannot be serialized");
+    }
+
+    [QueueName("t_unsendable")]
+    public sealed class UnsendableConsumer(Probe probe) : IPgmqConsumer<UnsendableTrigger>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<UnsendableTrigger> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(UnsendableConsumer), context.Message, context);
+            await context.PublishAsync(new DownstreamMessage("unsendable"), cancellationToken);
+            await context.PublishAsync(new UnsendableMessage(), cancellationToken);
+        }
+    }
+
+    [QueueName("t_unsendable_sink")]
+    public sealed class UnsendableSink(Probe probe) : IPgmqConsumer<UnsendableMessage>
+    {
+        public Task HandleAsync(PgmqConsumeContext<UnsendableMessage> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(UnsendableSink), context.Message, context);
+            return Task.CompletedTask;
         }
     }
 

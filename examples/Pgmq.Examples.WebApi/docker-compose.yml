@@ -1,0 +1,18 @@
+# PostgreSQL with pgmq for the example, on port 5433 so it stays clear of any Postgres already on 5432.
+name: pgmq-example
+services:
+  postgres:
+    image: ghcr.io/pgmq/pg18-pgmq:v1.13.1
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgmq-example-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 15
+
+volumes:
+  pgmq-example-data:
