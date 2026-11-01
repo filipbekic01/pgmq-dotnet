@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-11-01
+
 ### Added
 
 - Direct queue access on `IPgmqQueueManager`, as raw JSON: `SendAsync` and `SendBatchAsync` (`pgmq.send`,
