@@ -126,6 +126,42 @@ public sealed class PublisherTests
         Assert.Equal(1, _sender.Calls);
     }
 
+    [Theory]
+    [InlineData("orders")]
+    [InlineData("orders.eu.created")]
+    [InlineData("app.user-service.auth_v2")]
+    public async Task A_valid_routing_key_Should_be_sent(string routingKey)
+    {
+        await Publisher.PublishToTopicAsync(routingKey, new Ping(1), Ct);
+
+        Assert.Equal(routingKey, Assert.Single(_sender.TopicSends).RoutingKey);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidRoutingKeys))]
+    public async Task An_invalid_routing_key_Should_be_refused_before_anything_is_sent(string routingKey)
+    {
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => Publisher.PublishToTopicAsync(routingKey, new Ping(1), Ct));
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            Publisher.PublishBatchToTopicAsync(routingKey, [new Ping(1)], Ct));
+
+        Assert.Equal(0, _sender.Calls);
+    }
+
+    /// <summary>What <c>pgmq.validate_routing_key</c> refuses.</summary>
+    public static TheoryData<string> InvalidRoutingKeys() =>
+    [
+        "",
+        "notify.email.big spender",
+        "logs.error!",
+        "orders.*",
+        "logs.#",
+        ".logs.error",
+        "logs.error.",
+        "logs..error",
+        new string('a', 256),
+    ];
+
     public sealed record Ping(int Id);
 
     /// <summary>Records what the publisher asks pgmq to write.</summary>

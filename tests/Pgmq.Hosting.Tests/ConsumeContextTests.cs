@@ -81,6 +81,21 @@ public sealed class ConsumeContextTests
     }
 
     [Fact]
+    public async Task A_topic_publish_with_an_invalid_routing_key_Should_throw_in_the_consumer_and_queue_nothing()
+    {
+        Mock<IPgmqPublisher> publisher = new(MockBehavior.Strict);
+        Outbox outbox = new();
+        PgmqConsumeContext<Ping> context = new(new Ping(), publisher.Object,
+            sendBack: (_, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            context.PublishToTopicAsync("notify.email.big spender", new Ping(), Ct));
+
+        Assert.Equal(0, outbox.Count);
+        publisher.VerifyNoOtherCalls();
+    }
+
+    [Fact]
     public async Task A_flush_that_fails_halfway_Should_resend_only_what_did_not_go_out()
     {
         Outbox outbox = new();

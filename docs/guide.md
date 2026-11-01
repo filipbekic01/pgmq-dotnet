@@ -16,6 +16,8 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   message read more than `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is
   archived without running again. `MaxAttempts = 1` turns retries off.
 - **Outbox.** What a consumer publishes through its context is sent only if it succeeds, so a retry does not send twice.
+  If a send then fails, the consumer runs again to send the rest only when the failure is transient; what already
+  went out may then go twice. A send that can never succeed archives the message instead.
 - **Timeouts.** A consumer past its timeout has its token cancelled and its message archived. One that ignores the
   token is abandoned, so its slot frees.
 - **Graceful shutdown.** Reading stops, running consumers get `DrainGrace` to finish, and what stops on cancellation
@@ -97,7 +99,9 @@ await publisher.PublishAsync(entry, new PgmqPublishOptions { GroupId = entry.Acc
 ### Topics
 
 Topic routing works next to the type-based fan-out. A consumer binds patterns to its queue (`*` is one word, `#` is
-any number), and a publish to a routing key reaches every queue whose pattern matches.
+any number), and a publish to a routing key reaches every queue whose pattern matches. A routing key is 1 to 255
+letters, digits, dots, hyphens and underscores, with no dot at either end and no two dots in a row; a publish with any
+other key throws `ArgumentException` before sending, also inside a consumer.
 
 ```csharp
 [TopicBinding("orders.*.created")]
