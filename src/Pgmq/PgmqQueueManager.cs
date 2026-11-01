@@ -255,6 +255,145 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         => QueryAsync("select msg_id from pgmq.set_vt($1, $2, $3)",
             [Text(queueName), Longs(messageIds), Int(Seconds(timeout))], r => r.GetInt64(0), cancellationToken);
 
+    /// <inheritdoc />
+    public async Task<long> SendAsync(string queueName, string message, string? headers = null, TimeSpan? delay = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(message);
+        IReadOnlyList<long> ids = await QueryAsync(
+            "select * from pgmq.send($1, $2, $3, pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => $4))",
+            [Text(queueName), Jsonb(message), Jsonb(headers), DelaySeconds(delay)], r => r.GetInt64(0),
+            cancellationToken);
+        return ids.Single();
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<long>> SendBatchAsync(string queueName, IReadOnlyList<string> messages,
+        IReadOnlyList<string>? headers = null, TimeSpan? delay = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        if (messages.Count == 0)
+        {
+            throw new ArgumentException("Send at least one message.", nameof(messages));
+        }
+
+        if (headers is not null && headers.Count != messages.Count)
+        {
+            throw new ArgumentException("Give one header object per message, or none.", nameof(headers));
+        }
+
+        // send_batch returns the ids in no promised order; order them as the bodies were given, which pgmq inserts in.
+        return OrderedAsync(QueryAsync(
+            "select * from pgmq.send_batch($1, $2, $3, pg_catalog.clock_timestamp() + pg_catalog.make_interval(secs => $4))",
+            [Text(queueName), JsonbArray(messages), JsonbArray(headers), DelaySeconds(delay)], r => r.GetInt64(0),
+            cancellationToken));
+
+        static async Task<IReadOnlyList<long>> OrderedAsync(Task<IReadOnlyList<long>> ids)
+            => [.. (await ids).Order()];
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<PgmqMessage>> ReadAsync(string queueName, TimeSpan visibilityTimeout, int quantity = 1,
+        PgmqReadOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        options ??= new PgmqReadOptions();
+        ArgumentOutOfRangeException.ThrowIfLessThan(quantity, 1, nameof(quantity));
+        if (options.Filter is not null && options.Mode != PgmqReadMode.Standard)
+        {
+            throw new ArgumentException("pgmq filters only the Standard read mode.", nameof(options));
+        }
+
+        string function = options.Mode switch
+        {
+            PgmqReadMode.Standard => "read",
+            PgmqReadMode.Grouped => "read_grouped",
+            PgmqReadMode.GroupedRoundRobin => "read_grouped_rr",
+            PgmqReadMode.GroupedHead => "read_grouped_head",
+            _ => throw new ArgumentOutOfRangeException(nameof(options), options.Mode, "Unknown read mode."),
+        };
+
+        List<NpgsqlParameter> parameters = [Text(queueName), Int(Seconds(visibilityTimeout)), Int(quantity)];
+        int? commandTimeout = null;
+        if (options.PollTimeout is { } poll)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(options.PollInterval, TimeSpan.FromMilliseconds(1),
+                nameof(options.PollInterval));
+            function += "_with_poll";
+            int pollSeconds = Seconds(poll);
+            parameters.Add(Int(pollSeconds));
+            parameters.Add(Int(Milliseconds(options.PollInterval)));
+            commandTimeout = pollSeconds + 30;
+        }
+
+        if (options.Filter is not null)
+        {
+            parameters.Add(Jsonb(options.Filter));
+        }
+
+        string arguments = string.Join(", ", parameters.Select((_, i) => $"${i + 1}"));
+        return ReadMessagesAsync($"select {MessageColumns} from pgmq.{function}({arguments})", [.. parameters],
+            commandTimeout, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<PgmqMessage>> PopAsync(string queueName, int quantity = 1,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(quantity, 1, nameof(quantity));
+        return ReadMessagesAsync($"select {MessageColumns} from pgmq.pop($1, $2)", [Text(queueName), Int(quantity)],
+            null, cancellationToken);
+    }
+
+    private const string MessageColumns =
+        "msg_id, read_ct, enqueued_at, last_read_at, vt, message::text, headers::text";
+
+    private async Task<IReadOnlyList<PgmqMessage>> ReadMessagesAsync(string sql, NpgsqlParameter[] parameters,
+        int? commandTimeout, CancellationToken cancellationToken)
+    {
+        await using NpgsqlCommand command = dataSource.CreateCommand(sql);
+        command.Parameters.AddRange(parameters);
+        if (commandTimeout is { } timeout)
+        {
+            // The command must outlive the poll it asks the database for.
+            command.CommandTimeout = Math.Max(command.CommandTimeout, timeout);
+        }
+
+        await using NpgsqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        List<PgmqMessage> messages = [];
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            messages.Add(new(
+                reader.GetInt64(0),
+                reader.GetInt32(1),
+                reader.GetFieldValue<DateTimeOffset>(2),
+                reader.IsDBNull(3) ? null : reader.GetFieldValue<DateTimeOffset>(3),
+                reader.GetFieldValue<DateTimeOffset>(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5),
+                reader.IsDBNull(6) ? null : reader.GetString(6)));
+        }
+
+        // pgmq returns a batch in no promised order.
+        messages.Sort((a, b) => a.MsgId.CompareTo(b.MsgId));
+        return messages;
+    }
+
+    private static NpgsqlParameter Jsonb(string? json)
+        => new() { Value = (object?)json ?? DBNull.Value, NpgsqlDbType = NpgsqlDbType.Jsonb };
+
+    private static NpgsqlParameter JsonbArray(IReadOnlyList<string>? json)
+        => new()
+        {
+            Value = (object?)json?.ToArray() ?? DBNull.Value,
+            NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Jsonb,
+        };
+
+    private static NpgsqlParameter DelaySeconds(TimeSpan? delay)
+    {
+        TimeSpan d = delay ?? TimeSpan.Zero;
+        ArgumentOutOfRangeException.ThrowIfLessThan(d, TimeSpan.Zero, nameof(delay));
+        return new NpgsqlParameter { Value = d.TotalSeconds, NpgsqlDbType = NpgsqlDbType.Double };
+    }
+
     private const string MetricsColumns =
         "queue_name, queue_length, queue_visible_length, newest_msg_age_sec, oldest_msg_age_sec, total_messages, " +
         "scrape_time, default_partition_length";

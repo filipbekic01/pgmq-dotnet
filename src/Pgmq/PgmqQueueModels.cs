@@ -89,6 +89,48 @@ public sealed record PgmqTopicBinding(string Pattern, string QueueName, DateTime
 /// <summary>A binding that a routing key matches (<c>pgmq.test_routing</c>).</summary>
 public sealed record PgmqTopicRoute(string Pattern, string QueueName, string CompiledRegex);
 
+/// <summary>
+/// A message as pgmq stores it (<c>pgmq.message_record</c>), read straight off a queue with
+/// <see cref="IPgmqQueueManager.ReadAsync"/> or <see cref="IPgmqQueueManager.PopAsync"/>.
+/// </summary>
+/// <param name="MsgId">pgmq's id of the message in its queue.</param>
+/// <param name="ReadCount">How many times it was read, this read included.</param>
+/// <param name="EnqueuedAt">When it was sent.</param>
+/// <param name="LastReadAt">When it was last read; null if never.</param>
+/// <param name="VisibleAt">When it can be read again (its visibility timeout).</param>
+/// <param name="Message">The JSON body.</param>
+/// <param name="Headers">The JSON headers; null when it was sent without any.</param>
+public sealed record PgmqMessage(
+    long MsgId,
+    int ReadCount,
+    DateTimeOffset EnqueuedAt,
+    DateTimeOffset? LastReadAt,
+    DateTimeOffset VisibleAt,
+    string? Message,
+    string? Headers);
+
+/// <summary>How <see cref="IPgmqQueueManager.ReadAsync"/> reads a queue.</summary>
+public sealed record PgmqReadOptions
+{
+    /// <summary>Which pgmq read function to call: <c>read</c> or one of the grouped FIFO reads.</summary>
+    public PgmqReadMode Mode { get; init; } = PgmqReadMode.Standard;
+
+    /// <summary>
+    /// A JSON object the body must contain (pgmq's experimental conditional read, <c>message @&gt; filter</c>), as in
+    /// <c>{"region":"eu"}</c>. Standard mode only.
+    /// </summary>
+    public string? Filter { get; init; }
+
+    /// <summary>
+    /// Wait inside the database for up to this long, rounded up to whole seconds, when nothing can be read yet (the
+    /// <c>_with_poll</c> functions). Null returns at once.
+    /// </summary>
+    public TimeSpan? PollTimeout { get; init; }
+
+    /// <summary>While polling, how often the database checks the queue again.</summary>
+    public TimeSpan PollInterval { get; init; } = TimeSpan.FromMilliseconds(100);
+}
+
 /// <summary>A queue that sends a notification on insert (<c>pgmq.enable_notify_insert</c>).</summary>
 /// <param name="QueueName">The queue.</param>
 /// <param name="ThrottleInterval">The shortest time between two notifications.</param>

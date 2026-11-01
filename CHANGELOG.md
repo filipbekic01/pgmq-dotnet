@@ -5,6 +5,18 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Direct queue access on `IPgmqQueueManager`, as raw JSON: `SendAsync` and `SendBatchAsync` (`pgmq.send`,
+  `pgmq.send_batch`), `ReadAsync` with `PgmqReadOptions` for the grouped modes, a filter and a long poll (`pgmq.read`,
+  the grouped reads and their `_with_poll` forms), and `PopAsync` (`pgmq.pop`). Messages come back as `PgmqMessage`.
+
+### Fixed
+
+- A message whose consumer keeps taking the process down is no longer read forever: once it was read more than
+  `MaxAttempts` times without finishing, the worker archives it without running it (`error.type`
+  `pgmq.attempts_exhausted`).
+
 ## [0.1.0-beta.1] - 2026-10-31
 
 ### Added

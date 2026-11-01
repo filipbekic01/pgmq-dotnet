@@ -19,7 +19,8 @@ namespace Pgmq.Hosting;
 /// <b>Outcome.</b> The consumer runs under its timeout. Success flushes its outbox, then deletes the message. A
 /// transient failure (<see cref="PgmqOptions.IsTransient"/>) makes it visible again after a backoff, up to
 /// <see cref="PgmqOptions.MaxAttempts"/> reads; any other failure, a timeout, or the last attempt archives it to
-/// <c>pgmq.a_{queue}</c>. The outcome is decided first and written to the queue after, with its own retries, so a
+/// <c>pgmq.a_{queue}</c>. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
+/// consumer keeps taking the process down) is archived without running. The outcome is decided first and written to the queue after, with its own retries, so a
 /// failed delete never runs a consumer again.
 /// </para>
 /// <para>
@@ -345,12 +346,24 @@ internal sealed class ConsumerWorker(
             message.MsgId, message.ReadCt, database.Server);
 
         bool known = headers is not null && messageType is not null && message.Body is not null;
+
+        // A failed attempt is settled, and the last one archived, so a message is read more than MaxAttempts times only
+        // when attempts never settled: its consumer kept taking the process down, or it never came back from one.
+        bool exhausted = !consumer.AtMostOnce && message.ReadCt > options.MaxAttempts;
         Outcome outcome;
 
         PgmqTelemetry.ActiveMessages.Add(1, state.Tags);
         try
         {
-            if (known)
+            if (exhausted)
+            {
+                logger.LogError(
+                    "Message {MsgId} on {Queue} was read {Reads} times without finishing, more than {MaxAttempts} " +
+                    "attempts; its consumer may be crashing the process. Archiving it without running it",
+                    message.MsgId, consumer.QueueName, message.ReadCt, options.MaxAttempts);
+                outcome = Outcome.Archived("pgmq.attempts_exhausted");
+            }
+            else if (known)
             {
                 outcome = await RunConsumerAsync(state, message, headers!, messageType!);
             }
@@ -379,8 +392,9 @@ internal sealed class ConsumerWorker(
         state.Leased.TryRemove(message.MsgId, out _);
         await SettleAsync(state, message, outcome.Settlement);
 
-        // An unknown message is archived, which takes it out of its group, so the group's next message may run.
-        return known ? outcome.Settlement.Kind : SettlementKind.Delete;
+        // An unknown or exhausted message is archived, which takes it out of its group, so the group's next message may
+        // run.
+        return known && !exhausted ? outcome.Settlement.Kind : SettlementKind.Delete;
     }
 
     /// <summary>Runs the consumer under its deadline and flushes its outbox, and says what to do with the message.</summary>
