@@ -90,7 +90,8 @@ builder.Services.AddOpenTelemetry()
 Logs go through `ILogger`. For queue depth gauges, also set `o.QueueMetricsInterval = TimeSpan.FromSeconds(15)`.
 Everything Pgmq emits is listed in [docs/guide.md](docs/guide.md#telemetry).
 
-A runnable worker is in [`examples/Pgmq.Examples.Worker`](examples/Pgmq.Examples.Worker). Behavior, all options and
+Runnable examples: a Web API to play with every feature in [`examples/Pgmq.Examples.WebApi`](examples/Pgmq.Examples.WebApi), and a
+worker in [`examples/Pgmq.Examples.Worker`](examples/Pgmq.Examples.Worker). Behavior, all options and
 PGMQ feature support are in [docs/guide.md](docs/guide.md).
 
 ## License

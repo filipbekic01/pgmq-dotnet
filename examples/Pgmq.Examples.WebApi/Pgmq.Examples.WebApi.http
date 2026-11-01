@@ -1,0 +1,79 @@
+@host = http://localhost:5080
+
+### What the consumers did, newest first. Re-run this after each request below.
+GET {{host}}/activity
+
+### Clear the activity feed
+DELETE {{host}}/activity
+
+### Queue depth and totals
+GET {{host}}/queues
+
+### Health
+GET {{host}}/health
+
+### Place an order. OrderPlacedHandler then sends a PaymentRequested and an email notification.
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "customer": "Ana", "total": 120.50 }
+
+### Retries: the payment gateway times out twice, then succeeds on the 3rd attempt. Backoff starts at 2 s.
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "customer": "Marko", "total": 80, "paymentFailures": 2 }
+
+### Retries run out: 5 failures but MaxAttempts is 4, so the message is archived to pgmq.a_example_payments.
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "customer": "Jelena", "total": 80, "paymentFailures": 5 }
+
+### Permanent failure: over the limit throws a non-transient exception, archived on the first attempt.
+POST {{host}}/orders
+Content-Type: application/json
+
+{ "customer": "Big Spender", "total": 50000 }
+
+### Publish by type: both EmailNotifier and NotificationAudit get a copy.
+POST {{host}}/notifications
+Content-Type: application/json
+
+{ "text": "Hello everyone" }
+
+### Topic: notify.email.ana matches notify.email.* (EmailNotifier) and notify.# (NotificationAudit) -> 2 queues
+POST {{host}}/notifications/notify.email.ana
+Content-Type: application/json
+
+{ "text": "Your parcel shipped" }
+
+### Topic: notify.sms.ana only matches notify.# -> 1 queue
+POST {{host}}/notifications/notify.sms.ana
+Content-Type: application/json
+
+{ "text": "Your code is 1234" }
+
+### Topic: nothing matches -> 0 queues
+POST {{host}}/notifications/billing.invoice
+Content-Type: application/json
+
+{ "text": "Nobody hears this" }
+
+### Which queues a routing key would reach
+GET {{host}}/topics/notify.email.ana
+
+### FIFO groups: each account's entries arrive in order (#1, #2, #3...), accounts interleave.
+POST {{host}}/ledger
+Content-Type: application/json
+
+{ "accounts": 3, "entriesPerAccount": 5 }
+
+### Delayed delivery: shows up in /activity after 10 seconds.
+POST {{host}}/reminders
+Content-Type: application/json
+
+{ "text": "Stand up and stretch", "delaySeconds": 10 }
+
+### Purge a queue
+DELETE {{host}}/queues/example_ledger
