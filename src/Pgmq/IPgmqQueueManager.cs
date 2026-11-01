@@ -4,7 +4,8 @@ namespace Pgmq;
 
 /// <summary>
 /// Manages queues and everything around them: creating and dropping queues, metrics, topic bindings, insert
-/// notifications, FIFO indexes, and deleting, archiving or hiding messages by id. Each method is one pgmq function;
+/// notifications, FIFO indexes, sending and reading raw messages, and deleting, archiving or hiding messages by id.
+/// Each method is one pgmq function;
 /// its summary names it. Pgmq.Hosting sets up the consumers' queues itself, so this is for what an application does
 /// on its own.
 /// </summary>
@@ -144,4 +145,43 @@ public interface IPgmqQueueManager
     /// <returns>The ids that existed and were updated.</returns>
     Task<IReadOnlyList<long>> SetVisibilityTimeoutAsync(string queueName, IReadOnlyCollection<long> messageIds,
         TimeSpan timeout, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Writes raw JSON straight to one queue (<c>pgmq.send</c>), past the publisher's routing and headers: for queues
+    /// shared with other languages or tools. The worker's consumers cannot handle such a message, since it lacks
+    /// Pgmq's <c>message-type</c> header; publish through <see cref="IPgmqPublisher"/> for them.
+    /// </summary>
+    /// <param name="queueName">The queue.</param>
+    /// <param name="message">The body, as JSON.</param>
+    /// <param name="headers">The headers, as a JSON object, or null for none.</param>
+    /// <param name="delay">How long it stays invisible, measured on the database's clock; null for none.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    /// <returns>The new message's id.</returns>
+    Task<long> SendAsync(string queueName, string message, string? headers = null, TimeSpan? delay = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>Writes several raw JSON messages to one queue in one call (<c>pgmq.send_batch</c>); see <see cref="SendAsync"/>.</summary>
+    /// <param name="queueName">The queue.</param>
+    /// <param name="messages">The bodies, as JSON. At least one.</param>
+    /// <param name="headers">One JSON object per message, or null for none.</param>
+    /// <param name="delay">How long they stay invisible, measured on the database's clock; null for none.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    /// <returns>The new messages' ids, in the order of <paramref name="messages"/>.</returns>
+    Task<IReadOnlyList<long>> SendBatchAsync(string queueName, IReadOnlyList<string> messages,
+        IReadOnlyList<string>? headers = null, TimeSpan? delay = null, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Reads up to <paramref name="quantity"/> messages and hides them for <paramref name="visibilityTimeout"/>, rounded
+    /// up to whole seconds (<c>pgmq.read</c>, the grouped reads, and their <c>_with_poll</c> forms). Delete or archive
+    /// each one when done, or it comes back once the timeout passes. This is the raw read; consumers registered with
+    /// Pgmq.Hosting are read by its worker.
+    /// </summary>
+    /// <returns>The messages, oldest first.</returns>
+    Task<IReadOnlyList<PgmqMessage>> ReadAsync(string queueName, TimeSpan visibilityTimeout, int quantity = 1,
+        PgmqReadOptions? options = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Reads and deletes up to <paramref name="quantity"/> messages in one step (<c>pgmq.pop</c>).</summary>
+    /// <returns>The messages, oldest first. They are already gone from the queue.</returns>
+    Task<IReadOnlyList<PgmqMessage>> PopAsync(string queueName, int quantity = 1,
+        CancellationToken cancellationToken = default);
 }

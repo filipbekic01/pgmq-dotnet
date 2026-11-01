@@ -12,7 +12,9 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
 - **Leases.** A read message is hidden for `Lease` (30 s), renewed while its consumer runs. A long job keeps its
   message, and a crashed process gives it back within one lease.
 - **Retries.** A failure that `IsTransient` accepts is retried after a backoff (30 s, 2 m, 8 m, 30 m), up to
-  `MaxAttempts`. Any other failure, a timeout, or the last attempt archives the message to `pgmq.a_{queue}`.
+  `MaxAttempts`. Any other failure, a timeout, or the last attempt archives the message to `pgmq.a_{queue}`. A
+  message read more than `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is
+  archived without running again. `MaxAttempts = 1` turns retries off.
 - **Outbox.** What a consumer publishes through its context is sent only if it succeeds, so a retry does not send twice.
 - **Timeouts.** A consumer past its timeout has its token cancelled and its message archived. One that ignores the
   token is abandoned, so its slot frees.
@@ -33,10 +35,10 @@ Npgsql and nothing else in between.
 | PGMQ feature | Function | Supported | How |
 |---|---|:---:|---|
 | **Sending** | | | |
-| Send a message | `send` | ✅ | `IPgmqPublisher.PublishAsync` |
+| Send a message | `send` | ✅ | `IPgmqPublisher.PublishAsync`; raw JSON to one queue with `IPgmqQueueManager.SendAsync` |
 | Send with headers | `send(…, headers)` | ✅ | Pgmq's own headers on every message; yours with `PgmqPublishOptions.Headers` |
 | Delayed send (seconds or timestamp) | `send(…, delay)` | ✅ | `SchedulePublishAsync`, or `PgmqPublishOptions.Delay` / `DeliverAt` |
-| Send a batch | `send_batch` | ✅ | `PublishBatchAsync`, one write per queue |
+| Send a batch | `send_batch` | ✅ | `PublishBatchAsync`, one write per queue; raw with `IPgmqQueueManager.SendBatchAsync` |
 | **Topic routing** | | | |
 | Bind a pattern to a queue | `bind_topic` | ✅ | `[TopicBinding("orders.*")]` on a consumer, or `IPgmqQueueManager.BindTopicAsync` |
 | Unbind a pattern | `unbind_topic` | ✅ | `IPgmqQueueManager.UnbindTopicAsync` |
@@ -45,13 +47,13 @@ Npgsql and nothing else in between.
 | Send to a topic | `send_topic` | ✅ | `IPgmqPublisher.PublishToTopicAsync` |
 | Send a batch to a topic | `send_batch_topic` | ✅ | `IPgmqPublisher.PublishBatchToTopicAsync` |
 | **Reading** | | | |
-| Read with a visibility timeout | `read` | ✅ | Worker, renewing the lease while the consumer runs |
-| Conditional read (experimental) | `read(…, conditional)` | ✅ | `[ConsumerOptions(Filter = """{"region":"eu"}""")]` |
-| Long poll | `read_with_poll` | ✅ | Worker, while notifications are not live (`PgmqOptions.LongPollTimeout`) |
-| FIFO, fill from the oldest group | `read_grouped`, `read_grouped_with_poll` | ✅ | `ReadMode = PgmqReadMode.Grouped`, group with `PgmqPublishOptions.GroupId` |
+| Read with a visibility timeout | `read` | ✅ | Worker, renewing the lease while the consumer runs; or `IPgmqQueueManager.ReadAsync` |
+| Conditional read (experimental) | `read(…, conditional)` | ✅ | `[ConsumerOptions(Filter = """{"region":"eu"}""")]`, or `PgmqReadOptions.Filter` |
+| Long poll | `read_with_poll` | ✅ | Worker, while notifications are not live (`PgmqOptions.LongPollTimeout`); or `PgmqReadOptions.PollTimeout` |
+| FIFO, fill from the oldest group | `read_grouped`, `read_grouped_with_poll` | ✅ | `ReadMode = PgmqReadMode.Grouped`, group with `PgmqPublishOptions.GroupId`; or `PgmqReadOptions.Mode` for any FIFO read |
 | FIFO, round robin across groups | `read_grouped_rr`, `read_grouped_rr_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedRoundRobin` |
 | FIFO, head of each group | `read_grouped_head`, `read_grouped_head_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedHead` |
-| Read and delete (at most once) | `pop` | ✅ | `[ConsumerOptions(AtMostOnce = true)]` |
+| Read and delete (at most once) | `pop` | ✅ | `[ConsumerOptions(AtMostOnce = true)]`, or `IPgmqQueueManager.PopAsync` |
 | **Deleting and archiving** | | | |
 | Delete a message | `delete` | ✅ | Worker, when a consumer succeeds; or `IPgmqQueueManager.DeleteMessageAsync` |
 | Delete a batch | `delete(…, msg_ids[])` | ✅ | `IPgmqQueueManager.DeleteMessagesAsync` |
@@ -140,6 +142,24 @@ PgmqQueueMetrics metrics = await queues.GetMetricsAsync("order_created");
 await queues.PurgeQueueAsync("order_created");
 await queues.BindTopicAsync("logs.#", "log_sink");
 ```
+
+It also reads and writes queues directly, as raw JSON, for queues shared with other languages or tools. Delete or
+archive what you read, or it comes back after its visibility timeout:
+
+```csharp
+await queues.SendAsync("reports", """{"id":42}""", headers: """{"source":"cron"}""",
+    delay: TimeSpan.FromMinutes(5));
+
+foreach (PgmqMessage message in await queues.ReadAsync("reports", TimeSpan.FromSeconds(30), quantity: 10,
+             new PgmqReadOptions { PollTimeout = TimeSpan.FromSeconds(5) }))
+{
+    // message.Message and message.Headers are the JSON pgmq stores.
+    await queues.DeleteMessageAsync("reports", message.MsgId);
+}
+```
+
+A message from outside Pgmq reaches a registered consumer when its headers name its type: `{"message-type": "..."}`
+with the type's full name, or its `[MessageName]`. Without that header the worker cannot type it and archives it.
 
 ## Database setup
 
@@ -243,7 +263,8 @@ so a trace still continues into the consumer.
 
 `messaging.pgmq.outcome` is what happened to a handled message: `success`, `retry`, `archived`, `released` (shutdown;
 it goes back to the queue) or `lost` (an at-most-once message that did not succeed). `error.type` says why: the
-exception's type, `timeout`, `pgmq.abandoned`, `pgmq.shutdown` or `pgmq.unknown_message_type`. Histograms suggest the
+exception's type, `timeout`, `pgmq.abandoned`, `pgmq.shutdown`, `pgmq.unknown_message_type` or
+`pgmq.attempts_exhausted`. Histograms suggest the
 bucket boundaries the OpenTelemetry messaging conventions recommend; your views can override them.
 
 The queue gauges come from `pgmq.metrics_all`, which counts the rows of every queue in the database. That query costs

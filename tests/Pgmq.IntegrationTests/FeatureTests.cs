@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Text.Json;
 using Npgsql;
 
 namespace Pgmq.IntegrationTests;
@@ -348,6 +350,90 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         Assert.Equal('p', await db.ScalarObjectAsync(
             "select c.relkind from pg_class c join pg_namespace n on n.oid = c.relnamespace " +
             "where n.nspname = 'pgmq' and c.relname = 'a_m_archive'"));
+    }
+
+    [Fact]
+    public async Task The_queue_manager_Should_send_read_poll_and_pop_raw_messages()
+    {
+        PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
+        await queues.EnsureQueueAsync("m_raw", cancellationToken: Ct);
+        await db.ResetAsync("m_raw");
+
+        long first = await queues.SendAsync("m_raw", """{"region":"us"}""", """{"source":"py"}""",
+            cancellationToken: Ct);
+        IReadOnlyList<long> batch = await queues.SendBatchAsync("m_raw",
+            ["""{"region":"eu","n":1}""", """{"region":"eu","n":2}"""], cancellationToken: Ct);
+        long delayed = await queues.SendAsync("m_raw", """{"region":"later"}""", delay: TimeSpan.FromSeconds(2),
+            cancellationToken: Ct);
+        Assert.True(first < batch[0] && batch[0] < batch[1] && batch[1] < delayed);
+
+        // A filtered read takes only what matches, oldest first, and hides it for the visibility timeout.
+        IReadOnlyList<PgmqMessage> eu = await queues.ReadAsync("m_raw", TimeSpan.FromMinutes(1), 10,
+            new PgmqReadOptions { Filter = """{"region":"eu"}""" }, Ct);
+        Assert.Equal(batch, eu.Select(m => m.MsgId));
+        Assert.All(eu, m =>
+        {
+            Assert.Equal(1, m.ReadCount);
+            Assert.NotNull(m.LastReadAt);
+            Assert.True(m.VisibleAt > DateTimeOffset.UtcNow.AddSeconds(30));
+            Assert.Null(m.Headers);
+        });
+        Assert.Equal(2, JsonDocument.Parse(eu[1].Message!).RootElement.GetProperty("n").GetInt32());
+
+        // A plain read now finds only the first: the batch is hidden and the delayed one is not due.
+        PgmqMessage us = Assert.Single(await queues.ReadAsync("m_raw", TimeSpan.FromMinutes(1), 10,
+            cancellationToken: Ct));
+        Assert.Equal(first, us.MsgId);
+        Assert.Equal("py", JsonDocument.Parse(us.Headers!).RootElement.GetProperty("source").GetString());
+
+        // A poll waits in the database for the delayed one to come due.
+        Stopwatch clock = Stopwatch.StartNew();
+        PgmqMessage later = Assert.Single(await queues.ReadAsync("m_raw", TimeSpan.FromMinutes(1), 10,
+            new PgmqReadOptions { PollTimeout = TimeSpan.FromSeconds(5) }, Ct));
+        Assert.Equal(delayed, later.MsgId);
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(4), $"polled for {clock.Elapsed}");
+
+        // Pop reads and deletes in one step.
+        await queues.SetVisibilityTimeoutAsync("m_raw", first, TimeSpan.Zero, Ct);
+        Assert.Equal(first, Assert.Single(await queues.PopAsync("m_raw", 10, Ct)).MsgId);
+        Assert.Empty(await queues.PopAsync("m_raw", 10, Ct));
+        Assert.Equal(3, await db.CountAsync("m_raw"));
+    }
+
+    [Fact]
+    public async Task The_queue_manager_Should_read_fifo_groups_and_refuse_what_pgmq_cannot_do()
+    {
+        PgmqQueueManager queues = db.Queues;
+        await queues.InitAsync(Ct);
+        await queues.EnsureQueueAsync("m_raw_fifo", cancellationToken: Ct);
+        await db.ResetAsync("m_raw_fifo");
+
+        IReadOnlyList<long> ids = await queues.SendBatchAsync("m_raw_fifo",
+            ["""{"n":1}""", """{"n":2}""", """{"n":3}"""],
+            ["""{"x-pgmq-group":"a"}""", """{"x-pgmq-group":"a"}""", """{"x-pgmq-group":"b"}"""], cancellationToken: Ct);
+
+        // The head of each group, and nothing behind a head that is out.
+        IReadOnlyList<PgmqMessage> heads = await queues.ReadAsync("m_raw_fifo", TimeSpan.FromMinutes(1), 10,
+            new PgmqReadOptions { Mode = PgmqReadMode.GroupedHead }, Ct);
+        Assert.Equal([ids[0], ids[2]], heads.Select(m => m.MsgId));
+        Assert.Empty(await queues.ReadAsync("m_raw_fifo", TimeSpan.FromMinutes(1), 10,
+            new PgmqReadOptions { Mode = PgmqReadMode.Grouped }, Ct));
+
+        await queues.DeleteMessageAsync("m_raw_fifo", ids[0], Ct);
+        Assert.Equal(ids[1], Assert.Single(await queues.ReadAsync("m_raw_fifo", TimeSpan.FromMinutes(1), 10,
+            new PgmqReadOptions { Mode = PgmqReadMode.GroupedRoundRobin, PollTimeout = TimeSpan.FromSeconds(1) },
+            Ct)).MsgId);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => queues.ReadAsync("m_raw_fifo", TimeSpan.FromSeconds(1), 1,
+            new PgmqReadOptions { Mode = PgmqReadMode.Grouped, Filter = "{}" }, Ct));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => queues.ReadAsync("m_raw_fifo", TimeSpan.FromSeconds(1), 0, cancellationToken: Ct));
+        await Assert.ThrowsAsync<ArgumentException>(() => queues.SendBatchAsync("m_raw_fifo", [], cancellationToken: Ct));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => queues.SendBatchAsync("m_raw_fifo", ["{}", "{}"], ["{}"], cancellationToken: Ct));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => queues.SendAsync("m_raw_fifo", "{}", delay: TimeSpan.FromSeconds(-1), cancellationToken: Ct));
     }
 
     private Task<TransportHarness> StartAsync(params Type[] consumers) => TransportHarness.StartAsync(db, _probe, consumers);
