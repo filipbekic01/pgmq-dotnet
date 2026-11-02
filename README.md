@@ -4,6 +4,8 @@
 |---|:---:|:---:|
 | Every pgmq queue feature, one to one, with nothing added to or changed in its SQL | ✅ | ✅ |
 | Background worker service that runs your consumers | ✅ | ❌ |
+| OpenTelemetry traces and metrics out of the box | ✅ | ❌ |
+| Shovel functionality via routines | ✅ | ❌ |
 
 [pgmq](https://github.com/pgmq/pgmq) is the standard for message queues in PostgreSQL. Pgmq.NET uses it as it is and
 adds a runtime service for .NET that consumes your messages for you.
