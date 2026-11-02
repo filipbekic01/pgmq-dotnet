@@ -201,7 +201,7 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
         CancellationToken cancellationToken)
     {
         await using NpgsqlCommand exists = new(
-            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer)') is not null", connection, transaction);
+            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[])') is not null", connection, transaction);
         bool existed = (bool)(await exists.ExecuteScalarAsync(cancellationToken))!;
 
         await ExecuteAsync(connection, transaction, ReadResource(OWN_RESOURCE_PREFIX, SHOVEL_SCRIPT), cancellationToken);

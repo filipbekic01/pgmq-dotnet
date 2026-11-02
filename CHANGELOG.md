@@ -8,7 +8,8 @@ All notable changes to this project are recorded here. The format follows
 ### Added
 
 - A shovel: `IPgmqQueueManager.ShovelAsync` moves messages from a queue, or from its archive, onto another queue in
-  one statement, keeping their bodies and headers. Replay what failed with
+  one statement, keeping their bodies and headers: the oldest, at most 1000 per call by default, or exactly the
+  messages whose ids it is given. Replay what failed with
   `ShovelAsync("orders", "orders", fromArchive: true)`. It runs `pgmq.shovel`, Pgmq.NET's one addition to pgmq, which
   the migrator creates (or replaces) after installing or upgrading pgmq.
 

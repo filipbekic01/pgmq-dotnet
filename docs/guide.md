@@ -179,16 +179,20 @@ with the type's full name, or its `[MessageName]`. Without that header the worke
 `pgmq.shovel` is Pgmq.NET's one addition to pgmq, created by the migrator: it moves messages from a queue, or from its archive, onto
 another queue in one statement. Each message keeps its body and headers and arrives as a new message, visible at
 once, read zero times. From a queue only visible messages move, so a message being handled or still delayed stays
-where it is. The target must exist; either every selected message moves or none does.
+where it is, and two shovels on one queue at once never move the same message. Both queues must exist; either every
+selected message moves or none does. From the archive messages are moved, not copied: they leave the archive.
 
 ```csharp
 await queues.ShovelAsync("orders", "orders_v2");                        // move a queue's messages to another queue
 await queues.ShovelAsync("orders", "orders", fromArchive: true);        // replay what failed back onto the queue
-await queues.ShovelAsync("orders", "orders", fromArchive: true, maxMessages: 100); // oldest 100 only
+await queues.ShovelAsync("orders", "orders", fromArchive: true, maxMessages: null); // all of them at once
+await queues.ShovelAsync("orders", "orders", [41, 42], fromArchive: true);  // exactly these, by msg_id
 ```
 
-It is plain SQL too: `select pgmq.shovel('orders', 'orders', from_archive => true)`. Moving a whole large queue
-holds its messages in one transaction; pass `maxMessages` and call it in a loop for big ones.
+One call moves at most 1000 messages (`maxMessages`), so it stays one modest transaction. Given message ids, it moves
+exactly those, however many, and leaves out ids that are not there or (in the queue) not visible. To drain a big queue, call
+it until it returns 0; `maxMessages: null` moves everything in one transaction. It is plain SQL too:
+`select pgmq.shovel('orders', 'orders', from_archive => true, msg_ids => array[41, 42])`.
 
 ## Database setup
 
