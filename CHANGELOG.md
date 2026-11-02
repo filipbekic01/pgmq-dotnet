@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-02
+
 ### Changed
 
 - **Breaking:** consumers are no longer retried by default. `PgmqOptions.IsTransient` defaults to the new
@@ -13,6 +15,8 @@ All notable changes to this project are recorded here. The format follows
   `options.IsTransient = PgmqTransientFailures.IsTransient`. A failed outbox flush is still retried in place, which
   runs no consumer.
 - The README says what the default retry policy is and why.
+- The README opens by saying Pgmq.NET follows pgmq one to one and adds workers on top. Its "Where it lives" section
+  is removed.
 - The Web API example runs on the library's defaults: `PaymentHandler` retries its flaky gateway call itself instead
   of having Pgmq run the whole message again.
 

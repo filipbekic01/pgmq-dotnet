@@ -10,8 +10,6 @@ You publish a typed message; every consumer of that type gets its own durable co
 worker, with timeouts, archiving of failed messages and graceful shutdown. Consumers wake up instantly through PostgreSQL LISTEN/NOTIFY,
 with long polling as the fallback.
 
-> Beta (`0.1.0-beta.2`). The API may still change before 1.0.
-
 ## Run it
 
 1. Start PostgreSQL with pgmq:
