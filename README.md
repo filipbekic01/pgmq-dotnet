@@ -5,12 +5,8 @@
 | Every pgmq queue feature, one to one, with nothing added to or changed in its SQL | ✅ | ✅ |
 | Background worker service that runs your consumers | ✅ | ❌ |
 
-Publish/subscribe messaging for .NET, stored in PostgreSQL through the [PGMQ](https://github.com/pgmq/pgmq) extension.
-No separate broker: your database is the queue.
-
-You publish a typed message; every consumer of that type gets its own durable copy and handles it in a background
-worker, with timeouts, archiving of failed messages and graceful shutdown. Consumers wake up instantly through PostgreSQL LISTEN/NOTIFY,
-with long polling as the fallback.
+[pgmq](https://github.com/pgmq/pgmq) is the standard for message queues in PostgreSQL. Pgmq.NET uses it as it is and
+adds a runtime service for .NET that consumes your messages for you.
 
 ## Run it
 
