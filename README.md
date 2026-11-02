@@ -1,14 +1,14 @@
 # Pgmq.NET
 
+[pgmq](https://github.com/pgmq/pgmq) is the standard for message queues in PostgreSQL. Pgmq.NET uses it as it is and
+adds an opinionated runtime service for .NET that consumes your messages for you.
+
 |  | Pgmq.NET | [pgmq](https://github.com/pgmq/pgmq) |
 |---|:---:|:---:|
 | Every pgmq feature, one to one | ✅ | ✅ |
 | Background workers woken by LISTEN/NOTIFY | ✅ | ❌ |
 | OpenTelemetry traces and metrics out of the box | ✅ | ❌ |
 | Shovel functionality via routines | ✅ | ❌ |
-
-[pgmq](https://github.com/pgmq/pgmq) is the standard for message queues in PostgreSQL. Pgmq.NET uses it as it is and
-adds a runtime service for .NET that consumes your messages for you.
 
 ## Run it
 
