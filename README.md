@@ -2,7 +2,7 @@
 
 |  | Pgmq.NET | [pgmq](https://github.com/pgmq/pgmq) |
 |---|:---:|:---:|
-| Every pgmq queue feature, one to one, with nothing added to or changed in its SQL | ✅ | ✅ |
+| Every pgmq feature, one to one | ✅ | ✅ |
 | Background worker service that runs your consumers | ✅ | ❌ |
 | OpenTelemetry traces and metrics out of the box | ✅ | ❌ |
 | Shovel functionality via routines | ✅ | ❌ |
