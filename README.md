@@ -3,7 +3,7 @@
 |  | Pgmq.NET | [pgmq](https://github.com/pgmq/pgmq) |
 |---|:---:|:---:|
 | Every pgmq feature, one to one | ✅ | ✅ |
-| Background worker service that runs your consumers | ✅ | ❌ |
+| Background workers woken by LISTEN/NOTIFY | ✅ | ❌ |
 | OpenTelemetry traces and metrics out of the box | ✅ | ❌ |
 | Shovel functionality via routines | ✅ | ❌ |
 
