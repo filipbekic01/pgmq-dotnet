@@ -41,7 +41,8 @@ public enum PgmqInstallation
 /// <param name="Version">The version now.</param>
 /// <param name="AppliedScripts">
 /// What ran: <c>pgmq.sql</c> and upgrade scripts for the SQL install, <c>create extension</c> or
-/// <c>alter extension</c> for the extension. Empty when pgmq was already current.
+/// <c>alter extension</c> for the extension, then Pgmq.NET's own migrations (<c>pgmq_dotnet/0001_shovel.sql</c>).
+/// Empty when everything was already current.
 /// </param>
 public sealed record PgmqMigrationResult(
     PgmqInstallation Installation,
@@ -62,6 +63,11 @@ public sealed record PgmqMigrationResult(
 /// package (<see cref="EmbeddedVersion"/>), recording each in <c>pgmq.__pgmq_migrations</c>, and later runs apply the
 /// upgrade scripts from the recorded version on.
 /// </para>
+/// <para>
+/// After pgmq, in the same transaction, it applies Pgmq.NET's own migrations: routines such as
+/// <c>pgmq_dotnet.shovel</c>, kept in their own <c>pgmq_dotnet</c> schema so pgmq's is never changed, and recorded in
+/// <c>pgmq_dotnet.__migrations</c>.
+/// </para>
 /// </summary>
 /// <param name="dataSource">The database pgmq lives in.</param>
 public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
@@ -72,6 +78,10 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
     internal const string INIT_SCRIPT = "pgmq.sql";
 
     private const string RESOURCE_PREFIX = "Pgmq.Sql.";
+    private const string OWN_RESOURCE_PREFIX = "Pgmq.Migrations.";
+
+    /// <summary>The schema Pgmq.NET's own routines live in, next to pgmq's.</summary>
+    internal const string OWN_SCHEMA = "pgmq_dotnet";
     private const string INVALID_CATALOG_NAME = "3D000";
     private const string DUPLICATE_DATABASE = "42P04";
     private const string UNIQUE_VIOLATION = "23505";
@@ -175,8 +185,61 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
             _ => await MigrateSqlAsync(connection, transaction, state, mode, cancellationToken),
         };
 
+        IReadOnlyList<string> own = await MigrateOwnAsync(connection, transaction, cancellationToken);
+        if (own.Count > 0)
+        {
+            result = result with { AppliedScripts = [.. result.AppliedScripts, .. own] };
+        }
+
         await transaction.CommitAsync(cancellationToken);
         return result;
+    }
+
+    /// <summary>The names of Pgmq.NET's own migrations, in the order they run.</summary>
+    internal static IReadOnlyList<string> OwnMigrations()
+        => [.. typeof(PgmqMigrator).Assembly.GetManifestResourceNames()
+            .Where(n => n.StartsWith(OWN_RESOURCE_PREFIX, StringComparison.Ordinal))
+            .Select(n => n[OWN_RESOURCE_PREFIX.Length..])
+            .Order(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// Runs every one of Pgmq.NET's own migrations not yet recorded in <c>pgmq_dotnet.__migrations</c>, in name order.
+    /// Called under the migration lock, after pgmq is installed, which they build on.
+    /// </summary>
+    /// <returns>What ran, as <c>pgmq_dotnet/name.sql</c>.</returns>
+    private static async Task<IReadOnlyList<string>> MigrateOwnAsync(NpgsqlConnection connection,
+        NpgsqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        await ExecuteAsync(connection, transaction, $"""
+            create schema if not exists {OWN_SCHEMA};
+            create table if not exists {OWN_SCHEMA}.__migrations (
+                name text primary key not null,
+                run_at timestamp with time zone not null default clock_timestamp());
+            """, cancellationToken);
+
+        HashSet<string> applied = [];
+        await using (NpgsqlCommand read = new($"select name from {OWN_SCHEMA}.__migrations", connection, transaction))
+        await using (NpgsqlDataReader reader = await read.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                applied.Add(reader.GetString(0));
+            }
+        }
+
+        List<string> ran = [];
+        foreach (string name in OwnMigrations().Where(n => !applied.Contains(n)))
+        {
+            await ExecuteAsync(connection, transaction, ReadResource(OWN_RESOURCE_PREFIX, name), cancellationToken);
+
+            await using NpgsqlCommand record = new($"insert into {OWN_SCHEMA}.__migrations (name) values ($1)",
+                connection, transaction);
+            record.Parameters.AddWithValue(name);
+            await record.ExecuteNonQueryAsync(cancellationToken);
+            ran.Add($"{OWN_SCHEMA}/{name}");
+        }
+
+        return ran;
     }
 
     private static async Task<PgmqMigrationResult> CreateExtensionAsync(NpgsqlConnection connection,
@@ -304,11 +367,13 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
             .Select(n => UpgradeScript.Parse(n[RESOURCE_PREFIX.Length..]))
             .OrderBy(u => u.From)];
 
-    internal static string ReadResource(string name)
+    internal static string ReadResource(string name) => ReadResource(RESOURCE_PREFIX, name);
+
+    private static string ReadResource(string prefix, string name)
     {
         Assembly assembly = typeof(PgmqMigrator).Assembly;
-        using Stream stream = assembly.GetManifestResourceStream(RESOURCE_PREFIX + name)
-            ?? throw new InvalidOperationException($"The embedded pgmq script {name} is missing.");
+        using Stream stream = assembly.GetManifestResourceStream(prefix + name)
+            ?? throw new InvalidOperationException($"The embedded script {name} is missing.");
         using StreamReader reader = new(stream);
         return reader.ReadToEnd();
     }

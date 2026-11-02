@@ -84,6 +84,29 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         => await ScalarAsync<bool>("select pgmq.drop_queue($1)", [Text(queueName)], cancellationToken);
 
     /// <inheritdoc />
+    public async Task<long> ShovelAsync(string sourceQueue, string targetQueue, bool fromArchive = false,
+        int? maxMessages = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourceQueue);
+        ArgumentException.ThrowIfNullOrEmpty(targetQueue);
+        if (maxMessages is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxMessages), maxMessages,
+                "Move at least one message, or pass null to move them all.");
+        }
+
+        return await ScalarAsync<long>($"select {PgmqMigrator.OWN_SCHEMA}.shovel($1, $2, $3, $4)",
+            [
+                Text(sourceQueue), Text(targetQueue),
+                new NpgsqlParameter { Value = fromArchive, NpgsqlDbType = NpgsqlDbType.Boolean },
+                new NpgsqlParameter
+                {
+                    Value = maxMessages is { } max ? max : DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer,
+                },
+            ], cancellationToken);
+    }
+
+    /// <inheritdoc />
     public async Task<long> PurgeQueueAsync(string queueName, CancellationToken cancellationToken = default)
         => await ScalarAsync<long>("select pgmq.purge_queue($1)", [Text(queueName)], cancellationToken);
 

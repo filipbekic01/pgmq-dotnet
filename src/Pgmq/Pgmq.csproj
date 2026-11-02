@@ -17,6 +17,11 @@
         <None Include="Sql\LICENSE" Pack="true" PackagePath="licenses\pgmq" />
     </ItemGroup>
 
+    <!-- Pgmq.NET's own routines (the shovel), installed into the pgmq_dotnet schema after pgmq, never into pgmq's. -->
+    <ItemGroup>
+        <EmbeddedResource Include="Migrations\*.sql" LogicalName="Pgmq.Migrations.%(Filename)%(Extension)" />
+    </ItemGroup>
+
     <ItemGroup>
         <InternalsVisibleTo Include="Pgmq.Hosting" />
         <InternalsVisibleTo Include="Pgmq.Tests" />

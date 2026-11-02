@@ -47,6 +47,25 @@ public interface IPgmqQueueManager
     /// <returns>True when the queue existed.</returns>
     Task<bool> DropQueueAsync(string queueName, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Moves messages from <paramref name="sourceQueue"/>, or from its archive, onto <paramref name="targetQueue"/>
+    /// in one statement (<c>pgmq_dotnet.shovel</c>, Pgmq.NET's own routine, installed by the migrator). Each keeps its
+    /// body and headers and arrives as a new message, visible at once, read zero times. From a queue only visible
+    /// messages move: one being handled or delayed stays. Either every selected message moves or none does.
+    /// <code>
+    /// // Replay what failed: everything in orders' archive goes back onto orders.
+    /// await queues.ShovelAsync("orders", "orders", fromArchive: true);
+    /// </code>
+    /// </summary>
+    /// <param name="sourceQueue">The queue to take messages from.</param>
+    /// <param name="targetQueue">The queue to put them on. It must exist.</param>
+    /// <param name="fromArchive">Take them from the source's archive (<c>pgmq.a_{source}</c>) instead.</param>
+    /// <param name="maxMessages">Move at most this many, oldest first; null moves them all.</param>
+    /// <param name="cancellationToken">Cancels the call.</param>
+    /// <returns>How many messages moved.</returns>
+    Task<long> ShovelAsync(string sourceQueue, string targetQueue, bool fromArchive = false, int? maxMessages = null,
+        CancellationToken cancellationToken = default);
+
     /// <summary>Deletes every message in a queue (<c>pgmq.purge_queue</c>).</summary>
     /// <returns>How many messages were deleted.</returns>
     Task<long> PurgeQueueAsync(string queueName, CancellationToken cancellationToken = default);
