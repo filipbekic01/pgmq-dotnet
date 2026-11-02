@@ -27,7 +27,7 @@ public sealed class OrderPlacedHandler(ActivityFeed feed) : IPgmqConsumer<OrderP
 }
 
 /// <summary>
-/// Charges an order through a fake, flaky gateway. Pgmq does not run a consumer twice by default: any exception
+/// Charges an order through a fake, flaky gateway. Pgmq never runs a consumer twice because it failed: any exception
 /// archives the message to <c>pgmq.a_example_payments</c> at once. So the consumer retries the one call that can
 /// fail for a passing reason, the gateway, itself, and only that call.
 /// </summary>

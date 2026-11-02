@@ -42,18 +42,23 @@ public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         {
             foreach (string group in new[] { "a", "b", "c" })
             {
-                // b3 fails once: the rest of b must wait for it, and still come in order.
-                await harness.Bus.PublishAsync(new FifoMessage(group, seq, FailOnce: group == "b" && seq == 3),
+                // b3 fails: it is archived, and the rest of b still comes after it, in order.
+                await harness.Bus.PublishAsync(new FifoMessage(group, seq, Fail: group == "b" && seq == 3),
                     new PgmqPublishOptions { GroupId = group }, Ct);
             }
         }
 
-        await Eventually.HoldsAsync(() => FifoConsumer.Done.Count == 15, Within, "every message handled");
+        await Eventually.HoldsAsync(() => FifoConsumer.Done.Count == 14, Within, "every other message handled");
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync(queue) == 1, Within, "b3 archived");
 
-        foreach (string group in new[] { "a", "b", "c" })
+        foreach (string group in new[] { "a", "c" })
         {
             Assert.Equal([1, 2, 3, 4, 5], FifoConsumer.Done.Where(d => d.Group == group).Select(d => d.Seq));
         }
+
+        Assert.Equal([1, 2, 4, 5], FifoConsumer.Done.Where(d => d.Group == "b").Select(d => d.Seq));
+        Assert.Equal([1, 2, 3, 4, 5],
+            _probe.Deliveries.Select(d => (FifoMessage)d.Message).Where(m => m.Group == "b").Select(m => m.Seq));
 
         Assert.Equal(0, FifoConsumer.Overlaps);
         Assert.True(FifoConsumer.MaxGroupsAtOnce > 1, "groups should run in parallel");
@@ -104,7 +109,7 @@ public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
                 configure?.Invoke(c);
             });
 
-    public sealed record FifoMessage(string Group, int Seq, bool FailOnce);
+    public sealed record FifoMessage(string Group, int Seq, bool Fail);
 
     public sealed class FifoConsumer(Probe probe) : IPgmqConsumer<FifoMessage>
     {
@@ -149,9 +154,9 @@ public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
             {
                 await Task.Delay(100, cancellationToken);
 
-                if (message.FailOnce && context.RedeliveryCount == 0)
+                if (message.Fail)
                 {
-                    throw new TimeoutException("transient");
+                    throw new InvalidOperationException("failed");
                 }
 
                 Done.Enqueue((message.Group, message.Seq));

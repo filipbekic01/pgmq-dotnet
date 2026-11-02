@@ -5,7 +5,7 @@ using Moq;
 namespace Pgmq.Hosting.Tests;
 
 /// <summary>
-/// What a consumer sends waits until it succeeds, so a retry does not send twice; and a flush goes through whatever
+/// What a consumer sends waits until it succeeds, so a failed consumer sends nothing; and a flush goes through whatever
 /// publisher it is handed, so the worker can run it in the transaction that deletes the message.
 /// </summary>
 public sealed class ConsumeContextTests
@@ -146,7 +146,7 @@ public sealed class ConsumeContextTests
 
     [Theory]
     [MemberData(nameof(Failures))]
-    public void Only_failures_that_say_nothing_about_the_message_Should_be_transient(Exception exception, bool transient)
+    public void Only_failures_that_can_pass_Should_retry_a_commit_in_place(Exception exception, bool transient)
         => Assert.Equal(transient, PgmqTransientFailures.IsTransient(exception));
 
     public static TheoryData<Exception, bool> Failures() => new()

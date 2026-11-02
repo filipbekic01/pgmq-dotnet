@@ -45,7 +45,7 @@ with long polling as the fallback.
    await publisher.PublishAsync(new OrderCreated(Guid.NewGuid()));
    ```
 
-## Retries: none by default
+## Retries: none
 
 **A consumer that throws is never run again.** Its message is archived to `pgmq.a_<queue>` at once, where you can
 inspect it, and the queue moves on.
@@ -56,20 +56,12 @@ effect that already happened. The calls that fail for a passing reason are infra
 database, a broker), so retry those inside the consumer, where you know what is safe to repeat, for example with
 [Polly](https://github.com/App-vNext/Polly) or `Microsoft.Extensions.Http.Resilience`.
 
-What the library still does for you, without running a consumer twice:
+There is no option to turn consumer retries on. What the library still does for you, without running a consumer
+twice:
 
 - A failed delete or archive of a finished message is retried in place.
-- What a consumer publishes through its context is sent only after it succeeds, and a failed send is retried in place.
-
-To retry whole messages anyway, for consumers you know are idempotent, opt in:
-
-```csharp
-builder.Services.AddPgmq(o =>
-{
-    o.IsTransient = PgmqTransientFailures.IsTransient; // database errors, timeouts, HTTP 408/429/5xx
-    o.MaxAttempts = 5;                                  // backoff 30 s, 2 m, 8 m, 30 m between them
-});
-```
+- What a consumer publishes through its context is sent only after it succeeds, in one transaction with the delete
+  of its message, and a failed commit is retried in place.
 
 Delivery is still at least once: a message whose process crashes mid-consumer, or whose consumer is cancelled by a
 shutdown, comes back and runs again. Only `[ConsumerOptions(AtMostOnce = true)]` rules that out, at the cost of losing

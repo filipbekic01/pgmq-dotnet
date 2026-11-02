@@ -1,7 +1,7 @@
 # Pgmq.Examples.WebApi
 
 A small Web API to play with Pgmq.NET: HTTP endpoints publish messages, background consumers in the same process
-handle them, and `GET /activity` shows what the consumers did. It runs on the library's defaults, retries included.
+handle them, and `GET /activity` shows what the consumers did. It runs on the library's defaults.
 A worker service without HTTP sets Pgmq up the same way, on `Host.CreateApplicationBuilder`.
 
 ## Run it
@@ -32,7 +32,7 @@ To start over with an empty database: `docker compose down -v`.
 | Try | Consumer | Feature |
 |---|---|---|
 | `POST /orders` | `OrderPlacedHandler` | Publish by type. The handler publishes a `PaymentRequested` and a topic notification through its context: an outbox that sends only if the handler succeeds. |
-| `POST /orders` with `"paymentFailures": 2` | `PaymentHandler` | The library's default retry policy: none. The handler retries its flaky gateway call itself, and the 3rd call succeeds. |
+| `POST /orders` with `"paymentFailures": 2` | `PaymentHandler` | The library never retries a consumer. The handler retries its flaky gateway call itself, and the 3rd call succeeds. |
 | `"paymentFailures": 5` | `PaymentHandler` | The gateway fails 3 times, the handler throws, and the message is archived. Pgmq does not run it again. |
 | `"total": 50000` | `PaymentHandler` | Any exception archives the message straight away. |
 | `POST /notifications` | `EmailNotifier`, `NotificationAudit` | Fan-out: every consumer of a type gets its own copy. Plus a custom header. |

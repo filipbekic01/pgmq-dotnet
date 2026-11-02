@@ -40,21 +40,6 @@ public sealed class RegistrationTests
         }));
     }
 
-    [Theory]
-    [MemberData(nameof(TransientFailures))]
-    public void By_default_not_even_a_transient_failure_Should_be_retried(Exception exception)
-    {
-        // Retries are opt-in: a consumer may not be idempotent, so a failure PgmqTransientFailures.IsTransient accepts
-        // still archives the message unless the app turns retries on.
-        using ServiceProvider services = Build(o => o.ConnectionString = Unreachable, _ => { });
-
-        Assert.True(PgmqTransientFailures.IsTransient(exception));
-        Assert.False(services.GetRequiredService<PgmqOptions>().IsTransient(exception));
-    }
-
-    public static TheoryData<Exception> TransientFailures()
-        => [.. ConsumeContextTests.Failures().Where(row => row.Data.Item2).Select(row => row.Data.Item1)];
-
     [Fact]
     public void A_class_that_consumes_nothing_Should_be_refused()
         => Assert.Throws<ArgumentException>(() => new ServiceCollection().AddPgmqConsumer<NotAConsumer>());

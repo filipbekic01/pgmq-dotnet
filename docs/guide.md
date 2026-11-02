@@ -11,19 +11,17 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   another one. A slot frees as soon as its message is settled.
 - **Leases.** A read message is hidden for `Lease` (30 s), renewed while its consumer runs. A long job keeps its
   message, and a crashed process gives it back within one lease.
-- **No retries by default.** A consumer that throws has its message archived to `pgmq.a_{queue}` at once, so a
-  consumer that is not idempotent never runs twice because it failed. Retry infrastructure calls inside the consumer
-  instead. To retry whole messages, opt in with `options.IsTransient = PgmqTransientFailures.IsTransient` (database
-  errors, timeouts, HTTP 408/429/5xx): a failure it accepts is retried after a backoff (30 s, 2 m, 8 m, 30 m), up to
-  `MaxAttempts`; any other failure, a timeout, or the last attempt archives the message. A message can still come back
-  without a failure: after a crash (its lease lapses) or a shutdown that cancels its consumer. A message read more than
+- **No consumer retries.** A consumer that throws, or runs past its timeout, has its message archived to
+  `pgmq.a_{queue}` at once, so a consumer that is not idempotent never runs twice because it failed. There is no
+  option to change this: retry infrastructure calls (an HTTP API, a database) inside the consumer, where you know what
+  is safe to repeat. A message can still come back without a failure: after a crash (its lease lapses) or a shutdown
+  that cancels its consumer. A message read more than
   `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is archived without running
   again. Keep `MaxAttempts` above 1, or a message released on shutdown is archived instead of run.
 - **Outbox.** What a consumer publishes through its context is sent only if it succeeds. When it does, everything it
   published and the delete of its message are one transaction: all of it goes out and the message is done, or none of
   it goes out and the message stays on the queue. A failed commit is retried in place, without running the consumer.
-  If it still fails, the consumer runs again only when retries are on and `IsTransient` accepts the failure, and since
-  nothing went out, nothing goes twice. Otherwise the message is archived. If the message is already gone from the
+  If it still fails, nothing went out and the message is archived. If the message is already gone from the
   queue when the consumer ends (another read finished it after its lease lapsed, or it was purged), its publishes
   are rolled back and its outcome is `gone`. Publishing through an injected `IPgmqPublisher` instead of the context
   skips all of this: it sends at once, on its own. Writes to your own database stay outside the transaction, so
@@ -210,10 +208,8 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `FailOnSetupError` | `true` | Off to start without Pgmq when the database lacks it; the health check reports it. |
 | `DefaultConcurrency` | `8` | Messages per queue at once, per instance. |
 | `DefaultTimeout` | 1 hour | Per message. |
-| `MaxAttempts` | `5` | |
-| `IsTransient` | `PgmqTransientFailures.Never` | Which failures run the consumer again. Set `PgmqTransientFailures.IsTransient` to turn retries on. |
+| `MaxAttempts` | `5` | Reads of a message that never finished (crash or shutdown) before it is archived without running. |
 | `Lease` / `RenewEvery` | 30 s / 10 s | |
-| `RetryBackoff` / `MaxRetryBackoff` | 30 s / 30 min | |
 | `DrainGrace` / `AbandonAfter` | 20 s / 30 s | |
 | `MinIdleDelay` / `MaxIdleDelay` | 200 ms / 5 s | Polling of an empty queue; `MaxIdleDelay` is also the safety re-read while waiting for a notification. |
 | `UseInsertNotifications` / `InsertNotificationThrottle` | `true` / 250 ms | Wake idle queues through LISTEN/NOTIFY. |
@@ -275,7 +271,7 @@ so a trace still continues into the consumer.
 | `pgmq.queue.messages.visible` | Gauge | `{message}` | queue; needs `QueueMetricsInterval` |
 | `pgmq.queue.oldest_message.age` | Gauge | `s` | queue; needs `QueueMetricsInterval` |
 
-`messaging.pgmq.outcome` is what happened to a handled message: `success`, `retry`, `archived`, `released` (shutdown;
+`messaging.pgmq.outcome` is what happened to a handled message: `success`, `archived`, `released` (shutdown;
 it goes back to the queue), `lost` (an at-most-once message that did not succeed) or `gone` (the consumer succeeded,
 but its message was no longer on the queue, so its publishes were rolled back). `error.type` says why: the
 exception's type, `timeout`, `pgmq.abandoned`, `pgmq.shutdown`, `pgmq.unknown_message_type` or

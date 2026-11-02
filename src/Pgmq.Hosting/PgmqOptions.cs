@@ -73,23 +73,12 @@ public sealed class PgmqOptions
     public TimeSpan DefaultTimeout { get; set; } = TimeSpan.FromHours(1);
 
     /// <summary>
-    /// Reads of one message before it is archived: a failure <see cref="IsTransient"/> accepts is given up on after
-    /// this many, and a message read more than this many times without ever finishing (its consumer keeps taking the
-    /// process down) is archived without running. Keep it above 1 even with retries off, so a message that went back
-    /// to the queue on shutdown still runs.
+    /// Reads of one message before it is archived without running. A consumer that throws is archived at once and never
+    /// run again, so a message is read more than once only when an earlier read never finished: the process crashed or
+    /// shut down while it ran. One read more than this many times (its consumer keeps taking the process down) is
+    /// archived without running. Keep it above 1, so a message that went back to the queue on shutdown still runs.
     /// </summary>
     public int MaxAttempts { get; set; } = 5;
-
-    /// <summary>
-    /// Which consumer failures run the consumer again, after <see cref="RetryBackoff"/>. Off by default: every failure
-    /// archives the message at once, because a consumer that is not idempotent must not run twice (a handler that
-    /// charged a card should not run again because a later line threw). Retry infrastructure calls inside the consumer
-    /// instead. To retry whole messages, opt in:
-    /// <code>
-    /// options.IsTransient = PgmqTransientFailures.IsTransient;
-    /// </code>
-    /// </summary>
-    public Func<Exception, bool> IsTransient { get; set; } = PgmqTransientFailures.Never;
 
     /// <summary>
     /// How long a read message stays hidden from other readers. It is renewed while the consumer runs, so this only
@@ -99,12 +88,6 @@ public sealed class PgmqOptions
 
     /// <summary>How often running messages' leases are renewed. A third of <see cref="Lease"/> survives one missed renewal.</summary>
     public TimeSpan RenewEvery { get; set; } = TimeSpan.FromSeconds(10);
-
-    /// <summary>The first retry delay after a transient failure; each further one is four times longer.</summary>
-    public TimeSpan RetryBackoff { get; set; } = TimeSpan.FromSeconds(30);
-
-    /// <summary>The longest retry delay.</summary>
-    public TimeSpan MaxRetryBackoff { get; set; } = TimeSpan.FromMinutes(30);
 
     /// <summary>How long a consumer that ignores its cancelled token is waited for before it is abandoned.</summary>
     public TimeSpan AbandonAfter { get; set; } = TimeSpan.FromSeconds(30);
@@ -201,7 +184,6 @@ public sealed class PgmqOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxAttempts, 1, nameof(MaxAttempts));
         ArgumentOutOfRangeException.ThrowIfLessThan(Lease, TimeSpan.FromSeconds(1), nameof(Lease));
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(RenewEvery, Lease, nameof(RenewEvery));
-        ArgumentNullException.ThrowIfNull(IsTransient, nameof(IsTransient));
         ArgumentOutOfRangeException.ThrowIfLessThan(InsertNotificationThrottle, TimeSpan.Zero,
             nameof(InsertNotificationThrottle));
 

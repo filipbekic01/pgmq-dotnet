@@ -3,7 +3,7 @@ using System.Diagnostics;
 namespace Pgmq.IntegrationTests;
 
 /// <summary>
-///     How the transport behaves against real PGMQ: fan-out, retries, leases, per-queue concurrency and
+///     How the transport behaves against real PGMQ: fan-out, failures, leases, per-queue concurrency and
 ///     independence, timeouts, the outbox, shutdown, delays, redelivery and tracing. Each test runs its own consumers
 ///     on its own queues. Needs a running Docker daemon.
 /// </summary>
@@ -28,41 +28,15 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
-    public async Task A_transient_failure_Should_be_retried_and_counted_until_it_succeeds()
+    public async Task A_failure_Should_be_archived_after_one_attempt_even_if_it_would_pass_next_time()
     {
         await using TransportHarness harness = await StartAsync(typeof(FlakyConsumer));
-
-        await harness.Bus.PublishAsync(new FlakyMessage(FailTimes: 2), Ct);
-
-        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 3, Within, "three attempts");
-        Assert.Equal([0, 1, 2], _probe.Deliveries.Select(d => d.RedeliveryCount));
-        await Eventually.HoldsAsync(async () => await db.CountAsync("t_flaky") == 0, Within, "deleted after success");
-        Assert.Equal(0, await db.ArchivedAsync("t_flaky"));
-    }
-
-    [Fact]
-    public async Task A_transient_failure_Should_be_archived_once_attempts_run_out()
-    {
-        await using TransportHarness harness = await StartAsync(typeof(FlakyConsumer));
-
-        await harness.Bus.PublishAsync(new FlakyMessage(FailTimes: 99), Ct);
-
-        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_flaky") == 1, Within, "archived");
-        Assert.Equal(TransportHarness.Fast.MaxAttempts, _probe.Deliveries.Count);
-    }
-
-    [Fact]
-    public async Task A_transient_failure_Should_be_archived_after_one_attempt_by_default()
-    {
-        // The harness turns retries on for the other tests; put back what a fresh PgmqOptions has.
-        await using TransportHarness harness =
-            await StartAsync(o => o.IsTransient = new PgmqOptions().IsTransient, typeof(FlakyConsumer));
 
         // It would succeed on its second run, so a single delivery means no retry, not a retry that also failed.
         await harness.Bus.PublishAsync(new FlakyMessage(FailTimes: 1), Ct);
 
         await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_flaky") == 1, Within, "archived");
-        await Task.Delay((TransportHarness.Fast.Lease + TransportHarness.Fast.RetryBackoff) * 2, Ct);
+        await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
         Assert.Equal(0, Assert.Single(_probe.Deliveries).RedeliveryCount);
         Assert.Equal(0, await db.CountAsync("t_flaky"));
     }

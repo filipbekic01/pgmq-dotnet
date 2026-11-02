@@ -18,10 +18,8 @@ namespace Pgmq.Hosting;
 /// </para>
 /// <para>
 /// <b>Outcome.</b> The consumer runs under its timeout. Success sends its outbox and deletes the message in one
-/// transaction, so what it published goes out exactly when the message is done. With
-/// retries turned on, a transient failure (<see cref="PgmqOptions.IsTransient"/>) makes it visible again after a backoff, up to
-/// <see cref="PgmqOptions.MaxAttempts"/> reads; any other failure, a timeout, or the last attempt archives it to
-/// <c>pgmq.a_{queue}</c>. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
+/// transaction, so what it published goes out exactly when the message is done. A failure or a timeout archives it to
+/// <c>pgmq.a_{queue}</c>; a consumer is never run again because it failed. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
 /// consumer keeps taking the process down) is archived without running. The outcome is decided first and written to the queue after, with its own retries, so a
 /// failed delete never runs a consumer again.
 /// </para>
@@ -459,10 +457,9 @@ internal sealed class ConsumerWorker(
         try
         {
             // Each try is a whole new transaction, so retrying it runs no consumer and sends nothing twice: a failed
-            // try rolled back everything it sent. It does not wait for retries to be turned on.
+            // try rolled back everything it sent.
             await RetryAsync(async ct => deleted = await CommitAsync(state, message, outbox, ct),
-                "commit the outbox of", state, message,
-                ex => PgmqTransientFailures.IsTransient(ex) || options.IsTransient(ex));
+                "commit the outbox of", state, message, PgmqTransientFailures.IsTransient);
         }
         catch (Exception ex)
         {
@@ -474,18 +471,10 @@ internal sealed class ConsumerWorker(
                 return Outcome.Lost(PgmqTelemetry.ErrorType(ex), ex);
             }
 
-            // Running it again is the only way to send them. That is worth it only when the failure can pass: a send
-            // that can never succeed would fail the same way on every run, so archive instead.
-            if (!options.IsTransient(ex) || message.ReadCt >= options.MaxAttempts)
-            {
-                logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; archiving the " +
-                                    "message", consumer.ConsumerType.Name, outbox.Count);
-                return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
-            }
-
-            logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; running it again",
-                consumer.ConsumerType.Name, outbox.Count);
-            return Outcome.Retry(Backoff(message.ReadCt), ex);
+            // Running it again is the only way to send them, and a consumer is never run again.
+            logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; archiving the " +
+                                "message", consumer.ConsumerType.Name, outbox.Count);
+            return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
         }
 
         if (consumer.AtMostOnce || deleted)
@@ -533,23 +522,10 @@ internal sealed class ConsumerWorker(
             return Outcome.Lost(PgmqTelemetry.ErrorType(ex), ex);
         }
 
-        if (!options.IsTransient(ex) || message.ReadCt >= options.MaxAttempts)
-        {
-            logger.LogError(ex, "{Consumer} failed {MessageType} (attempt {Attempt}); archiving the message",
-                consumer.ConsumerType.Name, messageType.Name, message.ReadCt);
-            return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
-        }
-
-        TimeSpan backoff = Backoff(message.ReadCt);
-        logger.LogWarning(ex, "{Consumer} failed {MessageType} (attempt {Attempt}); retrying in {Delay}",
-            consumer.ConsumerType.Name, messageType.Name, message.ReadCt, backoff);
-        return Outcome.Retry(backoff, ex);
+        logger.LogError(ex, "{Consumer} failed {MessageType} (attempt {Attempt}); archiving the message",
+            consumer.ConsumerType.Name, messageType.Name, message.ReadCt);
+        return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
     }
-
-    /// <summary>By default 30s, 2m, 8m, 30m.</summary>
-    private TimeSpan Backoff(int attempt)
-        => TimeSpan.FromTicks((long)Math.Min(options.RetryBackoff.Ticks * Math.Pow(4, Math.Max(0, attempt - 1)),
-            options.MaxRetryBackoff.Ticks));
 
     /// <summary>
     /// Sends the outbox and deletes the message in one transaction. An at-most-once message was deleted as it was read,
@@ -627,8 +603,6 @@ internal sealed class ConsumerWorker(
             {
                 SettlementKind.Delete => queues.DeleteMessageAsync(queue, message.MsgId, ct),
                 SettlementKind.Archive => queues.ArchiveMessageAsync(queue, message.MsgId, ct),
-                SettlementKind.Retry => queues.SetVisibilityTimeoutAsync(queue, message.MsgId,
-                    TimeSpan.FromSeconds(Math.Max(1, (int)Math.Ceiling(settlement.Delay.TotalSeconds))), ct),
                 SettlementKind.Release => queues.SetVisibilityTimeoutAsync(queue, message.MsgId, TimeSpan.Zero, ct),
                 _ => Task.CompletedTask,
             }, settlement.Kind.ToString().ToLowerInvariant(), state, message);
@@ -753,24 +727,21 @@ internal sealed class ConsumerWorker(
     {
         Delete,
         Archive,
-        Retry,
         Release,
     }
 
     /// <summary>What to write to the queue; nothing, when <c>Written</c> says the outbox's transaction already settled it.</summary>
-    private readonly record struct Settlement(SettlementKind Kind, TimeSpan Delay, bool Written = false)
+    private readonly record struct Settlement(SettlementKind Kind, bool Written = false)
     {
-        public static readonly Settlement Delete = new(SettlementKind.Delete, TimeSpan.Zero);
-        public static readonly Settlement Deleted = new(SettlementKind.Delete, TimeSpan.Zero, Written: true);
-        public static readonly Settlement Archive = new(SettlementKind.Archive, TimeSpan.Zero);
-        public static readonly Settlement Release = new(SettlementKind.Release, TimeSpan.Zero);
-
-        public static Settlement RetryAfter(TimeSpan delay) => new(SettlementKind.Retry, delay);
+        public static readonly Settlement Delete = new(SettlementKind.Delete);
+        public static readonly Settlement Deleted = new(SettlementKind.Delete, Written: true);
+        public static readonly Settlement Archive = new(SettlementKind.Archive);
+        public static readonly Settlement Release = new(SettlementKind.Release);
     }
 
     /// <summary>
     /// How handling a message ended: what to write to the queue, the <c>messaging.pgmq.outcome</c> it is reported
-    /// under (success, retry, archived, released, lost or gone), and, for a failure, its <c>error.type</c> and exception.
+    /// under (success, archived, released, lost or gone), and, for a failure, its <c>error.type</c> and exception.
     /// </summary>
     private readonly record struct Outcome(Settlement Settlement, string Name, string? ErrorType, Exception? Error)
     {
@@ -785,9 +756,6 @@ internal sealed class ConsumerWorker(
         /// </summary>
         public static readonly Outcome Gone = new(Settlement.Deleted, "gone", null, null);
         public static readonly Outcome Released = new(Settlement.Release, "released", null, null);
-
-        public static Outcome Retry(TimeSpan delay, Exception error)
-            => new(Settlement.RetryAfter(delay), "retry", PgmqTelemetry.ErrorType(error), error);
 
         public static Outcome Archived(string errorType, Exception? error = null)
             => new(Settlement.Archive, "archived", errorType, error);

@@ -198,11 +198,8 @@ public sealed class TransportHarness : IAsyncDisposable
         options.DefaultConcurrency = 4;
         options.DefaultTimeout = TimeSpan.FromSeconds(30);
         options.MaxAttempts = 3;
-        options.IsTransient = PgmqTransientFailures.IsTransient; // retries are off by default; the tests cover them
         options.Lease = TimeSpan.FromSeconds(2);
         options.RenewEvery = TimeSpan.FromMilliseconds(500);
-        options.RetryBackoff = TimeSpan.FromSeconds(1);
-        options.MaxRetryBackoff = TimeSpan.FromSeconds(1);
         options.AbandonAfter = TimeSpan.FromSeconds(1);
         options.DrainGrace = TimeSpan.FromMilliseconds(500);
         options.MinIdleDelay = TimeSpan.FromMilliseconds(50);

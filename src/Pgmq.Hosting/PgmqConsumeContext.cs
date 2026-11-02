@@ -33,7 +33,8 @@ public abstract class PgmqConsumeContext
     public Guid? MessageId { get; }
 
     /// <summary>
-    /// How many times this message came back before: once for every failed attempt, and once for every
+    /// How many times this message came back before: once for every read that never finished (a crash or a shutdown
+    /// while it ran), and once for every
     /// <see cref="PgmqConsumeContext{TMessage}.RedeliverAsync"/>. Zero on the first delivery.
     /// </summary>
     public int RedeliveryCount { get; }

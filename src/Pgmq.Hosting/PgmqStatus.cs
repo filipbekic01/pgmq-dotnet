@@ -39,21 +39,14 @@ public sealed class PgmqStatus
 }
 
 /// <summary>
-/// Classifiers for <see cref="PgmqOptions.IsTransient"/>: <see cref="Never"/>, the default, and
-/// <see cref="IsTransient"/>, the failures that say nothing about the message itself.
+/// The failures the worker retries its own queue writes on (the outbox commit), in place: they run no consumer.
+/// Consumers themselves are never run again.
 /// </summary>
-public static class PgmqTransientFailures
+internal static class PgmqTransientFailures
 {
-    /// <summary>False for every failure: no consumer runs twice. The default.</summary>
-    public static bool Never(Exception exception) => false;
-
     /// <summary>
     /// True for a transient database error, a timeout, a broken HTTP connection, or an HTTP 408, 429, 5xx or 520
-    /// response, found anywhere in the exception or its inner exceptions. Opt in to retries with it, and extend it
-    /// rather than replace it. The worker also uses it to retry an outbox commit in place, which runs no consumer.
-    /// <code>
-    /// options.IsTransient = ex => PgmqTransientFailures.IsTransient(ex) || ex is LockTimeoutException;
-    /// </code>
+    /// response, found anywhere in the exception or its inner exceptions.
     /// </summary>
     public static bool IsTransient(Exception exception)
     {
