@@ -1,5 +1,8 @@
 # Pgmq.NET
 
+> Pgmq.NET follows the official [pgmq/pgmq](https://github.com/pgmq/pgmq) one to one: every queue feature is pgmq's
+> own, with nothing added to or changed in its SQL. This library adds background workers on top of it, and that is all.
+
 Publish/subscribe messaging for .NET, stored in PostgreSQL through the [PGMQ](https://github.com/pgmq/pgmq) extension.
 No separate broker: your database is the queue.
 
@@ -73,25 +76,6 @@ builder.Services.AddPgmq(o =>
 Delivery is still at least once: a message whose process crashes mid-consumer, or whose consumer is cancelled by a
 shutdown, comes back and runs again. Only `[ConsumerOptions(AtMostOnce = true)]` rules that out, at the cost of losing
 the message instead.
-
-## Where it lives
-
-| | Default | Override |
-|---|---|---|
-| Database | The one in the connection string. Without `Database=` there, Npgsql uses the user name, so `postgres` in the example above. | `o.Database = "transport"`, or name it in `o.ConnectionString`. |
-| Schema | `pgmq`: the queue registry `pgmq.meta`, every function, and one table pair per queue (`pgmq.q_<queue>` and `pgmq.a_<queue>`). The SQL install also adds `pgmq.__pgmq_migrations`. | Not possible: pgmq pins its schema. The extension cannot be relocated, and its SQL refers to `pgmq.` throughout. To keep pgmq apart from your own tables, give it its own database. |
-
-`o.Database` lets an application pass its own connection string and still keep pgmq in a separate database:
-
-```csharp
-builder.Services.AddPgmq(o =>
-{
-    o.ConnectionString = builder.Configuration.GetConnectionString("App"); // server and credentials
-    o.Database = "transport";                                             // pgmq's own database
-});
-```
-
-With `o.DataSource` instead, the data source decides the database, and `o.Database` is refused.
 
 ## Setup on start
 
