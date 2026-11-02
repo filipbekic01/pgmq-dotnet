@@ -135,7 +135,7 @@ public sealed class MigrationTests(MigrationServers servers) : IClassFixture<Mig
         Assert.Equal(PgmqInstallation.Sql, result.Installation);
         Assert.Equal("1.12.0", result.PreviousVersion);
         Assert.Equal("1.13.1", result.Version);
-        Assert.Equal(["pgmq--1.12.0--1.13.0.sql", "pgmq--1.13.0--1.13.1.sql", "pgmq_dotnet/0001_shovel.sql"],
+        Assert.Equal(["pgmq--1.12.0--1.13.0.sql", "pgmq--1.13.0--1.13.1.sql", "shovel.sql"],
             result.AppliedScripts);
 
         Assert.Equal(1L, await ScalarAsync<long>(connectionString, "select count(*) from pgmq.q_kept"));

@@ -176,7 +176,7 @@ with the type's full name, or its `[MessageName]`. Without that header the worke
 
 ### Shovel
 
-`pgmq_dotnet.shovel` is Pgmq.NET's own routine, not pgmq's: it moves messages from a queue, or from its archive, onto
+`pgmq.shovel` is Pgmq.NET's one addition to pgmq, created by the migrator: it moves messages from a queue, or from its archive, onto
 another queue in one statement. Each message keeps its body and headers and arrives as a new message, visible at
 once, read zero times. From a queue only visible messages move, so a message being handled or still delayed stays
 where it is. The target must exist; either every selected message moves or none does.
@@ -187,7 +187,7 @@ await queues.ShovelAsync("orders", "orders", fromArchive: true);        // repla
 await queues.ShovelAsync("orders", "orders", fromArchive: true, maxMessages: 100); // oldest 100 only
 ```
 
-It is plain SQL too: `select pgmq_dotnet.shovel('orders', 'orders', from_archive => true)`. Moving a whole large queue
+It is plain SQL too: `select pgmq.shovel('orders', 'orders', from_archive => true)`. Moving a whole large queue
 holds its messages in one transaction; pass `maxMessages` and call it in a loop for big ones.
 
 ## Database setup
@@ -204,9 +204,8 @@ everything current changes nothing:
    - Not installed: `create extension pgmq` where the server has it, otherwise the embedded `pgmq.sql`
      (`InstallMode` narrows this).
    - A `pgmq` schema with no version record is refused rather than guessed at.
-3. **Pgmq.NET's own routines.** In the same transaction, after pgmq: the migrations embedded in the package that are
-   not yet recorded in `pgmq_dotnet.__migrations`, such as `pgmq_dotnet.shovel`. They live in their own `pgmq_dotnet`
-   schema, so pgmq's schema is never changed.
+3. **Shovel.** In the same transaction, after pgmq: `create or replace function pgmq.shovel`, Pgmq.NET's one addition
+   to pgmq.
 4. **Queues.** Each consumer's queue, FIFO index, topic bindings and insert notification trigger.
 
 The SQL install follows what upstream calls a versioned SQL-only install. It uses the same table and lock key as the

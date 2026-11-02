@@ -49,7 +49,7 @@ public interface IPgmqQueueManager
 
     /// <summary>
     /// Moves messages from <paramref name="sourceQueue"/>, or from its archive, onto <paramref name="targetQueue"/>
-    /// in one statement (<c>pgmq_dotnet.shovel</c>, Pgmq.NET's own routine, installed by the migrator). Each keeps its
+    /// in one statement (<c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq, created by the migrator). Each keeps its
     /// body and headers and arrives as a new message, visible at once, read zero times. From a queue only visible
     /// messages move: one being handled or delayed stays. Either every selected message moves or none does.
     /// <code>

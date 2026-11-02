@@ -95,7 +95,7 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
                 "Move at least one message, or pass null to move them all.");
         }
 
-        return await ScalarAsync<long>($"select {PgmqMigrator.OWN_SCHEMA}.shovel($1, $2, $3, $4)",
+        return await ScalarAsync<long>("select pgmq.shovel($1, $2, $3, $4)",
             [
                 Text(sourceQueue), Text(targetQueue),
                 new NpgsqlParameter { Value = fromArchive, NpgsqlDbType = NpgsqlDbType.Boolean },

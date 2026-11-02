@@ -17,9 +17,9 @@
         <None Include="Sql\LICENSE" Pack="true" PackagePath="licenses\pgmq" />
     </ItemGroup>
 
-    <!-- Pgmq.NET's own routines (the shovel), installed into the pgmq_dotnet schema after pgmq, never into pgmq's. -->
+    <!-- Pgmq.NET's one addition to pgmq: pgmq.shovel, created by the migrator after pgmq. -->
     <ItemGroup>
-        <EmbeddedResource Include="Migrations\*.sql" LogicalName="Pgmq.Migrations.%(Filename)%(Extension)" />
+        <EmbeddedResource Include="shovel.sql" LogicalName="Pgmq.shovel.sql" />
     </ItemGroup>
 
     <ItemGroup>

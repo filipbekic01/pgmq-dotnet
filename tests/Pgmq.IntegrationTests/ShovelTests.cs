@@ -3,7 +3,7 @@ using Npgsql;
 namespace Pgmq.IntegrationTests;
 
 /// <summary>
-///     <c>pgmq_dotnet.shovel</c>, Pgmq.NET's own routine, through <see cref="IPgmqQueueManager.ShovelAsync"/>: moving
+///     <c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq, through <see cref="IPgmqQueueManager.ShovelAsync"/>: moving
 ///     messages from a queue or its archive onto another queue. Needs a running Docker daemon.
 /// </summary>
 public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IAsyncLifetime
@@ -21,16 +21,14 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
     [Fact]
-    public async Task The_migrator_Should_install_the_shovel_in_its_own_schema_once()
+    public async Task The_migrator_Should_create_the_shovel_in_pgmq_and_report_it_only_once()
     {
         await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
         PgmqMigrationResult again = await new PgmqMigrator(dataSource).MigrateAsync(cancellationToken: Ct);
 
         Assert.False(again.Changed);
-        Assert.Equal("0001_shovel.sql", await db.ScalarObjectAsync("select string_agg(name, ',') from pgmq_dotnet.__migrations"));
-        Assert.Equal(0L, await db.ScalarObjectAsync(
-            "select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace " +
-            "where n.nspname = 'pgmq' and p.proname = 'shovel'"));
+        Assert.Equal(true, await db.ScalarObjectAsync(
+            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer)') is not null"));
     }
 
     [Fact]

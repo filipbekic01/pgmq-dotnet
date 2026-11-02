@@ -1,4 +1,4 @@
--- Pgmq.NET's own routines live in the pgmq_dotnet schema, never in pgmq's, so pgmq stays exactly as upstream ships it.
+-- Pgmq.NET's one addition to pgmq, run by the migrator after pgmq is installed or upgraded. Idempotent.
 
 -- shovel: moves messages from a queue, or from its archive, into another queue, in one statement.
 --   source_queue  the queue to take messages from
@@ -9,7 +9,7 @@
 -- a new msg_id and a read count of zero. From a queue only visible messages move: one being handled (its lease not yet
 -- lapsed) or delayed stays where it is, and rows another transaction holds are skipped. Everything happens in the
 -- caller's transaction, so the messages either all move or none do. Returns how many moved.
-CREATE FUNCTION pgmq_dotnet.shovel(
+CREATE OR REPLACE FUNCTION pgmq.shovel(
     source_queue TEXT,
     target_queue TEXT,
     from_archive BOOLEAN DEFAULT false,
