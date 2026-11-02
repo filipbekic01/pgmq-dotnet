@@ -54,14 +54,16 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     [Fact]
     public async Task A_transient_failure_Should_be_archived_after_one_attempt_by_default()
     {
+        // The harness turns retries on for the other tests; put back what a fresh PgmqOptions has.
         await using TransportHarness harness =
             await StartAsync(o => o.IsTransient = new PgmqOptions().IsTransient, typeof(FlakyConsumer));
 
+        // It would succeed on its second run, so a single delivery means no retry, not a retry that also failed.
         await harness.Bus.PublishAsync(new FlakyMessage(FailTimes: 1), Ct);
 
         await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_flaky") == 1, Within, "archived");
-        await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
-        Assert.Single(_probe.Deliveries);
+        await Task.Delay((TransportHarness.Fast.Lease + TransportHarness.Fast.RetryBackoff) * 2, Ct);
+        Assert.Equal(0, Assert.Single(_probe.Deliveries).RedeliveryCount);
         Assert.Equal(0, await db.CountAsync("t_flaky"));
     }
 
