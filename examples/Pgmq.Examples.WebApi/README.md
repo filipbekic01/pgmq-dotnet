@@ -12,8 +12,8 @@ docker compose up -d --wait
 dotnet run
 ```
 
-Postgres with pgmq runs on port **5433**, so it stays clear of any Postgres you already have on 5432. On start, Pgmq
-creates the `pgmq_example` database, installs pgmq and creates one queue per consumer. The API listens on
+Postgres with pgmq runs on port **5432**. If you already run Postgres with pgmq there, skip `docker compose up`: the
+app uses it as is. On start, Pgmq creates the `example-transport` database, installs pgmq and creates one queue per consumer. The API listens on
 <http://localhost:5080>.
 
 Then open [`Pgmq.Examples.WebApi.http`](Pgmq.Examples.WebApi.http) in Rider, Visual Studio or VS Code (REST Client)
@@ -45,8 +45,15 @@ To start over with an empty database: `docker compose down -v`.
 Archived messages stay in Postgres, one archive table per queue:
 
 ```bash
-docker compose exec postgres psql -U postgres -d pgmq_example -c "select msg_id, read_ct, message from pgmq.a_example_payments"
+docker compose exec postgres psql -U postgres -d example-transport -c "select msg_id, read_ct, message from pgmq.a_example_payments"
 ```
+
+## Telemetry
+
+With `Telemetry:Console` on (the default in `appsettings.json`), the app prints OpenTelemetry spans and metrics to the
+console, so you can check them without a collector. One `POST /orders` makes a single trace: the HTTP request, the
+`send`, the `process` of each consumer, the sends made from inside a consumer, and each `delete`. Metrics print every
+30 seconds. Set `Telemetry:Console` to `false` to keep the console quiet.
 
 ## Where to look
 

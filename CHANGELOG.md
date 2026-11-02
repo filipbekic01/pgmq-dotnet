@@ -8,6 +8,8 @@ All notable changes to this project are recorded here. The format follows
 ### Added
 
 - `examples/Pgmq.Examples.WebApi`: a Web API to try every feature from HTTP requests, with its own Postgres in Docker.
+  Its traces, metrics and logs print to the console, and go to an OTLP collector when `OTEL_EXPORTER_OTLP_ENDPOINT`
+  is set (launch profile `otlp`).
 
 ### Fixed
 

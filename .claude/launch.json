@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "example-webapi",
+      "runtimeExecutable": "dotnet",
+      "runtimeArgs": ["run", "--project", "examples/Pgmq.Examples.WebApi", "--launch-profile", "otlp"],
+      "port": 5080
+    }
+  ]
+}

@@ -1,3 +1,7 @@
+using OpenTelemetry;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using Pgmq;
 using Pgmq.Examples.WebApi;
 
@@ -17,15 +21,62 @@ builder.Services.AddSingleton<ActivityFeed>();
 builder.Services.AddPgmq(options =>
 {
     options.ConnectionString = builder.Configuration.GetConnectionString("Pgmq");
-    options.Database = "pgmq_example"; // its own database, created on start
+    options.Database = "example-transport"; // its own database, created on start
 
     // Faster than the defaults, so retries are easy to watch.
     options.MaxAttempts = 4;
     options.RetryBackoff = TimeSpan.FromSeconds(2);
     options.MaxRetryBackoff = TimeSpan.FromSeconds(10);
+
+    // Queue depth gauges (pgmq.queue.messages and friends), off unless set.
+    options.QueueMetricsInterval = TimeSpan.FromSeconds(30);
 });
 builder.Services.AddPgmqConsumers(typeof(Program).Assembly); // every IPgmqConsumer<T> in this project
 builder.Services.AddHealthChecks().AddPgmq();
+
+// Pgmq only emits telemetry; the app decides where it goes. Two outputs, each turned on by configuration:
+// - Telemetry:Console = true prints Pgmq's spans and metrics to the console, so you can see them without a collector.
+// - OTEL_EXPORTER_OTLP_ENDPOINT (plus the other standard OTEL_* variables) sends traces, metrics and logs to an
+//   OpenTelemetry collector, for example grafana/otel-lgtm:
+//
+//     docker run -d -p 3000:3000 -p 4318:4318 grafana/otel-lgtm
+//     dotnet run --project examples/Pgmq.Examples.WebApi --launch-profile otlp
+bool console = builder.Configuration.GetValue("Telemetry:Console", false);
+bool otlp = !string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]);
+if (console || otlp)
+{
+    IOpenTelemetryBuilder telemetry = builder.Services.AddOpenTelemetry()
+        .ConfigureResource(r => r.AddService("pgmq-example-webapi"))
+        // The HTTP request span is the root, so a trace runs request -> send -> process -> the consumer's own sends.
+        .WithTracing(t =>
+        {
+            t.AddAspNetCoreInstrumentation().AddSource(PgmqTelemetry.SourceName);
+            if (console)
+            {
+                t.AddConsoleExporter();
+            }
+        })
+        .WithMetrics(m =>
+        {
+            m.AddMeter(PgmqTelemetry.MeterName);
+            if (console)
+            {
+                m.AddConsoleExporter((_, reader) =>
+                    reader.PeriodicExportingMetricReaderOptions.ExportIntervalMilliseconds = 30_000);
+            }
+        });
+
+    if (otlp)
+    {
+        // Logs too: while a message is handled, the log scope carries Queue, MessageType, MessageId and Attempt, so
+        // each line can be found by the message-id header of an archived message.
+        telemetry.WithLogging(_ => { }, o =>
+        {
+            o.IncludeScopes = true;
+            o.IncludeFormattedMessage = true; // the rendered text, not the template, as the log body
+        }).UseOtlpExporter();
+    }
+}
 
 WebApplication app = builder.Build();
 
@@ -46,7 +97,24 @@ app.MapGet("/", () => Results.Text("""
 // Type-based publish: every consumer of OrderPlaced gets its own copy.
 app.MapPost("/orders", async (PlaceOrder request, IPgmqPublisher publisher, CancellationToken ct) =>
 {
-    OrderPlaced order = new(Guid.CreateVersion7(), request.Customer, request.Total, request.PaymentFailures);
+    // Check before publishing: a bad order caught here is a 400, not an archived message later.
+    Dictionary<string, string[]> errors = [];
+    if (string.IsNullOrWhiteSpace(request.Customer))
+    {
+        errors["customer"] = ["A customer is required."];
+    }
+
+    if (request.Total <= 0)
+    {
+        errors["total"] = ["The total must be more than 0."];
+    }
+
+    if (errors.Count > 0)
+    {
+        return Results.ValidationProblem(errors);
+    }
+
+    OrderPlaced order = new(Guid.CreateVersion7(), request.Customer!.Trim(), request.Total, request.PaymentFailures);
     await publisher.PublishAsync(order, ct);
     return Results.Accepted(value: order);
 });
@@ -119,7 +187,7 @@ app.MapHealthChecks("/health");
 
 app.Run();
 
-public sealed record PlaceOrder(string Customer, decimal Total, int PaymentFailures = 0);
+public sealed record PlaceOrder(string? Customer, decimal Total, int PaymentFailures = 0);
 
 public sealed record SendNotification(string Text);
 
