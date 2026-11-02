@@ -17,6 +17,11 @@
         <None Include="Sql\LICENSE" Pack="true" PackagePath="licenses\pgmq" />
     </ItemGroup>
 
+    <!-- Pgmq.NET's one addition to pgmq: pgmq.shovel, created by the migrator after pgmq. -->
+    <ItemGroup>
+        <EmbeddedResource Include="shovel.sql" LogicalName="Pgmq.shovel.sql" />
+    </ItemGroup>
+
     <ItemGroup>
         <InternalsVisibleTo Include="Pgmq.Hosting" />
         <InternalsVisibleTo Include="Pgmq.Tests" />

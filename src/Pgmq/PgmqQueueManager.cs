@@ -84,6 +84,47 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         => await ScalarAsync<bool>("select pgmq.drop_queue($1)", [Text(queueName)], cancellationToken);
 
     /// <inheritdoc />
+    public async Task<long> ShovelAsync(string sourceQueue, string targetQueue, bool fromArchive = false,
+        int? maxMessages = 1000, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourceQueue);
+        ArgumentException.ThrowIfNullOrEmpty(targetQueue);
+        if (maxMessages is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxMessages), maxMessages,
+                "Move at least one message, or pass null to move them all.");
+        }
+
+        return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, maxMessages, null, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<long> ShovelAsync(string sourceQueue, string targetQueue, IReadOnlyCollection<long> messageIds,
+        bool fromArchive = false, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sourceQueue);
+        ArgumentException.ThrowIfNullOrEmpty(targetQueue);
+        ArgumentNullException.ThrowIfNull(messageIds);
+
+        return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, null, messageIds, cancellationToken);
+    }
+
+    private Task<long> ShovelCoreAsync(string sourceQueue, string targetQueue, bool fromArchive, int? maxMessages,
+        IReadOnlyCollection<long>? messageIds, CancellationToken cancellationToken)
+        => ScalarAsync<long>("select pgmq.shovel($1, $2, $3, $4, $5)",
+            [
+                Text(sourceQueue), Text(targetQueue),
+                new NpgsqlParameter { Value = fromArchive, NpgsqlDbType = NpgsqlDbType.Boolean },
+                new NpgsqlParameter
+                {
+                    Value = maxMessages is { } max ? max : DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer,
+                },
+                messageIds is null
+                    ? new NpgsqlParameter { Value = DBNull.Value, NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Bigint }
+                    : Longs(messageIds),
+            ], cancellationToken);
+
+    /// <inheritdoc />
     public async Task<long> PurgeQueueAsync(string queueName, CancellationToken cancellationToken = default)
         => await ScalarAsync<long>("select pgmq.purge_queue($1)", [Text(queueName)], cancellationToken);
 

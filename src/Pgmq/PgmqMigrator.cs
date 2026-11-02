@@ -41,7 +41,8 @@ public enum PgmqInstallation
 /// <param name="Version">The version now.</param>
 /// <param name="AppliedScripts">
 /// What ran: <c>pgmq.sql</c> and upgrade scripts for the SQL install, <c>create extension</c> or
-/// <c>alter extension</c> for the extension. Empty when pgmq was already current.
+/// <c>alter extension</c> for the extension, then <c>shovel.sql</c> the first time it creates <c>pgmq.shovel</c>.
+/// Empty when everything was already current.
 /// </param>
 public sealed record PgmqMigrationResult(
     PgmqInstallation Installation,
@@ -62,6 +63,9 @@ public sealed record PgmqMigrationResult(
 /// package (<see cref="EmbeddedVersion"/>), recording each in <c>pgmq.__pgmq_migrations</c>, and later runs apply the
 /// upgrade scripts from the recorded version on.
 /// </para>
+/// <para>
+/// After pgmq, in the same transaction, it creates or replaces <c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq.
+/// </para>
 /// </summary>
 /// <param name="dataSource">The database pgmq lives in.</param>
 public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
@@ -72,6 +76,10 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
     internal const string INIT_SCRIPT = "pgmq.sql";
 
     private const string RESOURCE_PREFIX = "Pgmq.Sql.";
+    private const string OWN_RESOURCE_PREFIX = "Pgmq.";
+
+    /// <summary>Pgmq.NET's one addition to pgmq: <c>pgmq.shovel</c>.</summary>
+    internal const string SHOVEL_SCRIPT = "shovel.sql";
     private const string INVALID_CATALOG_NAME = "3D000";
     private const string DUPLICATE_DATABASE = "42P04";
     private const string UNIQUE_VIOLATION = "23505";
@@ -175,8 +183,29 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
             _ => await MigrateSqlAsync(connection, transaction, state, mode, cancellationToken),
         };
 
+        if (await EnsureShovelAsync(connection, transaction, cancellationToken))
+        {
+            result = result with { AppliedScripts = [.. result.AppliedScripts, SHOVEL_SCRIPT] };
+        }
+
         await transaction.CommitAsync(cancellationToken);
         return result;
+    }
+
+    /// <summary>
+    /// Creates or replaces <c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq, under the migration lock and after pgmq,
+    /// which it builds on. It runs on every migration, so an upgraded package brings its new version.
+    /// </summary>
+    /// <returns>True when the shovel did not exist before.</returns>
+    private static async Task<bool> EnsureShovelAsync(NpgsqlConnection connection, NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using NpgsqlCommand exists = new(
+            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[])') is not null", connection, transaction);
+        bool existed = (bool)(await exists.ExecuteScalarAsync(cancellationToken))!;
+
+        await ExecuteAsync(connection, transaction, ReadResource(OWN_RESOURCE_PREFIX, SHOVEL_SCRIPT), cancellationToken);
+        return !existed;
     }
 
     private static async Task<PgmqMigrationResult> CreateExtensionAsync(NpgsqlConnection connection,
@@ -304,11 +333,13 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
             .Select(n => UpgradeScript.Parse(n[RESOURCE_PREFIX.Length..]))
             .OrderBy(u => u.From)];
 
-    internal static string ReadResource(string name)
+    internal static string ReadResource(string name) => ReadResource(RESOURCE_PREFIX, name);
+
+    private static string ReadResource(string prefix, string name)
     {
         Assembly assembly = typeof(PgmqMigrator).Assembly;
-        using Stream stream = assembly.GetManifestResourceStream(RESOURCE_PREFIX + name)
-            ?? throw new InvalidOperationException($"The embedded pgmq script {name} is missing.");
+        using Stream stream = assembly.GetManifestResourceStream(prefix + name)
+            ?? throw new InvalidOperationException($"The embedded script {name} is missing.");
         using StreamReader reader = new(stream);
         return reader.ReadToEnd();
     }
