@@ -5,14 +5,7 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
-### Removed
-
-- **Breaking:** consumer retries. `PgmqOptions.IsTransient`, `PgmqOptions.RetryBackoff`,
-  `PgmqOptions.MaxRetryBackoff` and the public `PgmqTransientFailures` class are gone, along with the `retry`
-  outcome. A consumer that throws or times out is archived at once and never run again; retry infrastructure calls
-  inside the consumer instead. `MaxAttempts` stays, as the guard against a message whose consumer keeps taking the
-  process down. The library still retries its own queue writes (delete, archive, outbox commit) in place, which never
-  runs a consumer.
+## [2.0.0] - 2026-11-02
 
 ### Changed
 
@@ -27,6 +20,15 @@ All notable changes to this project are recorded here. The format follows
 - A consumer whose message is no longer on the queue when it finishes (another read finished it after its lease
   lapsed, or the queue was purged) has its publishes rolled back, with the new outcome `gone`.
 - An at-most-once consumer whose publishes cannot be sent reports `lost` instead of `archived`.
+
+### Removed
+
+- **Breaking:** consumer retries. `PgmqOptions.IsTransient`, `PgmqOptions.RetryBackoff`,
+  `PgmqOptions.MaxRetryBackoff` and the public `PgmqTransientFailures` class are gone, along with the `retry`
+  outcome. A consumer that throws or times out is archived at once and never run again; retry infrastructure calls
+  inside the consumer instead. `MaxAttempts` stays, as the guard against a message whose consumer keeps taking the
+  process down. The library still retries its own queue writes (delete, archive, outbox commit) in place, which never
+  runs a consumer.
 
 ## [1.0.0] - 2026-11-02
 
