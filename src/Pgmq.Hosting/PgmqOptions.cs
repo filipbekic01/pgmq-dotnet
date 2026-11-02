@@ -66,8 +66,16 @@ public sealed class PgmqOptions
     /// </summary>
     public bool FailOnSetupError { get; set; } = true;
 
-    /// <summary>Messages one queue handles at once, per instance, unless its consumer says otherwise.</summary>
-    public int DefaultConcurrency { get; set; } = 8;
+    /// <summary>
+    /// Messages one queue handles at once, per instance, unless its consumer sets
+    /// <see cref="ConsumerOptionsAttribute.Concurrency"/>. One by default: a handler never runs alongside itself unless
+    /// it asks to, and load stays one message per queue however many queues there are. Change it for every queue at
+    /// setup, for example to one per processor:
+    /// <code>
+    /// builder.Services.AddPgmq(o => o.DefaultConcurrency = Environment.ProcessorCount);
+    /// </code>
+    /// </summary>
+    public int DefaultConcurrency { get; set; } = 1;
 
     /// <summary>How long one message may run, unless its consumer says otherwise.</summary>
     public TimeSpan DefaultTimeout { get; set; } = TimeSpan.FromHours(1);

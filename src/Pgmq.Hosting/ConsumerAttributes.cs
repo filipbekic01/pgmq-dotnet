@@ -17,16 +17,17 @@ public sealed class QueueNameAttribute(string name) : Attribute
 /// How one consumer's queue runs. Unset values take the defaults in <see cref="PgmqOptions"/>; values passed to
 /// <c>AddPgmqConsumer</c> win over these.
 /// <code>
-/// [ConsumerOptions(Concurrency = 1, TimeoutSeconds = 600)]
-/// public sealed class RebuildFeedHandler : IPgmqConsumer&lt;RebuildFeed&gt; { ... }
+/// [ConsumerOptions(Concurrency = 16, TimeoutSeconds = 600)]
+/// public sealed class OrderHandler : IPgmqConsumer&lt;OrderPlaced&gt; { ... }
 /// </code>
 /// </summary>
 [AttributeUsage(AttributeTargets.Class, Inherited = false)]
 public sealed class ConsumerOptionsAttribute : Attribute
 {
     /// <summary>
-    /// How many messages of this queue one instance handles at once. Each instance applies it on its own, so a
-    /// deployment runs up to this times its number of instances.
+    /// How many messages of this queue one instance handles at once; <see cref="PgmqOptions.DefaultConcurrency"/> (1)
+    /// when unset. Each instance applies it on its own, so a deployment runs up to this times its number of
+    /// instances.
     /// </summary>
     public int Concurrency { get; init; }
 

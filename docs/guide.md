@@ -95,7 +95,8 @@ Npgsql and nothing else in between.
 ### FIFO groups
 
 Messages of one group are handled one at a time, in the order they were published. Different groups run in
-parallel, up to the consumer's concurrency. When a message fails and is retried, the rest of its group waits for it.
+parallel, up to the consumer's concurrency, so a grouped consumer needs a concurrency above one to run groups side
+by side. When a message fails it is archived, and its group moves on to the next one.
 
 ```csharp
 [ConsumerOptions(ReadMode = PgmqReadMode.Grouped, Concurrency = 8)]
@@ -206,7 +207,7 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `InstallMode` | `Auto` | `Auto`: the extension where available, the embedded SQL otherwise. `Extension` or `Sql` for one only. |
 | `RunConsumers` | `true` | Off for a host that only publishes. |
 | `FailOnSetupError` | `true` | Off to start without Pgmq when the database lacks it; the health check reports it. |
-| `DefaultConcurrency` | `8` | Messages per queue at once, per instance. |
+| `DefaultConcurrency` | `1` | Messages per queue at once, per instance. A consumer overrides it with `[ConsumerOptions(Concurrency = n)]`. |
 | `DefaultTimeout` | 1 hour | Per message. |
 | `MaxAttempts` | `5` | Reads of a message that never finished (crash or shutdown) before it is archived without running. |
 | `Lease` / `RenewEvery` | 30 s / 10 s | |
@@ -220,6 +221,16 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 A consumer's queue, concurrency, timeout, read mode, queue type, filter and at-most-once setting come from
 `AddPgmqConsumer<T>(c => ...)`, then `[QueueName]`, `[ConsumerOptions]` and `[TopicBinding]`, then these defaults. Pin queue names with `[QueueName]` and message names with `[MessageName]`
 before renaming or moving a class: the names live in the database.
+
+Concurrency is one message at a time per queue unless you say otherwise. Change it for every queue at setup, and
+raise it on the busy queues whose handler is safe to run in parallel:
+
+```csharp
+builder.Services.AddPgmq(o => o.DefaultConcurrency = Environment.ProcessorCount); // every queue
+
+[ConsumerOptions(Concurrency = 32)]                                            // one consumer
+public sealed class OrderHandler : IPgmqConsumer<OrderPlaced> { ... }
+```
 
 Add `services.AddHealthChecks().AddPgmq()` for the health check.
 

@@ -106,6 +106,16 @@ public sealed class RegistrationTests
     }
 
     [Fact]
+    public void By_default_a_queue_Should_handle_one_message_at_a_time()
+    {
+        using ServiceProvider services = Build(o => o.ConnectionString = Unreachable,
+            s => s.AddPgmqConsumer<PlainConsumer>());
+
+        Assert.Equal(1, services.GetRequiredService<PgmqOptions>().DefaultConcurrency);
+        Assert.Equal(1, Assert.Single(services.GetRequiredService<ConsumerRegistry>().Consumers).Concurrency);
+    }
+
+    [Fact]
     public void Queue_type_read_mode_bindings_and_notifications_Should_come_from_attributes_then_registration()
     {
         using ServiceProvider services = Build(o =>

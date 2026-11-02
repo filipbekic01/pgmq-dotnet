@@ -16,6 +16,10 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **Breaking:** `PgmqOptions.DefaultConcurrency` defaults to 1, down from 8. A queue handles one message at a time
+  per instance unless its consumer sets `[ConsumerOptions(Concurrency = n)]`, so a handler never runs alongside itself
+  without asking to, and load no longer grows eight-fold with the number of queues. Change it for every queue at
+  setup, for example `AddPgmq(o => o.DefaultConcurrency = Environment.ProcessorCount)`.
 - What a consumer publishes through its context now goes out in one transaction with the delete of its message. Its
   publishes and its "done" commit together or not at all, so a send that fails partway, or a crash between the sends
   and the delete, no longer sends part of the outbox or sends it twice. A failed commit is retried as a whole. An

@@ -195,7 +195,6 @@ public sealed class TransportHarness : IAsyncDisposable
 
     private static PgmqOptions ApplyFast(PgmqOptions options)
     {
-        options.DefaultConcurrency = 4;
         options.DefaultTimeout = TimeSpan.FromSeconds(30);
         options.MaxAttempts = 3;
         options.Lease = TimeSpan.FromSeconds(2);
