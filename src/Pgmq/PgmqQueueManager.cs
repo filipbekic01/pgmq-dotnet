@@ -225,6 +225,19 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         => await ScalarAsync<bool>("select pgmq.delete($1, $2)", [Text(queueName), Long(messageId)],
             cancellationToken);
 
+    /// <summary>Deletes one message in <paramref name="transaction"/>, so it stays on the queue if that rolls back.</summary>
+    /// <returns>False when the message was not there.</returns>
+    internal async Task<bool> DeleteMessageAsync(string queueName, long messageId, NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        NpgsqlConnection connection = transaction.Connection
+            ?? throw new InvalidOperationException("The transaction has already ended.");
+        await using NpgsqlCommand command = new("select pgmq.delete($1, $2)", connection, transaction);
+        command.Parameters.Add(Text(queueName));
+        command.Parameters.Add(Long(messageId));
+        return (bool)(await command.ExecuteScalarAsync(cancellationToken))!;
+    }
+
     /// <inheritdoc />
     public Task<IReadOnlyList<long>> DeleteMessagesAsync(string queueName, IReadOnlyCollection<long> messageIds,
         CancellationToken cancellationToken = default)

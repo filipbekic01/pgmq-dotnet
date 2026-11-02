@@ -50,7 +50,7 @@ public static class PgmqTransientFailures
     /// <summary>
     /// True for a transient database error, a timeout, a broken HTTP connection, or an HTTP 408, 429, 5xx or 520
     /// response, found anywhere in the exception or its inner exceptions. Opt in to retries with it, and extend it
-    /// rather than replace it. The worker also uses it to retry an outbox flush in place, which runs no consumer.
+    /// rather than replace it. The worker also uses it to retry an outbox commit in place, which runs no consumer.
     /// <code>
     /// options.IsTransient = ex => PgmqTransientFailures.IsTransient(ex) || ex is LockTimeoutException;
     /// </code>

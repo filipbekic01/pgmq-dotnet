@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 namespace Pgmq.Hosting;
 
@@ -16,7 +17,8 @@ namespace Pgmq.Hosting;
 /// one lease; a live one keeps them however long they take.
 /// </para>
 /// <para>
-/// <b>Outcome.</b> The consumer runs under its timeout. Success flushes its outbox, then deletes the message. With
+/// <b>Outcome.</b> The consumer runs under its timeout. Success sends its outbox and deletes the message in one
+/// transaction, so what it published goes out exactly when the message is done. With
 /// retries turned on, a transient failure (<see cref="PgmqOptions.IsTransient"/>) makes it visible again after a backoff, up to
 /// <see cref="PgmqOptions.MaxAttempts"/> reads; any other failure, a timeout, or the last attempt archives it to
 /// <c>pgmq.a_{queue}</c>. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
@@ -448,31 +450,55 @@ internal sealed class ConsumerWorker(
             return Failed(consumer, message, messageType, ex);
         }
 
+        if (outbox.Count == 0)
+        {
+            return Outcome.Success;
+        }
+
+        bool deleted = false;
         try
         {
-            // Retrying the flush in place sends only what is left and runs no consumer, so it does not wait for retries
-            // to be turned on.
-            await RetryAsync(outbox.FlushAsync, "flush the outbox of", state, message,
+            // Each try is a whole new transaction, so retrying it runs no consumer and sends nothing twice: a failed
+            // try rolled back everything it sent. It does not wait for retries to be turned on.
+            await RetryAsync(async ct => deleted = await CommitAsync(state, message, outbox, ct),
+                "commit the outbox of", state, message,
                 ex => PgmqTransientFailures.IsTransient(ex) || options.IsTransient(ex));
         }
         catch (Exception ex)
         {
-            // The consumer's work is done but some of what it published is not out. Running it again is the only way
-            // to send the rest, and what already went out may then go twice. That is worth it only when the failure
-            // can pass: a send that can never succeed would fail the same way on every run, so archive instead.
+            // Nothing the consumer published went out, and its message is still on the queue.
+            if (consumer.AtMostOnce)
+            {
+                logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; the " +
+                                    "at-most-once message is lost", consumer.ConsumerType.Name, outbox.Count);
+                return Outcome.Lost(PgmqTelemetry.ErrorType(ex), ex);
+            }
+
+            // Running it again is the only way to send them. That is worth it only when the failure can pass: a send
+            // that can never succeed would fail the same way on every run, so archive instead.
             if (!options.IsTransient(ex) || message.ReadCt >= options.MaxAttempts)
             {
-                logger.LogError(ex, "{Consumer} succeeded but {Count} of its publishes did not go out; archiving the message",
-                    consumer.ConsumerType.Name, outbox.Count);
+                logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; archiving the " +
+                                    "message", consumer.ConsumerType.Name, outbox.Count);
                 return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
             }
 
-            logger.LogError(ex, "{Consumer} succeeded but {Count} of its publishes did not go out; running it again",
+            logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; running it again",
                 consumer.ConsumerType.Name, outbox.Count);
             return Outcome.Retry(Backoff(message.ReadCt), ex);
         }
 
-        return Outcome.Success;
+        if (consumer.AtMostOnce || deleted)
+        {
+            return Outcome.Committed;
+        }
+
+        // Someone else settled the message first (its lease lapsed and another read finished it, or it was deleted by
+        // hand), or a commit that seemed to fail went through. Its publishes then went out already, or belong to that
+        // other read; these were rolled back.
+        logger.LogWarning("{Consumer} succeeded, but message {MsgId} was no longer on {Queue}; its {Count} publishes " +
+                          "were not sent", consumer.ConsumerType.Name, message.MsgId, consumer.QueueName, outbox.Count);
+        return Outcome.Gone;
     }
 
     private async Task DispatchAsync(ConsumerRegistration consumer, QueueMessage message,
@@ -485,8 +511,9 @@ internal sealed class ConsumerWorker(
         Delivery delivery = new(publisher, headers.MessageId,
             RedeliveryCount: headers.RedeliveryCount + Math.Max(0, message.ReadCt - 1),
             outbox,
-            SendBack: (m, type, delay, count, messageId, groupId, custom, ct) =>
-                publisher.SendAsync(consumer.QueueName, m, type, delay, count, messageId, groupId, custom, ct))
+            // The outbox flushes through this worker's publisher, bound to its transaction: always a PgmqPublisher.
+            SendBack: (p, m, type, delay, count, messageId, groupId, custom, ct) =>
+                ((PgmqPublisher)p).SendAsync(consumer.QueueName, m, type, delay, count, messageId, groupId, custom, ct))
         {
             GroupId = headers.GroupId,
             Headers = headers.CustomHeaders,
@@ -524,14 +551,62 @@ internal sealed class ConsumerWorker(
         => TimeSpan.FromTicks((long)Math.Min(options.RetryBackoff.Ticks * Math.Pow(4, Math.Max(0, attempt - 1)),
             options.MaxRetryBackoff.Ticks));
 
+    /// <summary>
+    /// Sends the outbox and deletes the message in one transaction. An at-most-once message was deleted as it was read,
+    /// so only the sends are in it.
+    /// </summary>
+    /// <returns>False when the message was no longer on the queue; the transaction then rolled back, sending nothing.</returns>
+    private async Task<bool> CommitAsync(QueueState state, QueueMessage message, Outbox outbox,
+        CancellationToken cancellationToken)
+    {
+        await using NpgsqlConnection connection = await database.DataSource.OpenConnectionAsync(cancellationToken);
+        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        await outbox.FlushAsync(publisher.InTransaction(transaction), cancellationToken);
+
+        if (!state.Consumer.AtMostOnce && !await DeleteAsync(state, message, transaction, cancellationToken))
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            return false;
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return true;
+    }
+
+    /// <summary>The delete of a message in its outbox's transaction, traced and measured as any other settle.</summary>
+    private async Task<bool> DeleteAsync(QueueState state, QueueMessage message, NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        string queue = state.Consumer.QueueName;
+        long start = Stopwatch.GetTimestamp();
+        using Activity? activity = PgmqTelemetry.StartSettle("delete", queue, message.MsgId, database.Server);
+        string? errorType = null;
+
+        try
+        {
+            return await queues.DeleteMessageAsync(queue, message.MsgId, transaction, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            errorType = PgmqTelemetry.ErrorType(ex);
+            PgmqTelemetry.Fail(activity, errorType, ex);
+            throw;
+        }
+        finally
+        {
+            PgmqTelemetry.RecordOperation("settle", "delete", queue, start, errorType, database.Server);
+        }
+    }
+
     /// <summary>Writes the outcome to the queue, retrying a failed write; a write that never lands leaves the lease to lapse.</summary>
     private async Task SettleAsync(QueueState state, QueueMessage message, Settlement settlement)
     {
         string queue = state.Consumer.QueueName;
 
-        if (state.Consumer.AtMostOnce)
+        if (state.Consumer.AtMostOnce || settlement.Written)
         {
-            // pgmq.pop deleted it as it was read; there is nothing left to settle.
+            // pgmq.pop deleted it as it was read, or the outbox's transaction already settled it.
             return;
         }
 
@@ -682,9 +757,11 @@ internal sealed class ConsumerWorker(
         Release,
     }
 
-    private readonly record struct Settlement(SettlementKind Kind, TimeSpan Delay)
+    /// <summary>What to write to the queue; nothing, when <c>Written</c> says the outbox's transaction already settled it.</summary>
+    private readonly record struct Settlement(SettlementKind Kind, TimeSpan Delay, bool Written = false)
     {
         public static readonly Settlement Delete = new(SettlementKind.Delete, TimeSpan.Zero);
+        public static readonly Settlement Deleted = new(SettlementKind.Delete, TimeSpan.Zero, Written: true);
         public static readonly Settlement Archive = new(SettlementKind.Archive, TimeSpan.Zero);
         public static readonly Settlement Release = new(SettlementKind.Release, TimeSpan.Zero);
 
@@ -693,11 +770,20 @@ internal sealed class ConsumerWorker(
 
     /// <summary>
     /// How handling a message ended: what to write to the queue, the <c>messaging.pgmq.outcome</c> it is reported
-    /// under (success, retry, archived, released or lost), and, for a failure, its <c>error.type</c> and exception.
+    /// under (success, retry, archived, released, lost or gone), and, for a failure, its <c>error.type</c> and exception.
     /// </summary>
     private readonly record struct Outcome(Settlement Settlement, string Name, string? ErrorType, Exception? Error)
     {
         public static readonly Outcome Success = new(Settlement.Delete, "success", null, null);
+
+        /// <summary>A success whose outbox went out in one transaction with the delete of its message.</summary>
+        public static readonly Outcome Committed = new(Settlement.Deleted, "success", null, null);
+
+        /// <summary>
+        /// A success whose message was no longer on the queue when its outbox went to commit: nothing was sent, and
+        /// nothing is left to settle.
+        /// </summary>
+        public static readonly Outcome Gone = new(Settlement.Deleted, "gone", null, null);
         public static readonly Outcome Released = new(Settlement.Release, "released", null, null);
 
         public static Outcome Retry(TimeSpan delay, Exception error)

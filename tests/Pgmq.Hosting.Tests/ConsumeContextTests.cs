@@ -5,8 +5,8 @@ using Moq;
 namespace Pgmq.Hosting.Tests;
 
 /// <summary>
-/// What a consumer sends waits until it succeeds, so a retry does not send twice; and a flush that fails halfway
-/// resends only what did not go out.
+/// What a consumer sends waits until it succeeds, so a retry does not send twice; and a flush goes through whatever
+/// publisher it is handed, so the worker can run it in the transaction that deletes the message.
 /// </summary>
 public sealed class ConsumeContextTests
 {
@@ -18,7 +18,7 @@ public sealed class ConsumeContextTests
         Mock<IPgmqPublisher> publisher = new(MockBehavior.Strict);
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), publisher.Object,
-            sendBack: (_, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+            sendBack: (_, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
 
         await context.PublishAsync(new Ping(), Ct);
         await context.SchedulePublishAsync(new Ping(), TimeSpan.FromMinutes(1), Ct);
@@ -35,14 +35,14 @@ public sealed class ConsumeContextTests
         (int Count, Guid? Id)? sentBack = null;
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
-            sendBack: (_, _, _, count, id, _, _, _) =>
+            sendBack: (_, _, _, _, count, id, _, _, _) =>
             {
                 sentBack = (count, id);
                 return Task.CompletedTask;
             }, outbox, messageId, redeliveryCount: 2);
 
         await context.RedeliverAsync(TimeSpan.FromSeconds(1));
-        await outbox.FlushAsync(Ct);
+        await outbox.FlushAsync(Mock.Of<IPgmqPublisher>(), Ct);
 
         Assert.Equal((3, messageId), sentBack);
     }
@@ -54,14 +54,14 @@ public sealed class ConsumeContextTests
         Outbox outbox = new();
         Dictionary<string, string> headers = new() { ["tenant"] = "acme" };
         PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
-            sendBack: (_, _, _, _, _, group, sent, _) =>
+            sendBack: (_, _, _, _, _, _, group, sent, _) =>
             {
                 sentBack = (group, sent);
                 return Task.CompletedTask;
             }, outbox, Guid.NewGuid(), redeliveryCount: 0, groupId: "customer-1", headers: headers);
 
         await context.RedeliverAsync(TimeSpan.FromSeconds(1));
-        await outbox.FlushAsync(Ct);
+        await outbox.FlushAsync(Mock.Of<IPgmqPublisher>(), Ct);
 
         Assert.Equal("customer-1", sentBack?.Group);
         Assert.Equal("acme", sentBack?.Headers?["tenant"]);
@@ -86,7 +86,7 @@ public sealed class ConsumeContextTests
         Mock<IPgmqPublisher> publisher = new(MockBehavior.Strict);
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), publisher.Object,
-            sendBack: (_, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+            sendBack: (_, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             context.PublishToTopicAsync("notify.email.big spender", new Ping(), Ct));
@@ -96,18 +96,35 @@ public sealed class ConsumeContextTests
     }
 
     [Fact]
-    public async Task A_flush_that_fails_halfway_Should_resend_only_what_did_not_go_out()
+    public async Task A_flush_Should_send_through_the_publisher_it_is_handed()
     {
+        Mock<IPgmqPublisher> held = new(MockBehavior.Strict);
+        Mock<IPgmqPublisher> flushedThrough = new();
+        Outbox outbox = new();
+        PgmqConsumeContext<Ping> context = new(new Ping(), held.Object,
+            sendBack: (_, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+
+        await context.PublishAsync(new Ping(), Ct);
+        await outbox.FlushAsync(flushedThrough.Object, Ct);
+
+        flushedThrough.Verify(p => p.PublishAsync(It.IsAny<Ping>(), It.IsAny<CancellationToken>()), Times.Once);
+        held.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task A_flush_that_fails_Should_send_everything_again_next_time()
+    {
+        // The worker flushes in a transaction: one that fails rolled back what went out, so the next try sends it all.
         Outbox outbox = new();
         List<string> sent = [];
         bool failOnce = true;
 
-        outbox.Add(_ =>
+        outbox.Add((_, _) =>
         {
             sent.Add("first");
             return Task.CompletedTask;
         });
-        outbox.Add(_ =>
+        outbox.Add((_, _) =>
         {
             if (failOnce)
             {
@@ -119,13 +136,12 @@ public sealed class ConsumeContextTests
             return Task.CompletedTask;
         });
 
-        await Assert.ThrowsAsync<TimeoutException>(() => outbox.FlushAsync(Ct));
-        Assert.Equal(1, outbox.Count);
+        await Assert.ThrowsAsync<TimeoutException>(() => outbox.FlushAsync(Mock.Of<IPgmqPublisher>(), Ct));
+        Assert.Equal(2, outbox.Count);
 
-        await outbox.FlushAsync(Ct);
+        await outbox.FlushAsync(Mock.Of<IPgmqPublisher>(), Ct);
 
-        Assert.Equal(["first", "second"], sent);
-        Assert.Equal(0, outbox.Count);
+        Assert.Equal(["first", "first", "second"], sent);
     }
 
     [Theory]

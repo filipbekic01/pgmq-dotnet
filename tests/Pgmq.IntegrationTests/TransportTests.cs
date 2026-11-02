@@ -389,10 +389,37 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_unsendable") == 1, Within, "archived");
         await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
 
-        // It ran once, and what it published before the bad send went out once, not once per attempt.
+        // It ran once, and nothing it published went out: the good publish before the bad one rolled back with it.
         Assert.Single(_probe.Of(nameof(UnsendableConsumer)));
-        Assert.Single(_probe.Of(nameof(DownstreamConsumer)));
+        Assert.Empty(_probe.Of(nameof(DownstreamConsumer)));
         Assert.Empty(_probe.Of(nameof(UnsendableSink)));
+    }
+
+    [Fact]
+    public async Task Several_publishes_from_one_consumer_Should_all_go_out_with_the_delete_of_its_message()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(ManyPublishesConsumer), typeof(DownstreamConsumer));
+
+        await harness.Bus.PublishAsync(new ManyPublishesMessage(Count: 3), Ct);
+
+        await Eventually.HoldsAsync(() => _probe.Of(nameof(DownstreamConsumer)).Count == 3, Within, "all three arrived");
+        await AssertEmptyAsync("t_many_publishes");
+        Assert.Equal(0, await db.ArchivedAsync("t_many_publishes"));
+    }
+
+    [Fact]
+    public async Task Publishes_of_a_message_that_is_gone_when_its_consumer_ends_Should_not_go_out()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(VanishingConsumer), typeof(DownstreamConsumer));
+
+        await harness.Bus.PublishAsync(new VanishingMessage(), Ct);
+
+        await Eventually.HoldsAsync(() => _probe.Of(nameof(VanishingConsumer)).Count == 1, Within, "ran");
+        await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
+
+        // Its publishes were in the transaction that deleted the message; with nothing to delete, it rolled back.
+        Assert.Empty(_probe.Of(nameof(DownstreamConsumer)));
+        Assert.Single(_probe.Of(nameof(VanishingConsumer)));
     }
 
     [Fact]
@@ -620,6 +647,35 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         {
             probe.Record(nameof(UnsendableSink), context.Message, context);
             return Task.CompletedTask;
+        }
+    }
+
+    public sealed record ManyPublishesMessage(int Count);
+
+    [QueueName("t_many_publishes")]
+    public sealed class ManyPublishesConsumer : IPgmqConsumer<ManyPublishesMessage>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<ManyPublishesMessage> context,
+            CancellationToken cancellationToken)
+        {
+            for (int i = 0; i < context.Message.Count; i++)
+            {
+                await context.PublishAsync(new DownstreamMessage($"many {i}"), cancellationToken);
+            }
+        }
+    }
+
+    public sealed record VanishingMessage;
+
+    /// <summary>Takes its own message off the queue, as a purge or a second reader finishing it first would.</summary>
+    [QueueName("t_vanishing")]
+    public sealed class VanishingConsumer(Probe probe, IPgmqQueueManager queues) : IPgmqConsumer<VanishingMessage>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<VanishingMessage> context, CancellationToken cancellationToken)
+        {
+            await context.PublishAsync(new DownstreamMessage("vanishing"), cancellationToken);
+            await queues.PurgeQueueAsync("t_vanishing", cancellationToken);
+            probe.Record(nameof(VanishingConsumer), context.Message, context);
         }
     }
 

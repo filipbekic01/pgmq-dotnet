@@ -5,6 +5,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- What a consumer publishes through its context now goes out in one transaction with the delete of its message. Its
+  publishes and its "done" commit together or not at all, so a send that fails partway, or a crash between the sends
+  and the delete, no longer sends part of the outbox or sends it twice. A failed commit is retried as a whole, and a
+  consumer that runs again sends nothing twice. An at-most-once consumer's publishes are one transaction too.
+- A consumer whose message is no longer on the queue when it finishes (another read finished it after its lease
+  lapsed, or the queue was purged) has its publishes rolled back, with the new outcome `gone`.
+- An at-most-once consumer whose publishes cannot be sent reports `lost` instead of `archived`.
+
 ## [1.0.0] - 2026-11-02
 
 ### Changed

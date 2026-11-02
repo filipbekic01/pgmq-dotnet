@@ -36,6 +36,13 @@ public sealed class PgmqPublisher : IPgmqPublisher
 
     private static readonly PgmqPublishOptions NoOptions = new();
 
+    /// <summary>
+    /// The same publisher writing in <paramref name="transaction"/>: what it sends commits or rolls back with it. How a
+    /// consumer's outbox goes out together with the delete of its message.
+    /// </summary>
+    internal PgmqPublisher InTransaction(NpgsqlTransaction transaction)
+        => new(new PgmqSender(transaction), _topology, _logger, _server);
+
     /// <inheritdoc />
     public Task PublishAsync<TMessage>(TMessage message, CancellationToken cancellationToken = default)
         where TMessage : class

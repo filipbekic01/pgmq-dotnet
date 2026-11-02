@@ -28,13 +28,23 @@ internal interface IPgmqSender
         CancellationToken cancellationToken);
 }
 
-/// <summary><see cref="IPgmqSender"/> calling the pgmq functions directly. Bodies are already JSON.</summary>
-internal sealed class PgmqSender(NpgsqlDataSource dataSource) : IPgmqSender
+/// <summary>
+/// <see cref="IPgmqSender"/> calling the pgmq functions directly. Bodies are already JSON. Built on a data source, each
+/// send commits on its own; built on a transaction, every send runs in it and commits or rolls back with it.
+/// </summary>
+internal sealed class PgmqSender : IPgmqSender
 {
+    private readonly NpgsqlDataSource? _dataSource;
+    private readonly NpgsqlTransaction? _transaction;
+
+    public PgmqSender(NpgsqlDataSource dataSource) => _dataSource = dataSource;
+
+    public PgmqSender(NpgsqlTransaction transaction) => _transaction = transaction;
+
     public async Task<long> SendAsync(string queueName, string body, IReadOnlyDictionary<string, object> headers,
         DateTimeOffset? deliverAt, CancellationToken cancellationToken)
     {
-        await using NpgsqlCommand command = dataSource.CreateCommand(deliverAt is null
+        await using NpgsqlCommand command = Command(deliverAt is null
             ? "select * from pgmq.send($1, $2, $3)"
             : "select * from pgmq.send($1, $2, $3, $4)");
         command.Parameters.Add(Text(queueName));
@@ -52,7 +62,7 @@ internal sealed class PgmqSender(NpgsqlDataSource dataSource) : IPgmqSender
         IReadOnlyList<IReadOnlyDictionary<string, object>> headers, DateTimeOffset? deliverAt,
         CancellationToken cancellationToken)
     {
-        await using NpgsqlCommand command = dataSource.CreateCommand(deliverAt is null
+        await using NpgsqlCommand command = Command(deliverAt is null
             ? "select * from pgmq.send_batch($1, $2, $3)"
             : "select * from pgmq.send_batch($1, $2, $3, $4)");
         command.Parameters.Add(Text(queueName));
@@ -76,7 +86,7 @@ internal sealed class PgmqSender(NpgsqlDataSource dataSource) : IPgmqSender
     public async Task<int> SendTopicAsync(string routingKey, string body, IReadOnlyDictionary<string, object> headers,
         int delaySeconds, CancellationToken cancellationToken)
     {
-        await using NpgsqlCommand command = dataSource.CreateCommand("select pgmq.send_topic($1, $2, $3, $4)");
+        await using NpgsqlCommand command = Command("select pgmq.send_topic($1, $2, $3, $4)");
         command.Parameters.Add(Text(routingKey));
         command.Parameters.Add(Jsonb(body));
         command.Parameters.Add(Jsonb(Serialize(headers)));
@@ -90,7 +100,7 @@ internal sealed class PgmqSender(NpgsqlDataSource dataSource) : IPgmqSender
         CancellationToken cancellationToken)
     {
         await using NpgsqlCommand command =
-            dataSource.CreateCommand("select queue_name from pgmq.send_batch_topic($1, $2, $3, $4)");
+            Command("select queue_name from pgmq.send_batch_topic($1, $2, $3, $4)");
         command.Parameters.Add(Text(routingKey));
         command.Parameters.Add(JsonbArray(bodies));
         command.Parameters.Add(JsonbArray([.. headers.Select(Serialize)]));
@@ -105,6 +115,13 @@ internal sealed class PgmqSender(NpgsqlDataSource dataSource) : IPgmqSender
 
         return queues;
     }
+
+    private NpgsqlCommand Command(string sql)
+        => _transaction is { } transaction
+            ? new NpgsqlCommand(sql,
+                transaction.Connection ?? throw new InvalidOperationException("The transaction has already ended."),
+                transaction)
+            : _dataSource!.CreateCommand(sql);
 
     private static string Serialize(IReadOnlyDictionary<string, object> headers) => JsonSerializer.Serialize(headers);
 

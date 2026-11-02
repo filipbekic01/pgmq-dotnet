@@ -19,10 +19,15 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   without a failure: after a crash (its lease lapses) or a shutdown that cancels its consumer. A message read more than
   `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is archived without running
   again. Keep `MaxAttempts` above 1, or a message released on shutdown is archived instead of run.
-- **Outbox.** What a consumer publishes through its context is sent only if it succeeds, so a retry does not send twice.
-  A failed send is retried in place, without running the consumer. If it still fails, the consumer runs again to
-  send the rest only when retries are on and `IsTransient` accepts the failure; what already went out may then go
-  twice. Otherwise the message is archived.
+- **Outbox.** What a consumer publishes through its context is sent only if it succeeds. When it does, everything it
+  published and the delete of its message are one transaction: all of it goes out and the message is done, or none of
+  it goes out and the message stays on the queue. A failed commit is retried in place, without running the consumer.
+  If it still fails, the consumer runs again only when retries are on and `IsTransient` accepts the failure, and since
+  nothing went out, nothing goes twice. Otherwise the message is archived. If the message is already gone from the
+  queue when the consumer ends (another read finished it after its lease lapsed, or it was purged), its publishes
+  are rolled back and its outcome is `gone`. Publishing through an injected `IPgmqPublisher` instead of the context
+  skips all of this: it sends at once, on its own. Writes to your own database stay outside the transaction, so
+  consumers still need to be idempotent.
 - **Timeouts.** A consumer past its timeout has its token cancelled and its message archived. One that ignores the
   token is abandoned, so its slot frees.
 - **Graceful shutdown.** Reading stops, running consumers get `DrainGrace` to finish, and what stops on cancellation
@@ -271,7 +276,8 @@ so a trace still continues into the consumer.
 | `pgmq.queue.oldest_message.age` | Gauge | `s` | queue; needs `QueueMetricsInterval` |
 
 `messaging.pgmq.outcome` is what happened to a handled message: `success`, `retry`, `archived`, `released` (shutdown;
-it goes back to the queue) or `lost` (an at-most-once message that did not succeed). `error.type` says why: the
+it goes back to the queue), `lost` (an at-most-once message that did not succeed) or `gone` (the consumer succeeded,
+but its message was no longer on the queue, so its publishes were rolled back). `error.type` says why: the
 exception's type, `timeout`, `pgmq.abandoned`, `pgmq.shutdown`, `pgmq.unknown_message_type` or
 `pgmq.attempts_exhausted`. Histograms suggest the
 bucket boundaries the OpenTelemetry messaging conventions recommend; your views can override them.
@@ -302,8 +308,9 @@ builder.ConfigureTracing(t => t
 
 ## Limitations
 
-- **Separate writes per queue.** Publishing to several queues is not one transaction, and there is no transactional
-  outbox with your own database writes. A topic publish is one statement.
+- **Separate writes per queue.** Publishing from outside a consumer to several queues is not one transaction, and
+  there is no transactional outbox with your own database writes. A topic publish is one statement. Inside a consumer,
+  everything published through its context commits in one transaction with the delete of its message.
 - **Archives grow** on standard and unlogged queues. Partitioned queues drop old partitions; `ConvertArchivePartitionedAsync`
   partitions an existing archive.
 - **No ordering guarantees** within a queue under concurrency, except per group in the grouped read modes.

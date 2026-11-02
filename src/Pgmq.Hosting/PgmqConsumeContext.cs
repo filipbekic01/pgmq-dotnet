@@ -4,8 +4,10 @@ namespace Pgmq;
 
 /// <summary>
 /// What a consumer gets besides the message: what it arrived with, and ways to send more. Everything sent through a
-/// context waits in an outbox until the consumer returns, and is dropped if it throws, so a retried consumer does not
-/// send the same messages twice.
+/// context waits in an outbox until the consumer returns, and is dropped if it throws. When it returns, the outbox goes
+/// out in one transaction with the delete of the message: all of it is sent and the message is done, or none of it is
+/// sent and the message stays on the queue. Send through the context, not an injected <see cref="IPgmqPublisher"/>,
+/// which sends at once and on its own.
 /// </summary>
 public abstract class PgmqConsumeContext
 {
@@ -45,7 +47,7 @@ public abstract class PgmqConsumeContext
     /// <summary>Publishes <paramref name="message"/> with <paramref name="options"/> once this consumer succeeds.</summary>
     public Task PublishAsync<TOther>(TOther message, PgmqPublishOptions options,
         CancellationToken cancellationToken = default) where TOther : class
-        => SendAsync(ct => Publisher.PublishAsync(message, options, ct), cancellationToken);
+        => SendAsync((p, ct) => p.PublishAsync(message, options, ct), cancellationToken);
 
     /// <summary>
     /// Publishes <paramref name="message"/> to a topic once this consumer succeeds. An invalid routing key throws here,
@@ -56,29 +58,29 @@ public abstract class PgmqConsumeContext
         CancellationToken cancellationToken = default) where TOther : class
     {
         RoutingKeys.ThrowIfInvalid(routingKey);
-        return SendAsync(ct => Publisher.PublishToTopicAsync(routingKey, message, ct), cancellationToken);
+        return SendAsync((p, ct) => p.PublishToTopicAsync(routingKey, message, ct), cancellationToken);
     }
 
     /// <summary>Publishes <paramref name="message"/> once this consumer succeeds.</summary>
     public Task PublishAsync<TOther>(TOther message, CancellationToken cancellationToken = default) where TOther : class
-        => SendAsync(ct => Publisher.PublishAsync(message, ct), cancellationToken);
+        => SendAsync((p, ct) => p.PublishAsync(message, ct), cancellationToken);
 
     /// <summary>Publishes <paramref name="message"/> as <paramref name="messageType"/> once this consumer succeeds.</summary>
     public Task PublishAsync(object message, Type messageType, CancellationToken cancellationToken = default)
-        => SendAsync(ct => Publisher.PublishAsync(message, messageType, ct), cancellationToken);
+        => SendAsync((p, ct) => p.PublishAsync(message, messageType, ct), cancellationToken);
 
     /// <summary>Publishes <paramref name="messages"/> once this consumer succeeds.</summary>
     public Task PublishBatchAsync<TOther>(IEnumerable<TOther> messages, CancellationToken cancellationToken = default)
         where TOther : class
     {
         TOther[] batch = [.. messages];
-        return SendAsync(ct => Publisher.PublishBatchAsync(batch, ct), cancellationToken);
+        return SendAsync((p, ct) => p.PublishBatchAsync(batch, ct), cancellationToken);
     }
 
     /// <summary>Publishes <paramref name="message"/> after <paramref name="delay"/>, once this consumer succeeds.</summary>
     public Task SchedulePublishAsync<TOther>(TOther message, TimeSpan delay, CancellationToken cancellationToken = default)
         where TOther : class
-        => SendAsync(ct => Publisher.SchedulePublishAsync(message, delay, ct), cancellationToken);
+        => SendAsync((p, ct) => p.SchedulePublishAsync(message, delay, ct), cancellationToken);
 
     /// <summary>
     /// Sends <paramref name="message"/> to this consumer's own queue after <paramref name="delay"/>, without fanning it
@@ -88,20 +90,20 @@ public abstract class PgmqConsumeContext
         where TOther : class
         => _sendBack is null
             ? SchedulePublishAsync(message, delay, cancellationToken)
-            : SendAsync(ct => _sendBack(message, typeof(TOther), delay, 0, null, null, null, ct), cancellationToken);
+            : SendAsync((p, ct) => _sendBack(p, message, typeof(TOther), delay, 0, null, null, null, ct), cancellationToken);
 
     private protected Task SendBackAsync(object message, Type messageType, TimeSpan delay, int redeliveryCount)
         => _sendBack is null
             ? throw new InvalidOperationException("This message was not read from a queue, so it cannot go back to one.")
-            : SendAsync(ct => _sendBack(message, messageType, delay, redeliveryCount, MessageId, GroupId,
+            : SendAsync((p, ct) => _sendBack(p, message, messageType, delay, redeliveryCount, MessageId, GroupId,
                 Headers.Count == 0 ? null : Headers, ct), default);
 
     /// <summary>Holds the send in the outbox, or sends it now when there is none (a test calling a consumer).</summary>
-    private Task SendAsync(Func<CancellationToken, Task> send, CancellationToken cancellationToken)
+    private Task SendAsync(Func<IPgmqPublisher, CancellationToken, Task> send, CancellationToken cancellationToken)
     {
         if (_outbox is null)
         {
-            return send(cancellationToken);
+            return send(Publisher, cancellationToken);
         }
 
         _outbox.Add(send);

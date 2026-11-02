@@ -5,11 +5,11 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Pgmq.Hosting;
 
 /// <summary>
-/// Puts a message back on the queue it was read from, after a delay, with the given redelivery count. A
-/// <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message; a group and headers go
-/// with it.
+/// Puts a message back on the queue it was read from, through <paramref name="publisher"/>, after a delay, with the
+/// given redelivery count. A <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message; a
+/// group and headers go with it.
 /// </summary>
-internal delegate Task SendBack(object message, Type messageType, TimeSpan delay, int redeliveryCount, Guid? messageId,
+internal delegate Task SendBack(IPgmqPublisher publisher, object message, Type messageType, TimeSpan delay, int redeliveryCount, Guid? messageId,
     string? groupId, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken);
 
 /// <summary>
@@ -70,12 +70,13 @@ internal static class ConsumerDispatcher
 }
 
 /// <summary>
-/// What a consumer sends while it runs, held back until it succeeds. In memory only: it closes the gap between a
-/// consumer's failure and its publishes, not a crash between the flush and the message's delete.
+/// What a consumer sends while it runs, held back until it succeeds. Each send is written against the publisher it is
+/// flushed through, so the worker can flush it inside the transaction that deletes the message: then what the
+/// consumer sent and the delete of its message commit together, or not at all.
 /// </summary>
 internal sealed class Outbox
 {
-    private readonly Queue<Func<CancellationToken, Task>> _pending = new();
+    private readonly List<Func<IPgmqPublisher, CancellationToken, Task>> _pending = [];
     private readonly Lock _lock = new();
 
     public int Count
@@ -89,37 +90,29 @@ internal sealed class Outbox
         }
     }
 
-    public void Add(Func<CancellationToken, Task> send)
+    public void Add(Func<IPgmqPublisher, CancellationToken, Task> send)
     {
         lock (_lock)
         {
-            _pending.Enqueue(send);
+            _pending.Add(send);
         }
     }
 
     /// <summary>
-    /// Sends everything held, in order. A send leaves the queue only once it went through, so calling this again after
-    /// a failure resends only what had not gone out.
+    /// Sends everything held, in order, through <paramref name="publisher"/>. Nothing leaves the outbox: a flush in a
+    /// transaction that rolls back sent nothing, so the next flush sends it all again.
     /// </summary>
-    public async Task FlushAsync(CancellationToken cancellationToken)
+    public async Task FlushAsync(IPgmqPublisher publisher, CancellationToken cancellationToken)
     {
-        while (true)
+        Func<IPgmqPublisher, CancellationToken, Task>[] sends;
+        lock (_lock)
         {
-            Func<CancellationToken, Task>? next;
-            lock (_lock)
-            {
-                if (!_pending.TryPeek(out next))
-                {
-                    return;
-                }
-            }
+            sends = [.. _pending];
+        }
 
-            await next(cancellationToken);
-
-            lock (_lock)
-            {
-                _pending.Dequeue();
-            }
+        foreach (Func<IPgmqPublisher, CancellationToken, Task> send in sends)
+        {
+            await send(publisher, cancellationToken);
         }
     }
 }
