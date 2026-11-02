@@ -12,10 +12,8 @@
 
         <!-- Example, benchmarks and tests -->
         <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.14" />
-        <PackageVersion Include="Microsoft.Extensions.Hosting" Version="10.0.14" />
         <PackageVersion Include="Microsoft.Extensions.Logging" Version="10.0.14" />
         <PackageVersion Include="Moq" Version="4.20.72" />
-        <PackageVersion Include="OpenTelemetry.Exporter.Console" Version="1.15.3" />
         <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
         <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
         <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />

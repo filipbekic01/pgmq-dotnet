@@ -5,7 +5,8 @@ using OpenTelemetry.Trace;
 using Pgmq;
 using Pgmq.Examples.WebApi;
 
-// A Web API that publishes messages from HTTP endpoints and handles them in background consumers.
+// A Web API that publishes messages from HTTP endpoints and handles them in background consumers, in the same process.
+// A worker service without HTTP sets Pgmq up the same way, on Host.CreateApplicationBuilder.
 // Start PostgreSQL with pgmq, then the app:
 //
 //   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres ghcr.io/pgmq/pg18-pgmq:v1.13.1
@@ -23,66 +24,40 @@ builder.Services.AddPgmq(options =>
     options.ConnectionString = builder.Configuration.GetConnectionString("Pgmq");
     options.Database = "example-transport"; // its own database, created on start
 
-    // Faster than the defaults, so retries are easy to watch.
-    options.MaxAttempts = 4;
-    options.RetryBackoff = TimeSpan.FromSeconds(2);
-    options.MaxRetryBackoff = TimeSpan.FromSeconds(10);
-
     // Queue depth gauges (pgmq.queue.messages and friends), off unless set.
     options.QueueMetricsInterval = TimeSpan.FromSeconds(30);
 });
 builder.Services.AddPgmqConsumers(typeof(Program).Assembly); // every IPgmqConsumer<T> in this project
 builder.Services.AddHealthChecks().AddPgmq();
 
-// Pgmq only emits telemetry; the app decides where it goes. Two outputs, each turned on by configuration:
-// - Telemetry:Console = true prints Pgmq's spans and metrics to the console, so you can see them without a collector.
-// - OTEL_EXPORTER_OTLP_ENDPOINT (plus the other standard OTEL_* variables) sends traces, metrics and logs to an
-//   OpenTelemetry collector, for example grafana/otel-lgtm:
+// Pgmq only emits telemetry; the app decides where it goes. Here: traces, metrics and logs to an OpenTelemetry
+// collector, when OTEL_EXPORTER_OTLP_ENDPOINT (plus the other standard OTEL_* variables) names one, for example
+// grafana/otel-lgtm:
 //
 //     docker run -d -p 3000:3000 -p 4318:4318 grafana/otel-lgtm
 //     dotnet run --project examples/Pgmq.Examples.WebApi --launch-profile otlp
-bool console = builder.Configuration.GetValue("Telemetry:Console", false);
-bool otlp = !string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]);
-if (console || otlp)
+if (!string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"]))
 {
-    IOpenTelemetryBuilder telemetry = builder.Services.AddOpenTelemetry()
+    builder.Services.AddOpenTelemetry()
         .ConfigureResource(r => r.AddService("pgmq-example-webapi"))
         // The HTTP request span is the root, so a trace runs request -> send -> process -> the consumer's own sends.
-        .WithTracing(t =>
-        {
-            t.AddAspNetCoreInstrumentation().AddSource(PgmqTelemetry.SourceName);
-            if (console)
-            {
-                t.AddConsoleExporter();
-            }
-        })
-        .WithMetrics(m =>
-        {
-            m.AddMeter(PgmqTelemetry.MeterName);
-            if (console)
-            {
-                m.AddConsoleExporter((_, reader) =>
-                    reader.PeriodicExportingMetricReaderOptions.ExportIntervalMilliseconds = 30_000);
-            }
-        });
-
-    if (otlp)
-    {
-        // Logs too: while a message is handled, the log scope carries Queue, MessageType, MessageId and Attempt, so
-        // each line can be found by the message-id header of an archived message.
-        telemetry.WithLogging(_ => { }, o =>
+        .WithTracing(t => t.AddAspNetCoreInstrumentation().AddSource(PgmqTelemetry.SourceName))
+        .WithMetrics(m => m.AddMeter(PgmqTelemetry.MeterName))
+        // While a message is handled, the log scope carries Queue, MessageType, MessageId and Attempt, so each line
+        // can be found by the message-id header of an archived message.
+        .WithLogging(_ => { }, o =>
         {
             o.IncludeScopes = true;
             o.IncludeFormattedMessage = true; // the rendered text, not the template, as the log body
-        }).UseOtlpExporter();
-    }
+        })
+        .UseOtlpExporter();
 }
 
 WebApplication app = builder.Build();
 
 app.MapGet("/", () => Results.Text("""
     Pgmq.NET example. Try:
-      POST /orders                   place an order (payment retries with "paymentFailures")
+      POST /orders                   place an order (a flaky gateway with "paymentFailures")
       POST /notifications            publish a notification by type
       POST /notifications/{key}      publish to a topic routing key, e.g. notify.email.ana
       GET  /topics/{key}             which queues a routing key reaches

@@ -72,15 +72,24 @@ public sealed class PgmqOptions
     /// <summary>How long one message may run, unless its consumer says otherwise.</summary>
     public TimeSpan DefaultTimeout { get; set; } = TimeSpan.FromHours(1);
 
-    /// <summary>Reads of one message before a transient failure is given up on and the message archived.</summary>
+    /// <summary>
+    /// Reads of one message before it is archived: a failure <see cref="IsTransient"/> accepts is given up on after
+    /// this many, and a message read more than this many times without ever finishing (its consumer keeps taking the
+    /// process down) is archived without running. Keep it above 1 even with retries off, so a message that went back
+    /// to the queue on shutdown still runs.
+    /// </summary>
     public int MaxAttempts { get; set; } = 5;
 
     /// <summary>
-    /// Which failures are worth another attempt. Anything else archives the message at once: a handler that charged a
-    /// card should not run again because a later line threw. Extend <see cref="PgmqTransientFailures.IsTransient"/>
-    /// rather than replace it.
+    /// Which consumer failures run the consumer again, after <see cref="RetryBackoff"/>. Off by default: every failure
+    /// archives the message at once, because a consumer that is not idempotent must not run twice (a handler that
+    /// charged a card should not run again because a later line threw). Retry infrastructure calls inside the consumer
+    /// instead. To retry whole messages, opt in:
+    /// <code>
+    /// options.IsTransient = PgmqTransientFailures.IsTransient;
+    /// </code>
     /// </summary>
-    public Func<Exception, bool> IsTransient { get; set; } = PgmqTransientFailures.IsTransient;
+    public Func<Exception, bool> IsTransient { get; set; } = PgmqTransientFailures.Never;
 
     /// <summary>
     /// How long a read message stays hidden from other readers. It is renewed while the consumer runs, so this only

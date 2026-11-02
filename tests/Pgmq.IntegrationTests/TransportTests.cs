@@ -52,6 +52,20 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task A_transient_failure_Should_be_archived_after_one_attempt_by_default()
+    {
+        await using TransportHarness harness =
+            await StartAsync(o => o.IsTransient = new PgmqOptions().IsTransient, typeof(FlakyConsumer));
+
+        await harness.Bus.PublishAsync(new FlakyMessage(FailTimes: 1), Ct);
+
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_flaky") == 1, Within, "archived");
+        await Task.Delay(TransportHarness.Fast.Lease * 2, Ct);
+        Assert.Single(_probe.Deliveries);
+        Assert.Equal(0, await db.CountAsync("t_flaky"));
+    }
+
+    [Fact]
     public async Task Any_other_failure_Should_be_archived_after_one_attempt()
     {
         await using TransportHarness harness = await StartAsync(typeof(BrokenConsumer));

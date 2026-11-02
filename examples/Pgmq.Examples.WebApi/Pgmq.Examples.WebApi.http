@@ -18,19 +18,19 @@ Content-Type: application/json
 
 { "customer": "Ana", "total": 120.50 }
 
-### Retries: the payment gateway times out twice, then succeeds on the 3rd attempt. Backoff starts at 2 s.
+### A flaky gateway: PaymentHandler retries the gateway call itself; the 3rd call succeeds in the same run.
 POST {{host}}/orders
 Content-Type: application/json
 
 { "customer": "Marko", "total": 80, "paymentFailures": 2 }
 
-### Retries run out: 5 failures but MaxAttempts is 4, so the message is archived to pgmq.a_example_payments.
+### The gateway keeps failing: after 3 calls the handler throws, and the message is archived to pgmq.a_example_payments.
 POST {{host}}/orders
 Content-Type: application/json
 
 { "customer": "Jelena", "total": 80, "paymentFailures": 5 }
 
-### Permanent failure: over the limit throws a non-transient exception, archived on the first attempt.
+### Refused: over the limit throws, and the message is archived. Pgmq never runs a failed consumer again by default.
 POST {{host}}/orders
 Content-Type: application/json
 

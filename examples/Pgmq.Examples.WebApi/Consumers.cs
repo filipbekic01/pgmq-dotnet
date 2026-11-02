@@ -5,7 +5,7 @@ namespace Pgmq.Examples.WebApi;
 
 /// <summary>
 /// Handles a new order and asks for its payment. What a consumer publishes through its context goes out only if the
-/// consumer succeeds (an outbox), so a retried order never asks for payment twice.
+/// consumer succeeds (an outbox), so a failed order never asks for payment.
 /// </summary>
 [QueueName("example_order_placed")]
 public sealed class OrderPlacedHandler(ActivityFeed feed) : IPgmqConsumer<OrderPlaced>
@@ -27,34 +27,56 @@ public sealed class OrderPlacedHandler(ActivityFeed feed) : IPgmqConsumer<OrderP
 }
 
 /// <summary>
-/// Charges an order through a fake, flaky gateway. Shows the two kinds of failure:
-/// a transient one (here a <see cref="TimeoutException"/>) is retried with backoff, up to <c>MaxAttempts</c>;
-/// any other exception archives the message to <c>pgmq.a_example_payments</c> straight away.
+/// Charges an order through a fake, flaky gateway. Pgmq does not run a consumer twice by default: any exception
+/// archives the message to <c>pgmq.a_example_payments</c> at once. So the consumer retries the one call that can
+/// fail for a passing reason, the gateway, itself, and only that call.
 /// </summary>
 [QueueName("example_payments")]
 [ConsumerOptions(Concurrency = 2, TimeoutSeconds = 30)]
 public sealed class PaymentHandler(ActivityFeed feed) : IPgmqConsumer<PaymentRequested>
 {
+    private const int GatewayTries = 3;
+
     public async Task HandleAsync(PgmqConsumeContext<PaymentRequested> context, CancellationToken cancellationToken)
     {
         PaymentRequested payment = context.Message;
-        int attempt = context.RedeliveryCount + 1;
-
-        await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken); // talking to the "gateway"
 
         if (payment.Amount > 10_000)
         {
             feed.Add(nameof(PaymentHandler), $"Order {payment.OrderId}: amount {payment.Amount} refused, archived");
-            throw new InvalidOperationException($"Amount {payment.Amount} is over the limit."); // permanent
+            throw new InvalidOperationException($"Amount {payment.Amount} is over the limit.");
         }
 
-        if (attempt <= payment.FailTimes)
+        for (int call = 1; ; call++)
         {
-            feed.Add(nameof(PaymentHandler), $"Order {payment.OrderId}: gateway timed out (attempt {attempt})");
-            throw new TimeoutException("The payment gateway timed out."); // transient: retried
+            try
+            {
+                await ChargeAsync(payment, call, cancellationToken);
+                feed.Add(nameof(PaymentHandler), $"Order {payment.OrderId}: charged {payment.Amount} (gateway call {call})");
+                return;
+            }
+            catch (TimeoutException) when (call < GatewayTries)
+            {
+                feed.Add(nameof(PaymentHandler), $"Order {payment.OrderId}: gateway timed out (call {call}), trying again");
+                await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                feed.Add(nameof(PaymentHandler),
+                    $"Order {payment.OrderId}: gateway timed out {GatewayTries} times, archived");
+                throw;
+            }
         }
+    }
 
-        feed.Add(nameof(PaymentHandler), $"Order {payment.OrderId}: charged {payment.Amount} (attempt {attempt})");
+    /// <summary>The fake gateway: times out on the first <see cref="PaymentRequested.FailTimes"/> calls.</summary>
+    private static async Task ChargeAsync(PaymentRequested payment, int call, CancellationToken cancellationToken)
+    {
+        await Task.Delay(TimeSpan.FromMilliseconds(200), cancellationToken);
+        if (call <= payment.FailTimes)
+        {
+            throw new TimeoutException("The payment gateway timed out.");
+        }
     }
 }
 

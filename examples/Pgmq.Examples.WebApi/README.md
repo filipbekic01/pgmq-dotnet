@@ -1,7 +1,8 @@
 # Pgmq.Examples.WebApi
 
-A small Web API to play with Pgmq.NET: HTTP endpoints publish messages, background consumers handle them, and
-`GET /activity` shows what the consumers did.
+A small Web API to play with Pgmq.NET: HTTP endpoints publish messages, background consumers in the same process
+handle them, and `GET /activity` shows what the consumers did. It runs on the library's defaults, retries included.
+A worker service without HTTP sets Pgmq up the same way, on `Host.CreateApplicationBuilder`.
 
 ## Run it
 
@@ -31,9 +32,9 @@ To start over with an empty database: `docker compose down -v`.
 | Try | Consumer | Feature |
 |---|---|---|
 | `POST /orders` | `OrderPlacedHandler` | Publish by type. The handler publishes a `PaymentRequested` and a topic notification through its context: an outbox that sends only if the handler succeeds. |
-| `POST /orders` with `"paymentFailures": 2` | `PaymentHandler` | A transient failure (`TimeoutException`) is retried with backoff. |
-| `"paymentFailures": 5` | `PaymentHandler` | Retries run out after `MaxAttempts` (4 here) and the message is archived. |
-| `"total": 50000` | `PaymentHandler` | Any other exception archives the message straight away. |
+| `POST /orders` with `"paymentFailures": 2` | `PaymentHandler` | The library's default retry policy: none. The handler retries its flaky gateway call itself, and the 3rd call succeeds. |
+| `"paymentFailures": 5` | `PaymentHandler` | The gateway fails 3 times, the handler throws, and the message is archived. Pgmq does not run it again. |
+| `"total": 50000` | `PaymentHandler` | Any exception archives the message straight away. |
 | `POST /notifications` | `EmailNotifier`, `NotificationAudit` | Fan-out: every consumer of a type gets its own copy. Plus a custom header. |
 | `POST /notifications/{routingKey}` | same | Topic routing: `notify.email.*` and `notify.#`. Returns how many queues matched. |
 | `GET /topics/{routingKey}` | | Which queues a routing key would reach. |
@@ -50,10 +51,17 @@ docker compose exec postgres psql -U postgres -d example-transport -c "select ms
 
 ## Telemetry
 
-With `Telemetry:Console` on (the default in `appsettings.json`), the app prints OpenTelemetry spans and metrics to the
-console, so you can check them without a collector. One `POST /orders` makes a single trace: the HTTP request, the
-`send`, the `process` of each consumer, the sends made from inside a consumer, and each `delete`. Metrics print every
-30 seconds. Set `Telemetry:Console` to `false` to keep the console quiet.
+Run with the `otlp` launch profile to send traces, metrics and logs to an OpenTelemetry collector on
+<http://localhost:4318>, for example [grafana/otel-lgtm](https://github.com/grafana/docker-otel-lgtm):
+
+```bash
+docker run -d -p 3000:3000 -p 4318:4318 grafana/otel-lgtm
+dotnet run --launch-profile otlp
+```
+
+One `POST /orders` makes a single trace: the HTTP request, the `send`, the `process` of each consumer, the sends made
+from inside a consumer, and each `delete`. Without the profile (no `OTEL_EXPORTER_OTLP_ENDPOINT`), the app exports no
+telemetry.
 
 ## Where to look
 

@@ -16,8 +16,8 @@ namespace Pgmq.Hosting;
 /// one lease; a live one keeps them however long they take.
 /// </para>
 /// <para>
-/// <b>Outcome.</b> The consumer runs under its timeout. Success flushes its outbox, then deletes the message. A
-/// transient failure (<see cref="PgmqOptions.IsTransient"/>) makes it visible again after a backoff, up to
+/// <b>Outcome.</b> The consumer runs under its timeout. Success flushes its outbox, then deletes the message. With
+/// retries turned on, a transient failure (<see cref="PgmqOptions.IsTransient"/>) makes it visible again after a backoff, up to
 /// <see cref="PgmqOptions.MaxAttempts"/> reads; any other failure, a timeout, or the last attempt archives it to
 /// <c>pgmq.a_{queue}</c>. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
 /// consumer keeps taking the process down) is archived without running. The outcome is decided first and written to the queue after, with its own retries, so a
@@ -450,7 +450,10 @@ internal sealed class ConsumerWorker(
 
         try
         {
-            await RetryAsync(outbox.FlushAsync, "flush the outbox of", state, message, options.IsTransient);
+            // Retrying the flush in place sends only what is left and runs no consumer, so it does not wait for retries
+            // to be turned on.
+            await RetryAsync(outbox.FlushAsync, "flush the outbox of", state, message,
+                ex => PgmqTransientFailures.IsTransient(ex) || options.IsTransient(ex));
         }
         catch (Exception ex)
         {

@@ -11,13 +11,18 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   another one. A slot frees as soon as its message is settled.
 - **Leases.** A read message is hidden for `Lease` (30 s), renewed while its consumer runs. A long job keeps its
   message, and a crashed process gives it back within one lease.
-- **Retries.** A failure that `IsTransient` accepts is retried after a backoff (30 s, 2 m, 8 m, 30 m), up to
-  `MaxAttempts`. Any other failure, a timeout, or the last attempt archives the message to `pgmq.a_{queue}`. A
-  message read more than `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is
-  archived without running again. `MaxAttempts = 1` turns retries off.
+- **No retries by default.** A consumer that throws has its message archived to `pgmq.a_{queue}` at once, so a
+  consumer that is not idempotent never runs twice because it failed. Retry infrastructure calls inside the consumer
+  instead. To retry whole messages, opt in with `options.IsTransient = PgmqTransientFailures.IsTransient` (database
+  errors, timeouts, HTTP 408/429/5xx): a failure it accepts is retried after a backoff (30 s, 2 m, 8 m, 30 m), up to
+  `MaxAttempts`; any other failure, a timeout, or the last attempt archives the message. A message can still come back
+  without a failure: after a crash (its lease lapses) or a shutdown that cancels its consumer. A message read more than
+  `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is archived without running
+  again. Keep `MaxAttempts` above 1, or a message released on shutdown is archived instead of run.
 - **Outbox.** What a consumer publishes through its context is sent only if it succeeds, so a retry does not send twice.
-  If a send then fails, the consumer runs again to send the rest only when the failure is transient; what already
-  went out may then go twice. A send that can never succeed archives the message instead.
+  A failed send is retried in place, without running the consumer. If it still fails, the consumer runs again to
+  send the rest only when retries are on and `IsTransient` accepts the failure; what already went out may then go
+  twice. Otherwise the message is archived.
 - **Timeouts.** A consumer past its timeout has its token cancelled and its message archived. One that ignores the
   token is abandoned, so its slot frees.
 - **Graceful shutdown.** Reading stops, running consumers get `DrainGrace` to finish, and what stops on cancellation
@@ -201,7 +206,7 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `DefaultConcurrency` | `8` | Messages per queue at once, per instance. |
 | `DefaultTimeout` | 1 hour | Per message. |
 | `MaxAttempts` | `5` | |
-| `IsTransient` | `PgmqTransientFailures.IsTransient` | Which failures are retried. |
+| `IsTransient` | `PgmqTransientFailures.Never` | Which failures run the consumer again. Set `PgmqTransientFailures.IsTransient` to turn retries on. |
 | `Lease` / `RenewEvery` | 30 s / 10 s | |
 | `RetryBackoff` / `MaxRetryBackoff` | 30 s / 30 min | |
 | `DrainGrace` / `AbandonAfter` | 20 s / 30 s | |

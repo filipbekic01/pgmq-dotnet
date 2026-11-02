@@ -38,12 +38,19 @@ public sealed class PgmqStatus
     internal void ReportStalledFrom(Func<IReadOnlyList<string>> stalled) => _stalled = stalled;
 }
 
-/// <summary>Which failures the worker tries again by default: those that say nothing about the message itself.</summary>
+/// <summary>
+/// Classifiers for <see cref="PgmqOptions.IsTransient"/>: <see cref="Never"/>, the default, and
+/// <see cref="IsTransient"/>, the failures that say nothing about the message itself.
+/// </summary>
 public static class PgmqTransientFailures
 {
+    /// <summary>False for every failure: no consumer runs twice. The default.</summary>
+    public static bool Never(Exception exception) => false;
+
     /// <summary>
     /// True for a transient database error, a timeout, a broken HTTP connection, or an HTTP 408, 429, 5xx or 520
-    /// response, found anywhere in the exception or its inner exceptions.
+    /// response, found anywhere in the exception or its inner exceptions. Opt in to retries with it, and extend it
+    /// rather than replace it. The worker also uses it to retry an outbox flush in place, which runs no consumer.
     /// <code>
     /// options.IsTransient = ex => PgmqTransientFailures.IsTransient(ex) || ex is LockTimeoutException;
     /// </code>

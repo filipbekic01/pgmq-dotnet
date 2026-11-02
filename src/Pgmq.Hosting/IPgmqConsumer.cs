@@ -9,8 +9,8 @@ namespace Pgmq;
 public interface IPgmqConsumer<TMessage> where TMessage : class
 {
     /// <summary>
-    /// Handles one message. Returning deletes it from the queue; throwing retries it when
-    /// <see cref="PgmqOptions.IsTransient"/> says the failure is transient, and archives it otherwise.
+    /// Handles one message. Returning deletes it from the queue; throwing archives it, unless retries are turned on
+    /// with <see cref="PgmqOptions.IsTransient"/> and it accepts the failure.
     /// </summary>
     /// <param name="context">The message and what it arrived with, and ways to publish more.</param>
     /// <param name="cancellationToken">Cancelled when the message runs past its timeout, or the host shuts down.</param>

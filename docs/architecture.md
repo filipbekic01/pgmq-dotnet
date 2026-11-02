@@ -46,9 +46,9 @@ One read loop per queue, each with its own semaphore of slots:
 1. Wait for a free slot, take every free slot, and read that many messages with a short visibility timeout (the
    lease).
 2. Run each message on its own task. While it runs, one call per queue renews the leases of everything running.
-3. Decide the outcome first, then write it to the queue with its own retries: delete on success; on a transient
-   failure set the visibility timeout to a backoff; otherwise archive. A failed write is never mistaken for a failed
-   consumer.
+3. Decide the outcome first, then write it to the queue with its own retries: delete on success; on a failure
+   that `IsTransient` accepts (none by default) set the visibility timeout to a backoff; otherwise archive. A failed
+   write is never mistaken for a failed consumer.
 4. Free the slot.
 
 An empty queue waits for an insert notification: one connection per host LISTENs to every queue, and a notification

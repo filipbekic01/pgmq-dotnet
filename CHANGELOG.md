@@ -5,11 +5,27 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** consumers are no longer retried by default. `PgmqOptions.IsTransient` defaults to the new
+  `PgmqTransientFailures.Never`, so a consumer that throws has its message archived at once instead of running again,
+  which is unsafe for a consumer that is not idempotent. Opt back in with
+  `options.IsTransient = PgmqTransientFailures.IsTransient`. A failed outbox flush is still retried in place, which
+  runs no consumer.
+- The README says what the default retry policy is and why.
+- The Web API example runs on the library's defaults: `PaymentHandler` retries its flaky gateway call itself instead
+  of having Pgmq run the whole message again.
+
+### Removed
+
+- `examples/Pgmq.Examples.Worker`. The Web API example publishes and consumes in one process and covers everything it
+  showed.
+
 ### Added
 
 - `examples/Pgmq.Examples.WebApi`: a Web API to try every feature from HTTP requests, with its own Postgres in Docker.
-  Its traces, metrics and logs print to the console, and go to an OTLP collector when `OTEL_EXPORTER_OTLP_ENDPOINT`
-  is set (launch profile `otlp`).
+  Its traces, metrics and logs go to an OTLP collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (launch profile
+  `otlp`).
 
 ### Fixed
 

@@ -4,7 +4,7 @@ Publish/subscribe messaging for .NET, stored in PostgreSQL through the [PGMQ](ht
 No separate broker: your database is the queue.
 
 You publish a typed message; every consumer of that type gets its own durable copy and handles it in a background
-worker, with retries, timeouts and graceful shutdown. Consumers wake up instantly through PostgreSQL LISTEN/NOTIFY,
+worker, with timeouts, archiving of failed messages and graceful shutdown. Consumers wake up instantly through PostgreSQL LISTEN/NOTIFY,
 with long polling as the fallback.
 
 > Beta (`0.1.0-beta.2`). The API may still change before 1.0.
@@ -43,6 +43,36 @@ with long polling as the fallback.
    // Anywhere, via IPgmqPublisher:
    await publisher.PublishAsync(new OrderCreated(Guid.NewGuid()));
    ```
+
+## Retries: none by default
+
+**A consumer that throws is never run again.** Its message is archived to `pgmq.a_<queue>` at once, where you can
+inspect it, and the queue moves on.
+
+Why: a library cannot know whether your consumer is idempotent, and most real consumers are not. A handler that
+charged a card and then threw on its next line must not charge it again. Retrying the whole message replays every side
+effect that already happened. The calls that fail for a passing reason are infrastructure calls (an HTTP API, a
+database, a broker), so retry those inside the consumer, where you know what is safe to repeat, for example with
+[Polly](https://github.com/App-vNext/Polly) or `Microsoft.Extensions.Http.Resilience`.
+
+What the library still does for you, without running a consumer twice:
+
+- A failed delete or archive of a finished message is retried in place.
+- What a consumer publishes through its context is sent only after it succeeds, and a failed send is retried in place.
+
+To retry whole messages anyway, for consumers you know are idempotent, opt in:
+
+```csharp
+builder.Services.AddPgmq(o =>
+{
+    o.IsTransient = PgmqTransientFailures.IsTransient; // database errors, timeouts, HTTP 408/429/5xx
+    o.MaxAttempts = 5;                                  // backoff 30 s, 2 m, 8 m, 30 m between them
+});
+```
+
+Delivery is still at least once: a message whose process crashes mid-consumer, or whose consumer is cancelled by a
+shutdown, comes back and runs again. Only `[ConsumerOptions(AtMostOnce = true)]` rules that out, at the cost of losing
+the message instead.
 
 ## Where it lives
 
@@ -90,9 +120,9 @@ builder.Services.AddOpenTelemetry()
 Logs go through `ILogger`. For queue depth gauges, also set `o.QueueMetricsInterval = TimeSpan.FromSeconds(15)`.
 Everything Pgmq emits is listed in [docs/guide.md](docs/guide.md#telemetry).
 
-Runnable examples: a Web API to play with every feature in [`examples/Pgmq.Examples.WebApi`](examples/Pgmq.Examples.WebApi), and a
-worker in [`examples/Pgmq.Examples.Worker`](examples/Pgmq.Examples.Worker). Behavior, all options and
-PGMQ feature support are in [docs/guide.md](docs/guide.md).
+A runnable example, a Web API that publishes and consumes in one process, to play with every feature:
+[`examples/Pgmq.Examples.WebApi`](examples/Pgmq.Examples.WebApi). Behavior, all options and PGMQ feature support are
+in [docs/guide.md](docs/guide.md).
 
 ## License
 

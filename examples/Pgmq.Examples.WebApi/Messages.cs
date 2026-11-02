@@ -8,7 +8,7 @@ namespace Pgmq.Examples.WebApi;
 public sealed record OrderPlaced(Guid OrderId, string Customer, decimal Total, int PaymentFailures);
 
 /// <summary>Charge the customer for an order. Sent by <see cref="OrderPlacedHandler"/>.</summary>
-/// <param name="FailTimes">How many times the fake payment gateway times out before it succeeds.</param>
+/// <param name="FailTimes">How many calls to the fake payment gateway time out before one succeeds.</param>
 [MessageName("example.payment-requested")]
 public sealed record PaymentRequested(Guid OrderId, decimal Amount, int FailTimes);
 
