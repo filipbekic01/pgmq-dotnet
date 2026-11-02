@@ -12,8 +12,8 @@ docker compose up -d --wait
 dotnet run
 ```
 
-Postgres with pgmq runs on port **5433**, so it stays clear of any Postgres you already have on 5432. On start, Pgmq
-creates the `example-transport` database, installs pgmq and creates one queue per consumer. The API listens on
+Postgres with pgmq runs on port **5432**. If you already run Postgres with pgmq there, skip `docker compose up`: the
+app uses it as is. On start, Pgmq creates the `example-transport` database, installs pgmq and creates one queue per consumer. The API listens on
 <http://localhost:5080>.
 
 Then open [`Pgmq.Examples.WebApi.http`](Pgmq.Examples.WebApi.http) in Rider, Visual Studio or VS Code (REST Client)

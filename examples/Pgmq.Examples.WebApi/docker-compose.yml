@@ -1,4 +1,4 @@
-# PostgreSQL with pgmq for the example, on port 5433 so it stays clear of any Postgres already on 5432.
+# PostgreSQL with pgmq for the example, on port 5432.
 name: pgmq-example
 services:
   postgres:
@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgmq-example-data:/var/lib/postgresql
     healthcheck:
