@@ -1,7 +1,9 @@
 # Pgmq.NET
 
-> Pgmq.NET follows the official [pgmq/pgmq](https://github.com/pgmq/pgmq) one to one: every queue feature is pgmq's
-> own, with nothing added to or changed in its SQL. This library adds background workers on top of it, and that is all.
+|  | Pgmq.NET | [pgmq](https://github.com/pgmq/pgmq) |
+|---|:---:|:---:|
+| Every pgmq queue feature, one to one, with nothing added to or changed in its SQL | ✅ | ✅ |
+| Background worker service that runs your consumers | ✅ | ❌ |
 
 Publish/subscribe messaging for .NET, stored in PostgreSQL through the [PGMQ](https://github.com/pgmq/pgmq) extension.
 No separate broker: your database is the queue.
