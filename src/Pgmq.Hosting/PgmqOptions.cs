@@ -107,23 +107,43 @@ public sealed class PgmqOptions
     public TimeSpan DrainGrace { get; set; } = TimeSpan.FromSeconds(20);
 
     /// <summary>
-    /// The first poll delay on an empty queue that polls from the application; it doubles up to
-    /// <see cref="MaxIdleDelay"/>. Also how often a long poll checks the queue inside the database.
+    /// How often the sweeper looks for work while some queue's insert notifications are not live (the listener is
+    /// down or reconnecting, notifications are off, or the database refused the trigger): first after this long, then
+    /// doubling up to about 1 s (never above <see cref="MaxIdleDelay"/>). Latency stays near a second on one
+    /// connection, however many queues there are.
     /// </summary>
     public TimeSpan MinIdleDelay { get; set; } = TimeSpan.FromMilliseconds(200);
 
     /// <summary>
-    /// The longest poll delay on an empty queue that polls from the application. A queue waiting for an insert
-    /// notification reads again after this long at the latest, in case a notification was throttled or lost.
+    /// How often the sweeper looks for work while insert notifications are live. An idle queue never reads on its
+    /// own: one sweeper asks, in one query for every queue, which have a visible message, and wakes only those. This
+    /// catches what notifications never report: a delayed message whose time came, a released message, a message back
+    /// from a lapsed lease, a lost or throttled notification. A delayed message is picked up within this long of its
+    /// due time.
     /// </summary>
     public TimeSpan MaxIdleDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
+    /// Reads, across every queue, that run at once in this host. A busy queue holds a slot only for its read, not
+    /// while its messages run, so busy queues take turns and idle ones never ask. Settles, outbox commits and lease
+    /// renewals do not count against it. A host then uses at most this many connections for reads, one for the
+    /// listener, one for the sweeper, and one per message settling at that moment, whatever the pool allows.
+    /// <para>
+    /// One by default: the fewest connections. Each read is one round trip, so with many busy queues of low concurrency
+    /// (each read then fetches only a message or two) this caps how fast the host reads. Raise it for throughput:
+    /// </para>
+    /// <code>
+    /// builder.Services.AddPgmq(o => o.MaxConcurrentReads = 16);
+    /// </code>
+    /// </summary>
+    public int MaxConcurrentReads { get; set; } = 1;
+
+    /// <summary>
     /// Wake an idle read loop as soon as a message is inserted, through PostgreSQL LISTEN/NOTIFY
-    /// (<c>pgmq.enable_notify_insert</c>). On by default. While notifications are not live (the listener connection is
-    /// down or reconnecting, or the database refused to create the trigger), the queue falls back to
-    /// <see cref="LongPollTimeout"/>. Uses one extra connection per host. A consumer can turn it on or off for itself at
-    /// registration.
+    /// (<c>pgmq.enable_notify_insert</c>). On by default. Uses one extra connection per host, opened outside the pool
+    /// so it never takes a pool slot. While notifications are not live (the listener is down or reconnecting, or the
+    /// database refused the trigger), the sweeper looks for work every <see cref="MinIdleDelay"/> to about 1 s instead
+    /// of every <see cref="MaxIdleDelay"/>. A consumer can turn it on or off for itself at registration.
     /// </summary>
     public bool UseInsertNotifications { get; set; } = true;
 
@@ -131,13 +151,12 @@ public sealed class PgmqOptions
     public TimeSpan InsertNotificationThrottle { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// The fallback when insert notifications are not live for a queue: long-poll it inside PostgreSQL (pgmq's
-    /// <c>read_with_poll</c> family) for up to this long, checking every <see cref="MinIdleDelay"/>. Holds a connection
-    /// per queue while it waits. Null polls from the application instead, backing off to <see cref="MaxIdleDelay"/>.
-    /// Not used by <see cref="ConsumerOptionsAttribute.AtMostOnce"/> consumers, which pgmq cannot long-poll. Must be
-    /// shorter than <see cref="StallAfter"/>.
+    /// Ignored. Queues no longer long-poll, which held a connection per queue: the sweeper finds work for every queue
+    /// on one connection (see <see cref="MinIdleDelay"/>). Kept so that code setting it still compiles.
     /// </summary>
-    public TimeSpan? LongPollTimeout { get; set; } = TimeSpan.FromSeconds(5);
+    [Obsolete("Ignored: idle queues no longer long-poll. The sweeper finds work for every queue on one connection; " +
+              "see MinIdleDelay and MaxIdleDelay. This property will be removed in 3.0.")]
+    public TimeSpan? LongPollTimeout { get; set; }
 
     /// <summary>
     /// How often to read every queue's depth and oldest message age (<c>pgmq.metrics_all</c>) for the
@@ -164,6 +183,13 @@ public sealed class PgmqOptions
 
     /// <summary>The queue name of a consumer without <see cref="QueueNameAttribute"/>. Null uses the default derivation.</summary>
     public Func<Type, string>? QueueNameFormatter { get; set; }
+
+    /// <summary>
+    /// How often a waiting read loop reports that it is alive: often enough that a quiet queue is never taken for a
+    /// stalled one.
+    /// </summary>
+    internal TimeSpan Heartbeat => TimeSpan.FromTicks(Math.Clamp(StallAfter.Ticks / 4,
+        TimeSpan.FromMilliseconds(10).Ticks, TimeSpan.FromSeconds(10).Ticks));
 
     /// <summary><see cref="ConnectionString"/> with <see cref="Database"/> applied; null with a data source.</summary>
     internal string? EffectiveConnectionString => ConnectionString is null || Database is null
@@ -201,10 +227,8 @@ public sealed class PgmqOptions
                 nameof(QueueMetricsInterval));
         }
 
-        if (LongPollTimeout is { } longPoll)
-        {
-            ArgumentOutOfRangeException.ThrowIfLessThan(longPoll, TimeSpan.FromSeconds(1), nameof(LongPollTimeout));
-            ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(longPoll, StallAfter, nameof(LongPollTimeout));
-        }
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentReads, 1, nameof(MaxConcurrentReads));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MinIdleDelay, TimeSpan.Zero, nameof(MinIdleDelay));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(StallAfter, TimeSpan.Zero, nameof(StallAfter));
     }
 }

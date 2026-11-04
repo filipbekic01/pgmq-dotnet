@@ -9,6 +9,9 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
 - **At-least-once delivery.** A message is deleted only after its consumer returns. Consumers should be idempotent.
 - **Independent queues.** Every queue has its own read loop and its own slots, so a full or slow queue never holds up
   another one. A slot frees as soon as its message is settled.
+- **Idle queues cost nothing.** A queue reads only when there is work: an insert notification, the sweeper finding a
+  visible message, or a read that just found some. An idle host holds two connections however many queues it has;
+  see [Connections](#connections).
 - **Leases.** A read message is hidden for `Lease` (30 s), renewed while its consumer runs. A long job keeps its
   message, and a crashed process gives it back within one lease.
 - **No consumer retries.** A consumer that throws, or runs past its timeout, has its message archived to
@@ -59,7 +62,7 @@ Npgsql and nothing else in between.
 | **Reading** | | | |
 | Read with a visibility timeout | `read` | ✅ | Worker, renewing the lease while the consumer runs; or `IPgmqQueueManager.ReadAsync` |
 | Conditional read (experimental) | `read(…, conditional)` | ✅ | `[ConsumerOptions(Filter = """{"region":"eu"}""")]`, or `PgmqReadOptions.Filter` |
-| Long poll | `read_with_poll` | ✅ | Worker, while notifications are not live (`PgmqOptions.LongPollTimeout`); or `PgmqReadOptions.PollTimeout` |
+| Long poll | `read_with_poll` | ✅ | `PgmqReadOptions.PollTimeout`. The worker does not long-poll, which held a connection per queue; the sweeper finds work instead |
 | FIFO, fill from the oldest group | `read_grouped`, `read_grouped_with_poll` | ✅ | `ReadMode = PgmqReadMode.Grouped`, group with `PgmqPublishOptions.GroupId`; or `PgmqReadOptions.Mode` for any FIFO read |
 | FIFO, round robin across groups | `read_grouped_rr`, `read_grouped_rr_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedRoundRobin` |
 | FIFO, head of each group | `read_grouped_head`, `read_grouped_head_with_poll` | ✅ | `ReadMode = PgmqReadMode.GroupedHead` |
@@ -133,13 +136,19 @@ int queues = await publisher.PublishToTopicAsync("orders.eu.created", new OrderC
 A queue gets its type when it is created. An existing queue keeps its type, and a warning is logged if the consumer
 asks for a different one. Filters match the JSON body as it is serialized, with camelCase property names.
 
-### Waking up: notifications and long polling
+### Waking up: notifications and the sweeper
 
-By default each queue sends a PostgreSQL notification on insert (LISTEN/NOTIFY), which wakes the idle consumer at
-once over one extra connection per host. A consumer still reads again after `MaxIdleDelay` in case a notification was
-throttled. While notifications are not live (the listener is reconnecting, or the database refused the trigger), the
-queue long-polls in the database instead (`read_with_poll`, up to `LongPollTimeout`). Set `LongPollTimeout = null` to
-poll from the application instead, or `UseInsertNotifications = false` to rely on long polling alone.
+An idle queue never reads on its own. By default each queue sends a PostgreSQL notification on insert
+(LISTEN/NOTIFY), which wakes its consumer at once; one connection per host listens for every queue, outside the pool.
+Besides it, one sweeper asks in a single query which queues have a visible message, and wakes only those. It catches
+what notifications never report: a delayed message whose time came, a released message, one back from a lapsed lease,
+and a lost or throttled notification. It runs every `MaxIdleDelay` (5 s) while notifications are live, so a delayed
+message is picked up within that long of its due time. While they are not (the listener is reconnecting,
+`UseInsertNotifications = false`, or the database refused the trigger) it runs every `MinIdleDelay` (200 ms), backing
+off to about a second while it finds nothing.
+
+A FIFO queue whose only visible message is held back by its group is woken by each sweep and reads nothing. That costs
+one empty read per sweep for that queue.
 
 ### Headers
 
@@ -234,9 +243,11 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `MaxAttempts` | `5` | Reads of a message that never finished (crash or shutdown) before it is archived without running. |
 | `Lease` / `RenewEvery` | 30 s / 10 s | |
 | `DrainGrace` / `AbandonAfter` | 20 s / 30 s | |
-| `MinIdleDelay` / `MaxIdleDelay` | 200 ms / 5 s | Polling of an empty queue; `MaxIdleDelay` is also the safety re-read while waiting for a notification. |
+| `MaxIdleDelay` | 5 s | How often the sweeper looks for work while notifications are live: the most a delayed or released message waits. |
+| `MinIdleDelay` | 200 ms | How often the sweeper looks for work while notifications are not live, backing off to about 1 s. |
+| `MaxConcurrentReads` | `1` | Reads at once across every queue in the host; raise it for throughput. See [Connections](#connections). |
 | `UseInsertNotifications` / `InsertNotificationThrottle` | `true` / 250 ms | Wake idle queues through LISTEN/NOTIFY. |
-| `LongPollTimeout` | 5 s | Long-poll empty queues in the database while notifications are not live. `null` polls from the application. |
+| `LongPollTimeout` | `null` | Obsolete and ignored; the sweeper replaced long polling. |
 | `QueueMetricsInterval` | `null` | How often to read queue depth and oldest message age for the `pgmq.queue.*` gauges. Off by default. |
 | `UnavailableHealthStatus` / `StalledHealthStatus` | `Unhealthy` | Use `Degraded` to keep a pod in service. |
 
@@ -255,6 +266,37 @@ public sealed class OrderHandler : IPgmqConsumer<OrderPlaced> { ... }
 ```
 
 Add `services.AddHealthChecks().AddPgmq()` for the health check.
+
+## Connections
+
+A host uses a fixed number of connections, whatever the number of queues:
+
+| | Connections |
+|---|---|
+| Insert listener | 1, outside the pool (none with `UseInsertNotifications = false`) |
+| Sweeper | 1, from the pool, for one short query at a time |
+| Reads | at most `MaxConcurrentReads` (1), across every queue |
+| Settles | one per message being deleted, archived or released at that moment, and per outbox commit |
+
+An idle host therefore holds 2. A busy one holds at most `MaxConcurrentReads` + the settles in flight + 2. Idle queues
+cost nothing because they never read on their own, and a busy queue holds a read slot only for its read, not while its
+messages run, so busy queues take turns. Lease renewals are one batched round trip for every queue each `RenewEvery`.
+
+`MaxConcurrentReads` is 1 by default: the fewest connections, but every read waits its turn, and each read is one round
+trip. With many busy queues of low concurrency, where each read fetches only a message or two, that caps throughput.
+Raise it when you need speed; on the benchmark (100 queues at concurrency 1), 16 matches the speed of reading every
+queue at once:
+
+```csharp
+builder.Services.AddPgmq(o => o.MaxConcurrentReads = 16);
+```
+
+`Max Pool Size` stays the ceiling and Pgmq never changes it; normally the pool never gets near it. Pgmq's pool keeps an
+idle connection for Npgsql's `Connection Idle Lifetime` (300 s) after a burst of settles before closing it.
+
+With a `DataSource` of your own, the listener's connection is built from that source's `ConnectionString`, which keeps
+the password only with `Persist Security Info=true`. When it cannot connect that way (no password, or a certificate or
+password provider set in code), the listener takes a pooled connection instead and logs a warning once.
 
 ## Telemetry
 
@@ -300,6 +342,10 @@ so a trace still continues into the consumer.
 | `pgmq.consumer.read_loop.restarts` | Counter | `{restart}` | queue, consumer |
 | `pgmq.consumer.lease_renewal.failures` | Counter | `{failure}` | queue, consumer, `error.type` |
 | `pgmq.consumer.settle.failures` | Counter | `{failure}` | queue, consumer, operation, `error.type` |
+| `pgmq.consumer.reads` | Counter | `{read}` | queue, consumer; every read, empty ones included |
+| `pgmq.reads.waiting` | UpDownCounter | `{read}` | reads queued for one of `MaxConcurrentReads` slots |
+| `pgmq.sweep.duration` | Histogram | `s` | `error.type` on failure |
+| `pgmq.sweep.woken` | Counter | `{queue}` | queues a sweep found work on |
 | `pgmq.queue.messages` | Gauge | `{message}` | queue; needs `QueueMetricsInterval` |
 | `pgmq.queue.messages.visible` | Gauge | `{message}` | queue; needs `QueueMetricsInterval` |
 | `pgmq.queue.oldest_message.age` | Gauge | `s` | queue; needs `QueueMetricsInterval` |

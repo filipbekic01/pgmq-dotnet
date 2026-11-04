@@ -4,9 +4,9 @@ namespace Pgmq.IntegrationTests;
 
 /// <summary>
 ///     Every pgmq read function the worker can call, against real PGMQ: the plain, grouped, round-robin and head reads,
-///     each with and without a long poll, and the conditional read with and without one. Each case checks the worker
-///     calls the function it should, and that what comes back is handled as that read promises. Needs a running Docker
-///     daemon.
+///     and the conditional read, each woken by insert notifications and by the sweeper alone. Each case checks that what
+///     comes back is handled as that read promises; which function the worker calls is checked in
+///     <c>Pgmq.Hosting.Tests</c>. Needs a running Docker daemon.
 /// </summary>
 public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
 {
@@ -17,18 +17,18 @@ public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
     [Theory]
-    [InlineData(PgmqReadMode.Grouped, false, "read_grouped")]
-    [InlineData(PgmqReadMode.Grouped, true, "read_grouped_with_poll")]
-    [InlineData(PgmqReadMode.GroupedRoundRobin, false, "read_grouped_rr")]
-    [InlineData(PgmqReadMode.GroupedRoundRobin, true, "read_grouped_rr_with_poll")]
-    [InlineData(PgmqReadMode.GroupedHead, false, "read_grouped_head")]
-    [InlineData(PgmqReadMode.GroupedHead, true, "read_grouped_head_with_poll")]
+    [InlineData(PgmqReadMode.Grouped, true)]
+    [InlineData(PgmqReadMode.Grouped, false)]
+    [InlineData(PgmqReadMode.GroupedRoundRobin, true)]
+    [InlineData(PgmqReadMode.GroupedRoundRobin, false)]
+    [InlineData(PgmqReadMode.GroupedHead, true)]
+    [InlineData(PgmqReadMode.GroupedHead, false)]
     public async Task A_grouped_queue_Should_handle_each_group_in_order_and_one_at_a_time(PgmqReadMode mode,
-        bool longPoll, string function)
+        bool notifications)
     {
-        string queue = $"t_fifo_{function}";
+        string queue = $"t_fifo_{mode.ToString().ToLowerInvariant()}_{(notifications ? "n" : "s")}";
         FifoConsumer.Reset();
-        await using TransportHarness harness = await StartAsync(typeof(FifoConsumer), queue, longPoll, c =>
+        await using TransportHarness harness = await StartAsync(typeof(FifoConsumer), queue, notifications, c =>
         {
             c.ReadMode = mode;
             c.Concurrency = 6;
@@ -63,16 +63,15 @@ public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         Assert.Equal(0, FifoConsumer.Overlaps);
         Assert.True(FifoConsumer.MaxGroupsAtOnce > 1, "groups should run in parallel");
         Assert.All(_probe.Deliveries, d => Assert.Equal(((FifoMessage)d.Message).Group, d.GroupId));
-        await Eventually.HoldsAsync(() => db.CallsAsync(function), Within, $"the worker reads with pgmq.{function}");
     }
 
     [Theory]
-    [InlineData(false, "read")]
-    [InlineData(true, "read_with_poll")]
-    public async Task A_filtered_consumer_Should_read_only_the_messages_that_match(bool longPoll, string function)
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_filtered_consumer_Should_read_only_the_messages_that_match(bool notifications)
     {
-        string queue = $"t_filtered_{function}";
-        await using TransportHarness harness = await StartAsync(typeof(FilteredConsumer), queue, longPoll);
+        string queue = $"t_filtered_{(notifications ? "notified" : "swept")}";
+        await using TransportHarness harness = await StartAsync(typeof(FilteredConsumer), queue, notifications);
 
         await harness.Bus.PublishAsync(new FilteredMessage("us", 1), Ct);
         await harness.Bus.PublishAsync(new FilteredMessage("eu", 2), Ct);
@@ -81,28 +80,16 @@ public sealed class ReadModeTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await Task.Delay(TimeSpan.FromSeconds(1), Ct);
         Assert.Equal(2, Assert.IsType<FilteredMessage>(Assert.Single(_probe.Deliveries).Message).Id);
         Assert.Equal(1, await db.CountAsync(queue));
-        await Eventually.HoldsAsync(() => db.CallsAsync(function), Within, $"the worker reads with pgmq.{function}");
     }
 
     /// <summary>
-    ///     Starts <paramref name="consumer"/> on <paramref name="queue"/>, set so that every read is a long poll, or
-    ///     none is: without notifications a queue always long-polls, and without a poll timeout it never does.
+    ///     Starts <paramref name="consumer"/> on <paramref name="queue"/>, woken by insert notifications, or by the
+    ///     sweeper alone.
     /// </summary>
-    private Task<TransportHarness> StartAsync(Type consumer, string queue, bool longPoll,
+    private Task<TransportHarness> StartAsync(Type consumer, string queue, bool notifications = true,
         Action<PgmqConsumerOptions>? configure = null)
         => TransportHarness.StartAsync(db, _probe, [consumer],
-            o =>
-            {
-                if (longPoll)
-                {
-                    o.UseInsertNotifications = false;
-                    o.LongPollTimeout = TimeSpan.FromSeconds(1);
-                }
-                else
-                {
-                    o.LongPollTimeout = null;
-                }
-            },
+            o => o.UseInsertNotifications = notifications,
             configureConsumers: c =>
             {
                 c.QueueName = queue;

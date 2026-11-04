@@ -121,7 +121,7 @@ internal sealed class QueueSetup(
             }
             else
             {
-                logger.LogInformation("Queue {Queue} has no insert notifications; it long-polls instead",
+                logger.LogInformation("Queue {Queue} has no insert notifications; the sweeper finds its messages instead",
                     consumer.QueueName);
             }
         }
@@ -164,8 +164,9 @@ internal sealed class QueueSetup(
             catch (PostgresException ex)
             {
                 // Notifications only make waking faster, so a database that refuses them (no right to create the
-                // trigger, say) leaves the queue on long polling rather than stopping the host.
-                logger.LogWarning(ex, "Insert notifications for {Queue} could not be turned on; it long-polls instead",
+                // trigger, say) leaves the queue to the sweeper rather than stopping the host.
+                logger.LogWarning(ex, "Insert notifications for {Queue} could not be turned on; the sweeper finds " +
+                                      "its messages instead",
                     queue);
             }
         }

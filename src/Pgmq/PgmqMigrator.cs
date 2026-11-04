@@ -409,7 +409,8 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
         return new(parsed.Major, parsed.Minor, Math.Max(parsed.Build, 0));
     }
 
-    private static string QuoteIdentifier(string name) => "\"" + name.Replace("\"", "\"\"") + "\"";
+    /// <summary>A PostgreSQL identifier, double-quoted, with any double quote in it doubled.</summary>
+    internal static string QuoteIdentifier(string name) => "\"" + name.Replace("\"", "\"\"") + "\"";
 
     private sealed record State(
         string? ExtensionVersion,

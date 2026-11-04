@@ -43,20 +43,27 @@ so each consumer retries, fails and archives independently of the others. The co
 
 One read loop per queue, each with its own semaphore of slots:
 
-1. Wait for a free slot, take every free slot, and read that many messages with a short visibility timeout (the
-   lease).
-2. Run each message on its own task. While it runs, one call per queue renews the leases of everything running.
-3. Decide the outcome first, then write it to the queue with its own retries: delete on success (in one
+1. Wait for a reason to read: an insert notification, the sweeper, or a previous read that found messages. An idle
+   loop waits here without touching the database.
+2. Wait for a free slot, take every free slot, and read that many messages with a short visibility timeout (the
+   lease). The read itself takes one of `MaxConcurrentReads` slots shared by the whole host, held only while it runs.
+3. Run each message on its own task. While it runs, one batched call for every queue renews the leases of everything
+   running.
+4. Decide the outcome first, then write it to the queue with its own retries: delete on success (in one
    transaction with what the consumer published, when it published anything); archive on a failure or a timeout.
    A consumer is never run again because it failed. A failed
    write is never mistaken for a failed consumer.
-4. Free the slot.
+5. Free the slot.
 
-An empty queue waits for an insert notification: one connection per host LISTENs to every queue, and a notification
-ends the wait (with a safety re-read after `MaxIdleDelay`). While that connection is down or a queue has no trigger,
-the read itself waits in the database for up to `LongPollTimeout`. Only when neither is possible does the loop poll,
-backing off from `MinIdleDelay` to `MaxIdleDelay`. A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the
-health check read.
+Nothing an idle queue does grows with the number of queues. One connection per host LISTENs to every queue, outside
+the pool, and a notification wakes that queue's loop. One sweeper asks, in a single query for every queue, which have
+a visible message, and wakes only those: every `MaxIdleDelay` while notifications are live, to catch delayed messages
+whose time came, released messages, lapsed leases and lost notifications; every `MinIdleDelay` to about a second while
+they are not. The listener and the sweeper start before the read loops, which start waiting, so starting the host is one
+query, and a listener that comes back runs one sweep rather than waking every queue. An idle host holds two
+connections; a busy one at most `MaxConcurrentReads` plus the settles in flight plus those two.
+
+A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the health check read.
 
 Each consumer's settings pick the pgmq read function: `read` (with an optional conditional filter), one of the
 grouped FIFO reads, or `pop` for at-most-once. A grouped read can return several messages of one group; they run one
