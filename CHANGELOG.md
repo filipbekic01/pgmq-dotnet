@@ -5,9 +5,11 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-04
+
 A host now uses a fixed number of connections, whatever the number of queues: 2 while idle, at most
 `MaxConcurrentReads` + the settles in flight + 2 while busy. Before, it used about one per queue, and 64 queues could
-exhaust a server's `max_connections`. This changes behaviour, so it goes out as a minor version (2.2.0).
+exhaust a server's `max_connections`.
 
 ### Added
 
