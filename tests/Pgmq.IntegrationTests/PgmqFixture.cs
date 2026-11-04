@@ -74,22 +74,6 @@ public sealed class PgmqFixture : IAsyncLifetime
         return [.. ids.Order()];
     }
 
-    /// <summary>
-    ///     Whether a connection to this database is calling <c>pgmq.<paramref name="function"/></c>, or did last. An
-    ///     idle pooled connection still shows its last query, and a long poll shows while it waits.
-    /// </summary>
-    public async Task<bool> CallsAsync(string function)
-    {
-        await using NpgsqlConnection connection = new(ConnectionString);
-        await connection.OpenAsync();
-        await using NpgsqlCommand command = new(
-            "select count(*) from pg_stat_activity " +
-            "where datname = current_database() and pid <> pg_backend_pid() and position($1 in query) > 0",
-            connection);
-        command.Parameters.AddWithValue($"pgmq.{function}(");
-        return (long)(await command.ExecuteScalarAsync())! > 0;
-    }
-
     /// <summary>The column <paramref name="table"/> is partitioned by, or null when it is not partitioned.</summary>
     public async Task<string?> PartitionColumnAsync(string table)
         => (string?)await ScalarObjectAsync(
@@ -203,7 +187,6 @@ public sealed class TransportHarness : IAsyncDisposable
         options.DrainGrace = TimeSpan.FromMilliseconds(500);
         options.MinIdleDelay = TimeSpan.FromMilliseconds(50);
         options.MaxIdleDelay = TimeSpan.FromMilliseconds(200);
-        options.LongPollTimeout = TimeSpan.FromSeconds(2);
         options.StallAfter = TimeSpan.FromSeconds(5);
         return options;
     }

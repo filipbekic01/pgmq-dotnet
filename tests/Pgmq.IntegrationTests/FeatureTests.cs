@@ -54,12 +54,11 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
-    public async Task An_insert_notification_Should_wake_an_idle_queue_before_its_next_poll()
+    public async Task An_insert_notification_Should_wake_an_idle_queue_before_its_next_sweep()
     {
         await using TransportHarness harness = await StartAsync([typeof(NotifiedConsumer)], o =>
         {
             o.InsertNotificationThrottle = TimeSpan.Zero;
-            o.LongPollTimeout = null;
             o.MinIdleDelay = TimeSpan.FromSeconds(15);
             o.MaxIdleDelay = TimeSpan.FromSeconds(15);
             o.StallAfter = TimeSpan.FromMinutes(1);
@@ -72,16 +71,19 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await harness.Bus.PublishAsync(new NotifiedMessage(), Ct);
 
         await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, TimeSpan.FromSeconds(5),
-            "woken well before the 15 second poll");
+            "woken well before the 15 second sweep");
     }
 
     [Fact]
-    public async Task Insert_notifications_Should_be_on_by_default_with_long_polling_as_the_fallback()
+    public async Task Insert_notifications_Should_be_on_by_default_with_the_sweeper_as_the_fallback()
     {
         PgmqOptions defaults = new();
 
         Assert.True(defaults.UseInsertNotifications);
-        Assert.NotNull(defaults.LongPollTimeout);
+#pragma warning disable CS0618 // Obsolete: checks that the old option is off and ignored.
+        Assert.Null(defaults.LongPollTimeout);
+#pragma warning restore CS0618
+        Assert.Equal(1, defaults.MaxConcurrentReads);
 
         await using TransportHarness harness = await StartAsync(typeof(FallbackConsumer));
 
@@ -111,12 +113,11 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
-    public async Task A_lost_listener_Should_leave_the_queue_long_polling_until_it_reconnects()
+    public async Task A_lost_listener_Should_leave_the_queue_to_the_fast_sweep_until_it_reconnects()
     {
         await using TransportHarness harness = await StartAsync([typeof(FallbackConsumer)], o =>
         {
             o.InsertNotificationThrottle = TimeSpan.Zero;
-            o.LongPollTimeout = TimeSpan.FromSeconds(3);
             o.MinIdleDelay = TimeSpan.FromMilliseconds(100);
             o.MaxIdleDelay = TimeSpan.FromSeconds(15);
             o.StallAfter = TimeSpan.FromMinutes(1);
@@ -133,25 +134,24 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await harness.Bus.PublishAsync(new FallbackMessage(), Ct);
 
         await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, TimeSpan.FromSeconds(3),
-            "picked up by a long poll, before the listener reconnects or the 15 second poll");
+            "found by the fast sweep, before the listener reconnects or the 15 second sweep");
     }
 
     [Fact]
-    public async Task A_long_poll_Should_pick_up_a_message_while_the_database_waits()
+    public async Task Without_notifications_Should_find_a_message_by_the_fast_sweep()
     {
         await using TransportHarness harness = await StartAsync([typeof(LongPollConsumer)], o =>
         {
             o.UseInsertNotifications = false;
-            o.LongPollTimeout = TimeSpan.FromSeconds(3);
             o.MinIdleDelay = TimeSpan.FromMilliseconds(100);
             o.MaxIdleDelay = TimeSpan.FromSeconds(15);
         });
 
-        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
+        await Task.Delay(TimeSpan.FromSeconds(2), Ct);
         await harness.Bus.PublishAsync(new LongPollMessage(), Ct);
 
-        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, TimeSpan.FromSeconds(3),
-            "picked up by the poll in progress");
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, TimeSpan.FromSeconds(2),
+            "found within about a second, not after the 15 second sweep");
     }
 
     [Fact]

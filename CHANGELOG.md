@@ -5,6 +5,37 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+A host now uses a fixed number of connections, whatever the number of queues: 2 while idle, at most
+`MaxConcurrentReads` + the settles in flight + 2 while busy. Before, it used about one per queue, and 64 queues could
+exhaust a server's `max_connections`. This changes behaviour, so it goes out as a minor version (2.2.0).
+
+### Added
+
+- `PgmqOptions.MaxConcurrentReads` (default 1): reads at once across every queue in a host. A read holds its slot only
+  while it runs; settles, outbox commits and lease renewals do not count against it. The default favours connections
+  over speed: with many busy queues it caps throughput below 2.1.0's. Raise it (16 matches 2.1.0 on the benchmark) for
+  throughput.
+- A sweeper: one query for every queue finds which have a visible message and wakes only those, every `MaxIdleDelay`
+  while insert notifications are live and every `MinIdleDelay` to about 1 s while they are not.
+- Metrics `pgmq.consumer.reads`, `pgmq.reads.waiting`, `pgmq.sweep.duration` and `pgmq.sweep.woken`.
+- The guide has a Connections section.
+
+### Changed
+
+- Idle queues no longer read on their own. A queue reads when an insert notification or the sweeper wakes it, or right
+  after a read that found messages; the per-queue safety re-read every `MaxIdleDelay` is gone. Starting a host, and a
+  listener reconnecting, is one sweep instead of one read per queue.
+- The insert listener has a connection of its own outside the pool, so it never takes a pool slot or waits for one.
+  With `PgmqOptions.DataSource` it is built from that source's connection string, which keeps the password only with
+  `Persist Security Info=true`; failing that, the listener uses a pooled connection as before.
+- Leases of every queue are renewed in one batched round trip each `RenewEvery`, instead of one call per queue.
+- `MinIdleDelay` and `MaxIdleDelay` now set the sweeper's intervals.
+
+### Deprecated
+
+- `PgmqOptions.LongPollTimeout` is obsolete, defaults to `null` and is ignored: long polling held a connection per
+  queue, and the sweeper replaces it on one connection. It will be removed in 3.0.
+
 ## [2.1.0] - 2026-11-02
 
 ### Added

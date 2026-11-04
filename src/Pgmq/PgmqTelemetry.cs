@@ -67,6 +67,20 @@ public static class PgmqTelemetry
     internal static readonly Counter<long> LeaseRenewalFailures = Meter.CreateCounter<long>(
         "pgmq.consumer.lease_renewal.failures", "{failure}", "Lease renewals that failed.");
 
+    internal static readonly Counter<long> Reads = Meter.CreateCounter<long>(
+        "pgmq.consumer.reads", "{read}", "Reads of a queue by the worker, empty ones included.");
+
+    internal static readonly UpDownCounter<long> ReadsWaiting = Meter.CreateUpDownCounter<long>(
+        "pgmq.reads.waiting", "{read}",
+        "Reads waiting for a free slot of PgmqOptions.MaxConcurrentReads, the bound on reads at once per host.");
+
+    internal static readonly Histogram<double> SweepDuration = Meter.CreateHistogram(
+        "pgmq.sweep.duration", "s", "Duration of one sweep: the one query that finds which idle queues have work.",
+        tags: null, advice: DurationAdvice);
+
+    internal static readonly Counter<long> SweepWoken = Meter.CreateCounter<long>(
+        "pgmq.sweep.woken", "{queue}", "Queues a sweep found a visible message on, and woke.");
+
     internal static readonly Counter<long> SettleFailures = Meter.CreateCounter<long>(
         "pgmq.consumer.settle.failures", "{failure}",
         "Outcomes that could not be written to the queue; the message comes back after its lease.");

@@ -7,6 +7,12 @@ namespace Pgmq.Hosting;
 /// The data source Pgmq works through, kept under its own type so that it never clashes with an
 /// <see cref="NpgsqlDataSource"/> the application registers. One Pgmq builds from a connection string is disposed with
 /// it; one handed in through <see cref="PgmqOptions.DataSource"/> is left to its owner.
+/// <para>
+/// Beside it is an unpooled data source for the one LISTEN connection, so the listener never takes a pool slot and
+/// never waits for one when it reconnects. With a data source handed in, it is built from that source's connection
+/// string, which keeps the password only with <c>Persist Security Info=true</c>; the listener falls back to the pool
+/// when it cannot connect that way.
+/// </para>
 /// </summary>
 internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
 {
@@ -17,9 +23,23 @@ internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
         _owned = dataSource is null;
         DataSource = dataSource ?? Build(connectionString!);
         Server = ServerEndpoint.Of(DataSource);
+        ListenerDataSource = Build(new NpgsqlConnectionStringBuilder(connectionString ?? DataSource.ConnectionString)
+        {
+            Pooling = false,
+        }.ConnectionString);
+        ListenerIsDerived = dataSource is not null;
     }
 
     public NpgsqlDataSource DataSource { get; }
+
+    /// <summary>Unpooled: where the listener opens its one long-lived connection.</summary>
+    public NpgsqlDataSource ListenerDataSource { get; }
+
+    /// <summary>
+    /// The listener's data source was built from a handed-in data source's connection string, which may have lost its
+    /// password or anything else the application configured in code.
+    /// </summary>
+    public bool ListenerIsDerived { get; }
 
     /// <summary>The database server, for the <c>server.*</c> tags of Pgmq's spans and metrics.</summary>
     public ServerEndpoint Server { get; }
@@ -40,6 +60,7 @@ internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
 
     public void Dispose()
     {
+        ListenerDataSource.Dispose();
         if (_owned)
         {
             DataSource.Dispose();
@@ -48,6 +69,7 @@ internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
 
     public async ValueTask DisposeAsync()
     {
+        await ListenerDataSource.DisposeAsync();
         if (_owned)
         {
             await DataSource.DisposeAsync();

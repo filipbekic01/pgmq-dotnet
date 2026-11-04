@@ -42,18 +42,18 @@ namespace Pgmq.Hosting;
 /// the message is gone from the queue once read, so there is no lease to renew and nothing to settle.
 /// </para>
 /// <para>
-/// <b>Waking.</b> An idle queue with live insert notifications (LISTEN/NOTIFY) waits for one, and still reads again
-/// after <see cref="PgmqOptions.MaxIdleDelay"/> at the latest in case a notification was throttled or lost. When its
-/// notifications are not live (turned off, not set up, or the listener is reconnecting) it long-polls in the database
-/// for up to <see cref="PgmqOptions.LongPollTimeout"/>. A queue that cannot long-poll either (an at-most-once consumer,
-/// or <see cref="PgmqOptions.LongPollTimeout"/> null) polls from here, backing off to
-/// <see cref="PgmqOptions.MaxIdleDelay"/>.
+/// <b>Waking.</b> An idle queue never goes to the database on its own. Its read loop reads only when woken: by an
+/// insert notification (LISTEN/NOTIFY), by the <see cref="QueueSweeper"/>, which finds every queue with a visible
+/// message in one query, or because its last read found messages, so more are likely. Otherwise it waits. An idle host
+/// therefore holds two connections (the listener and the sweeper's) whatever the number of queues, and a busy one
+/// reads through at most <see cref="PgmqOptions.MaxConcurrentReads"/> connections at once.
 /// </para>
 /// </summary>
 internal sealed class ConsumerWorker(
     PgmqQueueManager queues,
     QueueReader reader,
     InsertListener listener,
+    QueueSweeper sweeper,
     ConsumerRegistry registry,
     PgmqPublisher publisher,
     IServiceScopeFactory scopeFactory,
@@ -64,7 +64,6 @@ internal sealed class ConsumerWorker(
 ) : BackgroundService
 {
     private static readonly TimeSpan RestartDelay = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan BeatEvery = TimeSpan.FromSeconds(10);
 
     private static readonly TimeSpan[] SettleRetries =
         [TimeSpan.FromMilliseconds(200), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)];
@@ -115,21 +114,32 @@ internal sealed class ConsumerWorker(
             _queues[consumer.QueueName] = new(consumer);
         }
 
-        List<Task> running =
-        [
-            .. registry.Consumers.Select(consumer =>
-                Task.Run(() => RunQueueAsync(_queues[consumer.QueueName], stoppingToken), CancellationToken.None)),
-        ];
+        // The listener and the sweeper come first. The read loops start waiting, and the first sweep wakes only the
+        // queues that have messages: starting costs one query, not one read per queue.
+        List<Task> background = [];
 
         Dictionary<string, Action> notified = registry.Consumers
             .Where(c => listener.IsEnabled(c.QueueName))
             .ToDictionary(c => c.QueueName, c => (Action)_queues[c.QueueName].Wake, StringComparer.Ordinal);
         if (notified.Count > 0)
         {
-            running.Add(Task.Run(() => listener.RunAsync(notified, stoppingToken), CancellationToken.None));
+            background.Add(Task.Run(() => listener.RunAsync(notified, sweeper.Nudge, stoppingToken),
+                CancellationToken.None));
         }
 
-        await Task.WhenAll(running);
+        SweptQueue[] swept = [.. registry.Consumers.Select(c => new SweptQueue(c, _queues[c.QueueName].Wake))];
+        background.Add(Task.Run(() => sweeper.RunAsync(swept, stoppingToken), CancellationToken.None));
+
+        using CancellationTokenSource renewalStop = new();
+        Task renewal = Task.Run(() => RenewLeasesAsync(renewalStop.Token), CancellationToken.None);
+
+        await Task.WhenAll(registry.Consumers.Select(consumer =>
+            Task.Run(() => RunQueueAsync(_queues[consumer.QueueName], stoppingToken), CancellationToken.None)));
+
+        // Every queue drained: nothing is leased any more.
+        await renewalStop.CancelAsync();
+        await renewal;
+        await Task.WhenAll(background);
     }
 
     public override void Dispose()
@@ -138,18 +148,18 @@ internal sealed class ConsumerWorker(
         base.Dispose();
     }
 
-    /// <summary>One queue for the life of the host: its read loop, kept alive, its lease renewal, and the drain.</summary>
+    /// <summary>One queue for the life of the host: its read loop, kept alive, and the drain.</summary>
     private async Task RunQueueAsync(QueueState state, CancellationToken stoppingToken)
     {
         ConsumerRegistration consumer = state.Consumer;
-        using CancellationTokenSource renewalStop = new();
-        Task renewal = RenewLeasesAsync(state, renewalStop.Token);
+        bool restarted = false;
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await ReadLoopAsync(state, stoppingToken);
+                // A loop started again reads at once, in case it failed with work waiting.
+                await ReadLoopAsync(state, readFirst: restarted, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -160,28 +170,43 @@ internal sealed class ConsumerWorker(
                 PgmqTelemetry.ReadLoopRestarts.Add(1,
                     PgmqTelemetry.ConsumerTags(consumer.QueueName, consumer.ConsumerType.Name));
                 await DelayQuietlyAsync(RestartDelay, stoppingToken);
+                restarted = true;
             }
         }
 
         // Shutting down: nothing new is read. Wait for what runs; it got the drain grace before its token cancels.
         state.Stopped = true;
         await Task.WhenAll(state.InFlight.Keys);
-        await renewalStop.CancelAsync();
-        await renewal;
     }
 
-    private async Task ReadLoopAsync(QueueState state, CancellationToken stoppingToken)
+    /// <summary>
+    /// Reads only when there is reason to: woken by a notification or the sweeper, or right after a read that found
+    /// messages. An idle queue waits here and costs the database nothing.
+    /// </summary>
+    private async Task ReadLoopAsync(QueueState state, bool readFirst, CancellationToken stoppingToken)
     {
         string queue = state.Consumer.QueueName;
-        TimeSpan idleDelay = options.MinIdleDelay;
+        TimeSpan heartbeat = options.Heartbeat;
+        bool readNext = readFirst;
 
         while (!stoppingToken.IsCancellationRequested)
         {
             state.Beat();
 
+            // Nothing suggests work: wait to be woken. The loop is alive while it waits, so it keeps beating.
+            if (!readNext)
+            {
+                while (!await state.Woken.WaitAsync(heartbeat, stoppingToken))
+                {
+                    state.Beat();
+                }
+
+                state.Beat();
+            }
+
             // Wait for one free slot, then take every other one that is free, and read that many. While every slot is
             // busy the loop is still alive, so it keeps beating.
-            while (!await state.Slots.WaitAsync(BeatEvery, stoppingToken))
+            while (!await state.Slots.WaitAsync(heartbeat, stoppingToken))
             {
                 state.Beat();
             }
@@ -192,13 +217,10 @@ internal sealed class ConsumerWorker(
                 free++;
             }
 
-            // Notifications first; long polling only while they are not live.
-            bool longPoll = !listener.IsLive(queue) && reader.CanLongPoll(state.Consumer);
-
             List<QueueMessage> messages;
             try
             {
-                messages = await reader.ReadAsync(state.Consumer, LeaseSeconds, free, longPoll, stoppingToken);
+                messages = await reader.ReadAsync(state.Consumer, LeaseSeconds, free, state.Beat, stoppingToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
             {
@@ -208,6 +230,7 @@ internal sealed class ConsumerWorker(
                 failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
                 PgmqTelemetry.ReadFailures.Add(1, failed);
                 await Task.Delay(options.MaxIdleDelay, stoppingToken);
+                readNext = true;
                 continue;
             }
             catch
@@ -216,32 +239,20 @@ internal sealed class ConsumerWorker(
                 throw;
             }
 
+            PgmqTelemetry.Reads.Add(1, state.Tags);
+
             if (messages.Count < free)
             {
                 state.Slots.Release(free - messages.Count);
             }
 
+            // A read that found messages is likely followed by more: read again as soon as a slot is free. One that
+            // found none waits to be woken.
+            readNext = messages.Count > 0;
             if (messages.Count == 0)
             {
-                if (longPoll)
-                {
-                    // The database already waited for a message.
-                    continue;
-                }
-
-                if (await state.Woken.WaitAsync(idleDelay, stoppingToken))
-                {
-                    idleDelay = options.MinIdleDelay;
-                }
-                else
-                {
-                    idleDelay = TimeSpan.FromTicks(Math.Min(idleDelay.Ticks * 2, options.MaxIdleDelay.Ticks));
-                }
-
                 continue;
             }
-
-            idleDelay = options.MinIdleDelay;
 
             if (PgmqTelemetry.ConsumedMessages.Enabled)
             {
@@ -645,33 +656,78 @@ internal sealed class ConsumerWorker(
         }
     }
 
-    /// <summary>Keeps every running message of a queue hidden, one batch call per queue per renewal.</summary>
-    private async Task RenewLeasesAsync(QueueState state, CancellationToken stop)
+    /// <summary>
+    /// Keeps every running message hidden: every <see cref="PgmqOptions.RenewEvery"/>, one round trip for all queues,
+    /// a <c>set_vt</c> per queue with leased messages in one batch.
+    /// </summary>
+    private async Task RenewLeasesAsync(CancellationToken stop)
     {
+        TimeSpan lease = TimeSpan.FromSeconds(LeaseSeconds);
+
         while (!stop.IsCancellationRequested)
         {
             try
             {
                 await Task.Delay(options.RenewEvery, stop);
-
-                long[] leased = [.. state.Leased.Keys];
-                if (leased.Length > 0)
-                {
-                    await queues.SetVisibilityTimeoutAsync(state.Consumer.QueueName, leased,
-                        TimeSpan.FromSeconds(LeaseSeconds), CancellationToken.None);
-                }
             }
-            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
                 return;
             }
-            catch (Exception ex)
+
+            List<(QueueState State, long[] Leased)> due =
+            [
+                .. _queues.Values
+                    .Select(q => (State: q, Leased: (long[])[.. q.Leased.Keys]))
+                    .Where(q => q.Leased.Length > 0),
+            ];
+            if (due.Count == 0)
             {
-                // One missed renewal is covered: the lease is three renewals long.
-                logger.LogWarning(ex, "Could not renew leases on {Queue}", state.Consumer.QueueName);
-                TagList failed = state.Tags;
-                failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
-                PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
+                continue;
+            }
+
+            try
+            {
+                await using NpgsqlBatch batch = database.DataSource.CreateBatch();
+                foreach ((QueueState state, long[] leased) in due)
+                {
+                    batch.BatchCommands.Add(new("select msg_id from pgmq.set_vt($1, $2, $3)")
+                    {
+                        Parameters =
+                        {
+                            new() { Value = state.Consumer.QueueName, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text },
+                            new()
+                            {
+                                Value = leased,
+                                NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Bigint,
+                            },
+                            new() { Value = LeaseSeconds, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Integer },
+                        },
+                    });
+                }
+
+                await batch.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+            catch (Exception batchFailure)
+            {
+                // A batch is one transaction: one broken queue fails them all. Renew one queue at a time instead, so
+                // the others keep their leases. One missed renewal is covered: the lease is three renewals long.
+                logger.LogDebug(batchFailure, "Renewing leases in one batch failed; renewing queue by queue");
+                foreach ((QueueState state, long[] leased) in due)
+                {
+                    try
+                    {
+                        await queues.SetVisibilityTimeoutAsync(state.Consumer.QueueName, leased, lease,
+                            CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "Could not renew leases on {Queue}", state.Consumer.QueueName);
+                        TagList failed = state.Tags;
+                        failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
+                        PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
+                    }
+                }
             }
         }
     }
@@ -705,7 +761,7 @@ internal sealed class ConsumerWorker(
         /// <summary>Every running handler, awaited on shutdown.</summary>
         public ConcurrentDictionary<Task, byte> InFlight { get; } = new();
 
-        /// <summary>Released by an insert notification, to end an idle wait early.</summary>
+        /// <summary>Released by an insert notification or the sweeper, to end an idle wait.</summary>
         public SemaphoreSlim Woken { get; } = new(0, 1);
 
         public void Beat() => Volatile.Write(ref LastBeat, Stopwatch.GetTimestamp());
