@@ -24,8 +24,9 @@ namespace Pgmq.Hosting;
 /// failed delete never runs a consumer again.
 /// </para>
 /// <para>
-/// <b>Shutdown.</b> Reading stops at once. Running consumers get <see cref="PgmqOptions.DrainGrace"/> to finish, then
-/// their token is cancelled and what stops on it goes straight back to the queue. One that still does not stop is
+/// <b>Shutdown.</b> Reading stops at once, and a message read but not yet started goes back to the queue. Running
+/// consumers get <see cref="PgmqOptions.DrainGrace"/> to finish (less, if the host's shutdown timeout runs out first),
+/// then their token is cancelled and what stops on it goes straight back to the queue. One that still does not stop is
 /// left to the host's shutdown timeout; its lease lapses and the message comes back.
 /// </para>
 /// <para>
@@ -142,9 +143,24 @@ internal sealed class ConsumerWorker(
         await Task.WhenAll(background);
     }
 
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        await base.StopAsync(cancellationToken);
+
+        // The base returns early only when the host's shutdown timeout ran out. If that came before the drain grace,
+        // cancel the consumers now, so what stops on its token still goes back to the queue instead of waiting out its
+        // lease.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            await _abort.CancelAsync();
+        }
+    }
+
     public override void Dispose()
     {
-        _abort.Dispose();
+        // _abort is cancelled, not disposed: a consumer the host gave up on may still be running, and its token comes
+        // from it.
+        _abort.Cancel();
         base.Dispose();
     }
 
@@ -281,11 +297,14 @@ internal sealed class ConsumerWorker(
 
     /// <summary>
     /// Runs messages one after another on their own task, freeing each one's slot when it is settled, whatever
-    /// happened. Once one does not succeed, or the host is stopping, the rest go back to the queue unhandled.
+    /// happened. Once one does not succeed, or the host is stopping, the rest go back to the queue unhandled. An
+    /// at-most-once message is already off the queue, so it runs even while the host stops: its consumer gets the
+    /// drain grace like any running one.
     /// </summary>
     private void Start(QueueState state, QueueMessage[] chain)
     {
-        if (!state.Consumer.AtMostOnce)
+        bool atMostOnce = state.Consumer.AtMostOnce;
+        if (!atMostOnce)
         {
             foreach (QueueMessage message in chain)
             {
@@ -298,7 +317,8 @@ internal sealed class ConsumerWorker(
             int next = 0;
             bool carryOn = true;
 
-            for (; next < chain.Length && carryOn; next++)
+            // Checked before each message, so one read just before shutdown goes back instead of starting.
+            for (; next < chain.Length && carryOn && (atMostOnce || !_stopping.IsCancellationRequested); next++)
             {
                 QueueMessage message = chain[next];
                 try
@@ -318,8 +338,6 @@ internal sealed class ConsumerWorker(
                     state.Leased.TryRemove(message.MsgId, out _);
                     state.Slots.Release();
                 }
-
-                carryOn &= !_stopping.IsCancellationRequested;
             }
 
             for (; next < chain.Length; next++)

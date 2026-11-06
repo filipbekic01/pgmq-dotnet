@@ -102,7 +102,8 @@ public sealed class PgmqOptions
 
     /// <summary>
     /// How long running consumers may finish after shutdown starts, before their token is cancelled. Keep it below the
-    /// host's shutdown timeout.
+    /// host's shutdown timeout, so a cancelled consumer has time to put its message back. If the host's timeout runs out
+    /// first, consumers are cancelled then.
     /// </summary>
     public TimeSpan DrainGrace { get; set; } = TimeSpan.FromSeconds(20);
 

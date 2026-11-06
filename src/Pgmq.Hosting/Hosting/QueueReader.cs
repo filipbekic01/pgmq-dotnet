@@ -49,7 +49,10 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
 
         try
         {
-            return await ReadNowAsync(consumer, leaseSeconds, quantity, cancellationToken);
+            // Once the read is sent it is not cancelled: a pop cancelled after it ran would lose its messages, and a
+            // read would leave them hidden for a lease with an attempt spent. A read is one short query, and the caller
+            // handles what it returns even while stopping.
+            return await ReadNowAsync(consumer, leaseSeconds, quantity, CancellationToken.None);
         }
         finally
         {

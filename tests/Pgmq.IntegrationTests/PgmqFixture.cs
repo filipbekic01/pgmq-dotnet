@@ -158,8 +158,11 @@ public sealed class TransportHarness : IAsyncDisposable
     public Task StartHostedAsync<T>() where T : IHostedService
         => _services.GetServices<IHostedService>().OfType<T>().Single().StartAsync(CancellationToken.None);
 
-    /// <summary>What a host does on shutdown: stop the worker and wait for its drain.</summary>
-    public async Task StopAsync()
+    /// <summary>
+    /// What a host does on shutdown: stop the worker and wait for its drain, giving up after
+    /// <paramref name="shutdownTimeout"/> (30 s by default) as a host does after its shutdown timeout.
+    /// </summary>
+    public async Task StopAsync(TimeSpan? shutdownTimeout = null)
     {
         if (_stopped)
         {
@@ -167,7 +170,7 @@ public sealed class TransportHarness : IAsyncDisposable
         }
 
         _stopped = true;
-        using CancellationTokenSource hostTimeout = new(TimeSpan.FromSeconds(30));
+        using CancellationTokenSource hostTimeout = new(shutdownTimeout ?? TimeSpan.FromSeconds(30));
         await Worker.StopAsync(hostTimeout.Token);
     }
 
