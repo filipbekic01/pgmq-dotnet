@@ -49,10 +49,7 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
 
         try
         {
-            // Once the read is sent it is not cancelled: a pop cancelled after it ran would lose its messages, and a
-            // read would leave them hidden for a lease with an attempt spent. A read is one short query, and the caller
-            // handles what it returns even while stopping.
-            return await ReadNowAsync(consumer, leaseSeconds, quantity, CancellationToken.None);
+            return await ReadNowAsync(consumer, leaseSeconds, quantity, cancellationToken);
         }
         finally
         {
@@ -63,7 +60,9 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
     private async Task<List<QueueMessage>> ReadNowAsync(ConsumerRegistration consumer, int leaseSeconds, int quantity,
         CancellationToken cancellationToken)
     {
-        await using NpgsqlCommand command = dataSource.CreateCommand(Sql(consumer));
+        // Getting a connection can be cancelled; nothing has been read yet.
+        await using NpgsqlConnection connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using NpgsqlCommand command = new(Sql(consumer), connection);
         command.Parameters.Add(new NpgsqlParameter { Value = consumer.QueueName, NpgsqlDbType = NpgsqlDbType.Text });
 
         if (!consumer.AtMostOnce)
@@ -78,10 +77,13 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
             command.Parameters.Add(new NpgsqlParameter { Value = consumer.Filter, NpgsqlDbType = NpgsqlDbType.Jsonb });
         }
 
-        await using NpgsqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        // Once sent, the read is not cancelled: a pop cancelled after it ran would lose its messages, and a read would
+        // leave them hidden for a lease with an attempt spent. It is one short query, and the caller handles what it
+        // returns even while stopping.
+        await using NpgsqlDataReader reader = await command.ExecuteReaderAsync(CancellationToken.None);
 
         List<QueueMessage> messages = [];
-        while (await reader.ReadAsync(cancellationToken))
+        while (await reader.ReadAsync(CancellationToken.None))
         {
             messages.Add(new(
                 reader.GetInt64(0),

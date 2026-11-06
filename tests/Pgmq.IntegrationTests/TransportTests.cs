@@ -170,9 +170,8 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         // The host gives up long before the drain grace ends: the consumer is cancelled then, not left holding it.
         await harness.StopAsync(TimeSpan.FromMilliseconds(500));
 
-        await Eventually.HoldsAsync(
-            async () => (await harness.Queues.GetMetricsAsync("t_hanging", Ct)).VisibleLength == 1, Within,
-            "released");
+        // Back on the queue by the time the stop returns, before the host would dispose the data source or exit.
+        Assert.Equal(1, (await harness.Queues.GetMetricsAsync("t_hanging", Ct)).VisibleLength);
         await harness.DisposeAsync();
     }
 

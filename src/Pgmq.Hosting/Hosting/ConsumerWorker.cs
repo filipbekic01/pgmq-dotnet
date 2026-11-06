@@ -66,6 +66,9 @@ internal sealed class ConsumerWorker(
 {
     private static readonly TimeSpan RestartDelay = TimeSpan.FromSeconds(5);
 
+    /// <summary>How long a stop the host gave up on still waits for cancelled consumers to put their messages back.</summary>
+    private static readonly TimeSpan ReleaseWindow = TimeSpan.FromSeconds(5);
+
     private static readonly TimeSpan[] SettleRetries =
         [TimeSpan.FromMilliseconds(200), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)];
 
@@ -150,17 +153,38 @@ internal sealed class ConsumerWorker(
         // The base returns early only when the host's shutdown timeout ran out. If that came before the drain grace,
         // cancel the consumers now, so what stops on its token still goes back to the queue instead of waiting out its
         // lease.
-        if (cancellationToken.IsCancellationRequested)
+        if (cancellationToken.IsCancellationRequested && ExecuteTask is { IsCompleted: false } running)
         {
             await _abort.CancelAsync();
+
+            // Returning now would let the host dispose the data source, or exit, before those messages are written
+            // back. Wait a little for the drain; a consumer that ignores its token is still left to its lease.
+            try
+            {
+                await running.WaitAsync(ReleaseWindow, CancellationToken.None);
+            }
+            catch (TimeoutException)
+            {
+            }
+            catch (OperationCanceledException)
+            {
+            }
         }
     }
 
     public override void Dispose()
     {
         // _abort is cancelled, not disposed: a consumer the host gave up on may still be running, and its token comes
-        // from it.
-        _abort.Cancel();
+        // from it. A callback a consumer registered on that token must not break the container's disposal.
+        try
+        {
+            _abort.Cancel();
+        }
+        catch (AggregateException ex)
+        {
+            logger.LogWarning(ex, "A consumer's cancellation callback failed while the worker was disposed");
+        }
+
         base.Dispose();
     }
 
