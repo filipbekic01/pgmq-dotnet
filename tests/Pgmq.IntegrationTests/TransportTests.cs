@@ -160,6 +160,22 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task On_shutdown_a_host_timeout_shorter_than_the_drain_grace_Should_still_cancel_and_release()
+    {
+        TransportHarness harness = await StartAsync(o => o.DrainGrace = TimeSpan.FromMinutes(5),
+            typeof(HangingConsumer));
+        await harness.Bus.PublishAsync(new HangingMessage(HonoursToken: true), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running");
+
+        // The host gives up long before the drain grace ends: the consumer is cancelled then, not left holding it.
+        await harness.StopAsync(TimeSpan.FromMilliseconds(500));
+
+        // Back on the queue by the time the stop returns, before the host would dispose the data source or exit.
+        Assert.Equal(1, (await harness.Queues.GetMetricsAsync("t_hanging", Ct)).VisibleLength);
+        await harness.DisposeAsync();
+    }
+
+    [Fact]
     public async Task A_scheduled_publish_Should_arrive_after_its_delay_and_not_before()
     {
         await using TransportHarness harness = await StartAsync(typeof(FanOutFirstConsumer));

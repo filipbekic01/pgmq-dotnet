@@ -5,6 +5,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A host whose shutdown timeout runs out before `DrainGrace` now cancels its running consumers then, so their messages
+  go back to the queue instead of staying hidden until their lease lapses.
+- On shutdown, a message read but not yet started goes back to the queue instead of starting its consumer.
+- A read already sent is no longer cancelled by shutdown: a cancelled `pop` could lose its messages, and a cancelled
+  read spent an attempt and hid its messages for a lease.
+- A consumer still running after the host gave up no longer fails with `ObjectDisposedException`.
+
 ## [2.2.0] - 2026-11-04
 
 A host now uses a fixed number of connections, whatever the number of queues: 2 while idle, at most
