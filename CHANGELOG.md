@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-06
+
 ### Fixed
 
 - A host whose shutdown timeout runs out before `DrainGrace` now cancels its running consumers then, so their messages
