@@ -26,6 +26,19 @@ public sealed class PublisherTests
     }
 
     [Fact]
+    public async Task A_publish_to_several_queues_Should_be_one_transaction_and_to_one_queue_none()
+    {
+        _topology.Subscribe(typeof(Ping), "first");
+        await Publisher.PublishAsync(new Ping(1), Ct);
+        Assert.Equal(0, _sender.Transactions);
+
+        _topology.Subscribe(typeof(Ping), "second");
+        await Publisher.PublishAsync(new Ping(2), Ct);
+        await Publisher.PublishBatchAsync([new Ping(3), new Ping(4)], Ct);
+        Assert.Equal(2, _sender.Transactions);
+    }
+
+    [Fact]
     public async Task A_message_nobody_subscribes_to_Should_write_nothing()
     {
         await Publisher.PublishAsync(new Ping(1), Ct);
@@ -182,6 +195,14 @@ public sealed class PublisherTests
         public IReadOnlyList<string> BatchTopicQueues { get; set; } = [];
 
         public int Calls { get; private set; }
+
+        public int Transactions { get; private set; }
+
+        public Task AllOrNothingAsync(Func<IPgmqSender, Task> sends, CancellationToken cancellationToken)
+        {
+            Transactions++;
+            return sends(this);
+        }
 
         public Task<long> SendAsync(string queueName, string body, IReadOnlyDictionary<string, object> headers,
             DateTimeOffset? deliverAt, CancellationToken cancellationToken)

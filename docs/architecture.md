@@ -37,7 +37,8 @@ The core never references the hosting package.
 ## Durable fan-out
 
 Each consumer is a separate logical subscription with its own queue. Publishing writes one copy per subscribed queue,
-so each consumer retries, fails and archives independently of the others. The copies are separate writes.
+so each consumer retries, fails and archives independently of the others. The copies are written in one transaction:
+every subscribed queue gets the message, or none does.
 
 ## The worker
 
