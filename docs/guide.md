@@ -388,7 +388,8 @@ builder.ConfigureTracing(t => t
 ## Limitations
 
 - **No transactional outbox with your own database writes.** A publish to several queues is one transaction of its
-  own, and a topic publish is one statement, but neither joins your application's transaction. Inside a consumer,
+  own (or joins an ambient `TransactionScope`), and a topic publish is one statement, but neither joins an
+  `NpgsqlTransaction` of your application's. Inside a consumer,
   everything published through its context commits in one transaction with the delete of its message.
 - **Archives grow** on standard and unlogged queues. Partitioned queues drop old partitions; `ConvertArchivePartitionedAsync`
   partitions an existing archive.

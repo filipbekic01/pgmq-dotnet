@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Transactions;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 
@@ -21,6 +22,11 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     [Fact]
     public async Task A_publish_to_several_queues_Should_reach_all_of_them_or_none()
     {
+        await using (NpgsqlDataSource setup = NpgsqlDataSource.Create(db.ConnectionString))
+        {
+            await new PgmqMigrator(setup).MigrateAsync(cancellationToken: Ct);
+        }
+
         await db.Queues.EnsureQueueAsync("t_fan_a", cancellationToken: Ct);
         await db.Queues.EnsureQueueAsync("t_fan_b", cancellationToken: Ct);
         await db.ResetAsync("t_fan_a");
@@ -48,6 +54,44 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
             new PgmqPublisher(dataSource, broken, NullLogger<PgmqPublisher>.Instance)
                 .PublishBatchAsync([new FanOut(3), new FanOut(4)], Ct));
         Assert.Equal(1, await db.CountAsync("t_fan_a"));
+    }
+
+    [Fact]
+    public async Task A_publish_to_several_queues_inside_a_TransactionScope_Should_commit_and_roll_back_with_it()
+    {
+        await using (NpgsqlDataSource setup = NpgsqlDataSource.Create(db.ConnectionString))
+        {
+            await new PgmqMigrator(setup).MigrateAsync(cancellationToken: Ct);
+        }
+
+        await db.Queues.EnsureQueueAsync("t_scope_a", cancellationToken: Ct);
+        await db.Queues.EnsureQueueAsync("t_scope_b", cancellationToken: Ct);
+        await db.ResetAsync("t_scope_a");
+        await db.ResetAsync("t_scope_b");
+
+        await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
+        PgmqTopology both = new();
+        both.Subscribe(typeof(FanOut), "t_scope_a");
+        both.Subscribe(typeof(FanOut), "t_scope_b");
+        PgmqPublisher publisher = new(dataSource, both, NullLogger<PgmqPublisher>.Instance);
+
+        using (TransactionScope rolledBack = new(TransactionScopeAsyncFlowOption.Enabled))
+        {
+            await publisher.PublishAsync(new FanOut(1), Ct);
+        }
+
+        Assert.Equal(0, await db.CountAsync("t_scope_a"));
+        Assert.Equal(0, await db.CountAsync("t_scope_b"));
+
+        using (TransactionScope committed = new(TransactionScopeAsyncFlowOption.Enabled))
+        {
+            await publisher.PublishAsync(new FanOut(2), Ct);
+            await publisher.PublishBatchAsync([new FanOut(3), new FanOut(4)], Ct);
+            committed.Complete();
+        }
+
+        Assert.Equal(3, await db.CountAsync("t_scope_a"));
+        Assert.Equal(3, await db.CountAsync("t_scope_b"));
     }
 
     public sealed record FanOut(int Id);

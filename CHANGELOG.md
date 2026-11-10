@@ -9,7 +9,8 @@ All notable changes to this project are recorded here. The format follows
 
 - A publish to several queues is now one transaction: every subscribed queue gets the message, or none does. Before, a
   failure part way left some queues with it and others without, and a retry duplicated it in the first ones. It also
-  takes one connection instead of one per queue. `PublishBatchAsync` likewise.
+  takes one connection from the pool instead of one per queue. `PublishBatchAsync` likewise. Inside a
+  `TransactionScope`, the scope's transaction is used instead.
 - The insert listener pings its connection after 30 s of quiet, so a connection that died without closing (a NAT or
   load balancer idle timeout, a failover) is noticed and opened again. Before, it waited forever, still counted as
   live, and new messages waited for the sweeper (up to `MaxIdleDelay`).

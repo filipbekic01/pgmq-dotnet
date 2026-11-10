@@ -718,8 +718,12 @@ internal sealed class ConsumerWorker(
     /// </summary>
     private async Task ReleaseAsync(string queue, long messageId, TimeSpan delay, CancellationToken cancellationToken)
     {
-        await _renewing.WaitAsync(cancellationToken);
-        _renewing.Release();
+        // Bounded: a renewal falling back queue by queue during an outage could hold it for minutes, and a release on
+        // shutdown cannot wait that long. Past the bound the race is back, at worst hiding the message for a lease.
+        if (await _renewing.WaitAsync(options.RenewEvery, cancellationToken))
+        {
+            _renewing.Release();
+        }
         await queues.SetVisibilityTimeoutAsync(queue, messageId, delay, cancellationToken);
     }
 

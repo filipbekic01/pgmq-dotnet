@@ -124,9 +124,10 @@ internal sealed class PgmqSender : IPgmqSender
 
     public async Task AllOrNothingAsync(Func<IPgmqSender, Task> sends, CancellationToken cancellationToken)
     {
-        if (_transaction is not null)
+        // Already in a transaction, ours or an ambient TransactionScope the connections enlist in: it commits or rolls
+        // back as one, and a transaction of our own on an enlisted connection would be refused.
+        if (_transaction is not null || System.Transactions.Transaction.Current is not null)
         {
-            // Already in a transaction: it commits or rolls back as one.
             await sends(this);
             return;
         }
