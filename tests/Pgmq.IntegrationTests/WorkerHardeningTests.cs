@@ -72,6 +72,28 @@ public sealed class WorkerHardeningTests(PgmqFixture db) : IClassFixture<PgmqFix
     }
 
     [Fact]
+    public async Task A_message_whose_lease_lapsed_Should_not_be_started_again_by_the_host_still_handling_it()
+    {
+        using TelemetryCapture telemetry = new();
+        await using TransportHarness harness = await StartAsync(typeof(RereadConsumer));
+        await harness.Bus.PublishAsync(new Reread(), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running");
+
+        // What a database that was away for longer than a lease leaves: the message visible again, a slot free.
+        await db.ScalarObjectAsync("update pgmq.q_t_reread set vt = clock_timestamp()");
+
+        await Eventually.HoldsAsync(() => telemetry.Sum("pgmq.consumer.leases.lost", "t_reread") == 1, Within,
+            "read again, and reported");
+        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
+        Assert.Single(_probe.Deliveries);
+
+        _probe.Open("reread");
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_reread") == 0, Within, "settled once");
+        Assert.Single(_probe.Deliveries);
+        Assert.Equal(1, telemetry.Sum("pgmq.consumer.leases.lost", "t_reread"));
+    }
+
+    [Fact]
     public async Task Messages_that_waited_behind_a_failed_one_Should_not_have_the_wait_counted_as_an_attempt()
     {
         await using (TransportHarness stopped = await StartAsync(typeof(BatchedGroupConsumer)))
@@ -166,6 +188,19 @@ public sealed class WorkerHardeningTests(PgmqFixture db) : IClassFixture<PgmqFix
         {
             probe.Record(nameof(LostLeaseConsumer), context.Message, context);
             await probe.Gate("lost-lease").WaitAsync(cancellationToken);
+        }
+    }
+
+    public sealed record Reread;
+
+    [QueueName("t_reread")]
+    [ConsumerOptions(Concurrency = 2)]
+    public sealed class RereadConsumer(Probe probe) : IPgmqConsumer<Reread>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<Reread> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(RereadConsumer), context.Message, context);
+            await probe.Gate("reread").WaitAsync(cancellationToken);
         }
     }
 

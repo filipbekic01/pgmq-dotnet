@@ -65,6 +65,20 @@ internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
         catch (Exception ex) when (ListenerIsDerived && ex is not OperationCanceledException)
         {
             NpgsqlConnection pooled = await DataSource.OpenConnectionAsync(cancellationToken);
+
+            // The pool hands out an idle connection untested. Only if it works is the unpooled source at fault and
+            // not the database: while the database is away, both fail, and nothing is decided.
+            try
+            {
+                await using NpgsqlCommand ping = new("select 1", pooled);
+                await ping.ExecuteNonQueryAsync(cancellationToken);
+            }
+            catch
+            {
+                await pooled.DisposeAsync();
+                throw;
+            }
+
             _dedicatedOnPool = true;
             logger.LogWarning(ex, "Could not open a connection outside the pool from the data source's connection " +
                                   "string, which keeps the password only with Persist Security Info=true; the " +

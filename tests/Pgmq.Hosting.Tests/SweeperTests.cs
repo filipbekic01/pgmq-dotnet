@@ -80,6 +80,10 @@ public sealed class SweeperTests
     }
 
     [Fact]
+    public void An_infinite_drain_grace_Should_be_allowed()
+        => new PgmqOptions { ConnectionString = "Host=h", DrainGrace = Timeout.InfiniteTimeSpan }.Validate();
+
+    [Fact]
     public void Headers_nested_too_deep_to_parse_Should_count_as_none_instead_of_failing_the_read()
     {
         string deep = string.Concat(Enumerable.Repeat("{\"a\":", 100)) + "1" + new string('}', 100);

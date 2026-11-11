@@ -13,7 +13,10 @@ All notable changes to this project are recorded here. The format follows
 - A delete or archive that could not be written was given up after about six seconds, and the message had already
   stopped renewing its lease, so a database failover ran every consumer that finished during it a second time. The
   write is now tried for about two minutes and the message keeps its lease meanwhile. After shutdown cancelled the
-  consumers it is still tried for about six seconds only.
+  consumers it is still tried for about six seconds only. If the database stays away for longer than a lease, the
+  lease still runs out, as no renewal reaches it: a host then no longer starts a message again that it is still
+  handling, and renews one second after a failed renewal instead of a whole `RenewEvery` later, but another host
+  may still read the message first.
 - Lease renewals took their connection from the pool. With the pool used up they waited, then tried queue by queue,
   each waiting again, while every lease ran out and other instances read the messages. Renewals now have a connection
   of their own, outside the pool, open only while messages are handled; a try is bounded to half a `RenewEvery` and
@@ -39,8 +42,8 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
-- `RenewEvery`, `MaxIdleDelay` and `DefaultTimeout` must be above zero, and `DrainGrace` and `AbandonAfter` not
-  negative; setup throws otherwise. A negative `RenewEvery` used to end lease renewal silently.
+- `RenewEvery`, `MaxIdleDelay` and `DefaultTimeout` must be above zero, and `DrainGrace` (unless infinite) and
+  `AbandonAfter` not negative; setup throws otherwise. A negative `RenewEvery` used to end lease renewal silently.
 - A busy host holds one connection more, for lease renewals.
 
 ## [2.3.0] - 2026-11-11

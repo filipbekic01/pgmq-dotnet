@@ -228,7 +228,11 @@ public sealed class PgmqOptions
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(RenewEvery, Lease, nameof(RenewEvery));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(DefaultTimeout, TimeSpan.Zero, nameof(DefaultTimeout));
         ArgumentOutOfRangeException.ThrowIfLessThan(AbandonAfter, TimeSpan.Zero, nameof(AbandonAfter));
-        ArgumentOutOfRangeException.ThrowIfLessThan(DrainGrace, TimeSpan.Zero, nameof(DrainGrace));
+        if (DrainGrace != Timeout.InfiniteTimeSpan)
+        {
+            // Infinite never cancels running consumers: they are left to the host's shutdown timeout.
+            ArgumentOutOfRangeException.ThrowIfLessThan(DrainGrace, TimeSpan.Zero, nameof(DrainGrace));
+        }
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MaxIdleDelay, TimeSpan.Zero, nameof(MaxIdleDelay));
         ArgumentOutOfRangeException.ThrowIfLessThan(InsertNotificationThrottle, TimeSpan.Zero,
             nameof(InsertNotificationThrottle));

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Data;
 using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -161,17 +162,17 @@ internal sealed class ConsumerWorker(
             .ToDictionary(c => c.QueueName, c => (Action)_queues[c.QueueName].Wake, StringComparer.Ordinal);
         if (notified.Count > 0)
         {
-            background.Add(Task.Run(() => KeepRunningAsync("The insert listener",
+            background.Add(Task.Run(() => KeepRunningAsync("insert_listener",
                 () => listener.RunAsync(notified, sweeper.Nudge, options.InsertNotificationThrottle, stoppingToken),
                 stoppingToken), CancellationToken.None));
         }
 
         SweptQueue[] swept = [.. registry.Consumers.Select(c => new SweptQueue(c, _queues[c.QueueName].Wake))];
-        background.Add(Task.Run(() => KeepRunningAsync("The sweeper", () => sweeper.RunAsync(swept, stoppingToken),
+        background.Add(Task.Run(() => KeepRunningAsync("sweeper", () => sweeper.RunAsync(swept, stoppingToken),
             stoppingToken), CancellationToken.None));
 
         using CancellationTokenSource renewalStop = new();
-        Task renewal = Task.Run(() => KeepRunningAsync("Lease renewal", () => RenewLeasesAsync(renewalStop.Token),
+        Task renewal = Task.Run(() => KeepRunningAsync("lease_renewal", () => RenewLeasesAsync(renewalStop.Token),
             renewalStop.Token), CancellationToken.None);
 
         await Task.WhenAll(registry.Consumers.Select(consumer =>
@@ -245,7 +246,7 @@ internal sealed class ConsumerWorker(
             }
             catch (Exception ex)
             {
-                logger.LogCritical(ex, "{Task} failed; starting it again", what);
+                logger.LogCritical(ex, "The worker's {Task} task failed; starting it again", what);
                 PgmqTelemetry.BackgroundRestarts.Add(1, new KeyValuePair<string, object?>("pgmq.task", what));
             }
 
@@ -350,14 +351,30 @@ internal sealed class ConsumerWorker(
 
             PgmqTelemetry.Reads.Add(1, state.Tags);
 
+            // A read that found messages is likely followed by more: read again as soon as a slot is free. One that
+            // found none waits to be woken.
+            readNext = messages.Count > 0;
+
+            // A message this host still handles came back: its lease lapsed, most likely because the database was
+            // away for longer than a lease. It is not started again alongside itself; the handler that has it
+            // finishes and settles it, and this read just hid it for another lease.
+            HashSet<string>? heldGroups = null;
+            messages.RemoveAll(m =>
+            {
+                if (!StillHeld(state, m))
+                {
+                    return false;
+                }
+
+                (heldGroups ??= new(StringComparer.Ordinal)).Add(m.GroupId ?? "");
+                return true;
+            });
+
             if (messages.Count < free)
             {
                 state.Slots.Release(free - messages.Count);
             }
 
-            // A read that found messages is likely followed by more: read again as soon as a slot is free. One that
-            // found none waits to be woken.
-            readNext = messages.Count > 0;
             if (messages.Count == 0)
             {
                 continue;
@@ -373,9 +390,10 @@ internal sealed class ConsumerWorker(
             if (state.Consumer.IsGrouped)
             {
                 // One chain per FIFO group, in message order, so a group never runs two of its messages at once.
+                // A group with a message this host still handles waits for it: the rest go back unhandled.
                 foreach (IGrouping<string?, QueueMessage> group in messages.GroupBy(m => m.GroupId))
                 {
-                    Start(state, [.. group]);
+                    Start(state, [.. group], run: heldGroups?.Contains(group.Key ?? "") != true);
                 }
             }
             else
@@ -394,7 +412,10 @@ internal sealed class ConsumerWorker(
     /// at-most-once message is already off the queue, so it runs even while the host stops: its consumer gets the
     /// drain grace like any running one.
     /// </summary>
-    private void Start(QueueState state, QueueMessage[] chain)
+    /// <param name="state">The queue the messages were read from.</param>
+    /// <param name="chain">The messages, in the order they run.</param>
+    /// <param name="run">False to put every one of them back on the queue unhandled.</param>
+    private void Start(QueueState state, QueueMessage[] chain, bool run = true)
     {
         bool atMostOnce = state.Consumer.AtMostOnce;
         LeaseEntry?[] leases = new LeaseEntry?[chain.Length];
@@ -412,7 +433,7 @@ internal sealed class ConsumerWorker(
             bool carryOn = true;
 
             // Checked before each message, so one read just before shutdown goes back instead of starting.
-            for (; next < chain.Length && carryOn && (atMostOnce || !_stopping.IsCancellationRequested); next++)
+            for (; run && next < chain.Length && carryOn && (atMostOnce || !_stopping.IsCancellationRequested); next++)
             {
                 QueueMessage message = chain[next];
                 try
@@ -457,6 +478,22 @@ internal sealed class ConsumerWorker(
 
         state.InFlight.TryAdd(handling, 0);
         handling.ContinueWith(done => state.InFlight.TryRemove(done, out _), TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Whether this host still handles a message it has just read again, which means its lease lapsed. The read is
+    /// this host's own, so later renewals must not take its higher read count for another reader's.
+    /// </summary>
+    private bool StillHeld(QueueState state, QueueMessage message)
+    {
+        if (!state.Leased.TryGetValue(message.MsgId, out LeaseEntry? lease))
+        {
+            return false;
+        }
+
+        ReportLostLease(state, message.MsgId, lease, "was read again by this host while it still handles it");
+        lease.ReadCt = message.ReadCt;
+        return true;
     }
 
     /// <summary>
@@ -619,7 +656,8 @@ internal sealed class ConsumerWorker(
                 return Outcome.Lost("pgmq.shutdown");
             }
 
-            logger.LogInformation(ex, "{Consumer} stopped for shutdown; its message goes back to the queue",
+            logger.LogInformation(ex is OperationCanceledException ? null : ex,
+                "{Consumer} stopped for shutdown; its message goes back to the queue",
                 consumer.ConsumerType.Name);
             return Outcome.Released;
         }
@@ -792,14 +830,21 @@ internal sealed class ConsumerWorker(
         try
         {
             bool found = true;
-            await RetryAsync(async ct => found = settlement.Kind switch
+            int tries = 0;
+            await RetryAsync(async ct =>
             {
-                SettlementKind.Delete => await queues.DeleteMessageAsync(queue, message.MsgId, ct),
-                SettlementKind.Archive => await queues.ArchiveMessageAsync(queue, message.MsgId, ct),
-                _ => await ReleaseAsync(queue, message.MsgId, settlement, ct),
+                tries++;
+                found = settlement.Kind switch
+                {
+                    SettlementKind.Delete => await queues.DeleteMessageAsync(queue, message.MsgId, ct),
+                    SettlementKind.Archive => await queues.ArchiveMessageAsync(queue, message.MsgId, ct),
+                    _ => await ReleaseAsync(queue, message.MsgId, settlement, ct),
+                };
             }, settlement.Kind.ToString().ToLowerInvariant(), state, message);
 
-            if (!found)
+            // After a failed try the message may be gone because that try did go through and only its answer was
+            // lost; that is no lost lease.
+            if (!found && tries == 1)
             {
                 ReportLostLease(state, message.MsgId, lease,
                     $"was no longer on the queue when it came to {operation} it");
@@ -878,8 +923,10 @@ internal sealed class ConsumerWorker(
                 logger.LogWarning(ex, "Could not {What} message {MsgId} on {Queue}; trying again in {Delay}", what,
                     message.MsgId, state.Consumer.QueueName, SettleRetries[attempt]);
 
-                // Cut short when shutdown cancels the consumers: the host is about to give up, so try once more now.
-                await DelayQuietlyAsync(SettleRetries[attempt], _abort.Token);
+                // The long waits are cut short when shutdown cancels the consumers: the host is about to give up, so
+                // the write is tried once more at once. The first few are short, and kept even then.
+                await DelayQuietlyAsync(SettleRetries[attempt],
+                    attempt < SettleRetriesOnShutdown ? CancellationToken.None : _abort.Token);
             }
         }
     }
@@ -890,13 +937,18 @@ internal sealed class ConsumerWorker(
     /// </summary>
     private async Task RenewLeasesAsync(CancellationToken stop)
     {
+        // A renewal that failed is tried again soon, not a whole interval later: when the database comes back, leases
+        // that ran out meanwhile are renewed before the read loops, here and in other hosts, read their messages again.
+        TimeSpan retryAfter = TimeSpan.FromTicks(Math.Min(options.RenewEvery.Ticks, TimeSpan.FromSeconds(1).Ticks));
+        bool renewed = true;
+
         try
         {
             while (!stop.IsCancellationRequested)
             {
                 try
                 {
-                    await Task.Delay(options.RenewEvery, stop);
+                    await Task.Delay(renewed ? options.RenewEvery : retryAfter, stop);
                 }
                 catch (OperationCanceledException)
                 {
@@ -906,7 +958,7 @@ internal sealed class ConsumerWorker(
                 await _renewing.WaitAsync(CancellationToken.None);
                 try
                 {
-                    await RenewOnceAsync();
+                    renewed = await RenewOnceAsync();
                 }
                 finally
                 {
@@ -925,7 +977,8 @@ internal sealed class ConsumerWorker(
     /// is made once more on a new one; each is bounded (<see cref="RenewTimeoutSeconds"/>), so a database that does not
     /// answer never keeps the next renewal waiting for long.
     /// </summary>
-    private async Task RenewOnceAsync()
+    /// <returns>False when the database could not be reached, so nothing was renewed.</returns>
+    private async Task<bool> RenewOnceAsync()
     {
         List<(QueueState State, long[] Leased)> due =
         [
@@ -937,7 +990,7 @@ internal sealed class ConsumerWorker(
         {
             // Nothing runs: an idle host holds no connection for renewals.
             await CloseRenewalConnectionAsync();
-            return;
+            return true;
         }
 
         Exception? failure = null;
@@ -950,7 +1003,7 @@ internal sealed class ConsumerWorker(
                 {
                     await RenewInOneBatchAsync(connection, due);
                 }
-                catch (PostgresException ex) when (connection.FullState == System.Data.ConnectionState.Open)
+                catch (PostgresException ex) when (connection.FullState == ConnectionState.Open)
                 {
                     // A batch is one transaction: one broken queue fails them all. Renew one queue at a time
                     // instead, so the others keep their leases.
@@ -958,7 +1011,7 @@ internal sealed class ConsumerWorker(
                     await RenewQueueByQueueAsync(connection, due);
                 }
 
-                return;
+                return true;
             }
             catch (Exception ex)
             {
@@ -977,6 +1030,8 @@ internal sealed class ConsumerWorker(
             failed.Add("error.type", errorType);
             PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
         }
+
+        return false;
     }
 
     private async Task RenewInOneBatchAsync(NpgsqlConnection connection, List<(QueueState State, long[] Leased)> due)
@@ -994,13 +1049,7 @@ internal sealed class ConsumerWorker(
         {
             do
             {
-                Dictionary<long, int> readCounts = [];
-                while (await reader.ReadAsync(CancellationToken.None))
-                {
-                    readCounts[reader.GetInt64(0)] = reader.GetInt32(1);
-                }
-
-                renewed.Add(readCounts);
+                renewed.Add(await ReadRenewedAsync(reader));
             } while (await reader.NextResultAsync(CancellationToken.None));
         }
 
@@ -1021,18 +1070,15 @@ internal sealed class ConsumerWorker(
                 await using NpgsqlCommand command = new(RenewSql, connection) { CommandTimeout = RenewTimeoutSeconds };
                 AddRenewParameters(command.Parameters, state, leased);
 
-                Dictionary<long, int> readCounts = [];
+                Dictionary<long, int> readCounts;
                 await using (NpgsqlDataReader reader = await command.ExecuteReaderAsync(CancellationToken.None))
                 {
-                    while (await reader.ReadAsync(CancellationToken.None))
-                    {
-                        readCounts[reader.GetInt64(0)] = reader.GetInt32(1);
-                    }
+                    readCounts = await ReadRenewedAsync(reader);
                 }
 
                 FindLostLeases(state, leased, readCounts);
             }
-            catch (PostgresException ex) when (connection.FullState == System.Data.ConnectionState.Open)
+            catch (PostgresException ex) when (connection.FullState == ConnectionState.Open)
             {
                 logger.LogWarning(ex, "Could not renew leases on {Queue}", state.Consumer.QueueName);
                 TagList failed = state.Tags;
@@ -1040,6 +1086,18 @@ internal sealed class ConsumerWorker(
                 PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
             }
         }
+    }
+
+    /// <summary>The messages one <c>set_vt</c> renewed, with the read count each has now.</summary>
+    private static async Task<Dictionary<long, int>> ReadRenewedAsync(NpgsqlDataReader reader)
+    {
+        Dictionary<long, int> readCounts = [];
+        while (await reader.ReadAsync(CancellationToken.None))
+        {
+            readCounts[reader.GetInt64(0)] = reader.GetInt32(1);
+        }
+
+        return readCounts;
     }
 
     private const string RenewSql = "select msg_id, read_ct from pgmq.set_vt($1, $2, $3)";
@@ -1084,7 +1142,7 @@ internal sealed class ConsumerWorker(
 
     private async Task<NpgsqlConnection> RenewalConnectionAsync()
     {
-        if (_renewalConnection is { FullState: System.Data.ConnectionState.Open } open)
+        if (_renewalConnection is { FullState: ConnectionState.Open } open)
         {
             return open;
         }
@@ -1166,7 +1224,7 @@ internal sealed class ConsumerWorker(
         public int Reported;
 
         /// <summary>The message's read count as this host read it; a higher one means someone read it again.</summary>
-        public int ReadCt { get; } = readCt;
+        public volatile int ReadCt = readCt;
 
         /// <summary>Its outcome is being written, so its row may be gone before the lease is ended.</summary>
         public volatile bool Settling;

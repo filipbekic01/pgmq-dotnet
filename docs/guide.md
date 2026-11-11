@@ -349,7 +349,7 @@ so a trace still continues into the consumer.
 | `pgmq.consumer.lease_renewal.failures` | Counter | `{failure}` | queue, consumer, `error.type` |
 | `pgmq.consumer.settle.failures` | Counter | `{failure}` | queue, consumer, operation, `error.type` |
 | `pgmq.consumer.leases.lost` | Counter | `{message}` | queue, consumer; a message read again or settled elsewhere while this host handled it |
-| `pgmq.worker.task.restarts` | Counter | `{restart}` | `pgmq.task`; lease renewal, the sweeper or the insert listener failed and was started again |
+| `pgmq.worker.task.restarts` | Counter | `{restart}` | `pgmq.task` (`lease_renewal`, `sweeper` or `insert_listener`); the task failed and was started again |
 | `pgmq.consumer.reads` | Counter | `{read}` | queue, consumer; every read, empty ones included |
 | `pgmq.reads.waiting` | UpDownCounter | `{read}` | reads queued for one of `MaxConcurrentReads` slots |
 | `pgmq.sweep.duration` | Histogram | `s` | `error.type` on failure |
