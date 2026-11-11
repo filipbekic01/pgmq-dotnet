@@ -19,6 +19,20 @@ public sealed class PgmqFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync() => await _container.StartAsync();
 
+    /// <summary>Freezes the database for <paramref name="duration"/>: every connection stays open and nothing answers.</summary>
+    public async Task FreezeAsync(TimeSpan duration)
+    {
+        await _container.PauseAsync();
+        try
+        {
+            await Task.Delay(duration);
+        }
+        finally
+        {
+            await _container.UnpauseAsync();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_dataSource is not null)

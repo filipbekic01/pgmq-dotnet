@@ -64,6 +64,34 @@ public sealed class SweeperTests
             MaxConcurrentReads = 0,
         }.Validate());
 
+    [Theory]
+    [InlineData(nameof(PgmqOptions.RenewEvery), 0)]
+    [InlineData(nameof(PgmqOptions.RenewEvery), -1)]
+    [InlineData(nameof(PgmqOptions.MaxIdleDelay), 0)]
+    [InlineData(nameof(PgmqOptions.DefaultTimeout), 0)]
+    [InlineData(nameof(PgmqOptions.DrainGrace), -1)]
+    [InlineData(nameof(PgmqOptions.AbandonAfter), -1)]
+    public void A_time_that_would_stop_a_background_task_Should_be_refused_at_setup(string option, int seconds)
+    {
+        PgmqOptions options = new() { ConnectionString = "Host=h" };
+        typeof(PgmqOptions).GetProperty(option)!.SetValue(options, TimeSpan.FromSeconds(seconds));
+
+        Assert.Throws<ArgumentOutOfRangeException>(options.Validate);
+    }
+
+    [Fact]
+    public void An_infinite_drain_grace_Should_be_allowed()
+        => new PgmqOptions { ConnectionString = "Host=h", DrainGrace = Timeout.InfiniteTimeSpan }.Validate();
+
+    [Fact]
+    public void Headers_nested_too_deep_to_parse_Should_count_as_none_instead_of_failing_the_read()
+    {
+        string deep = string.Concat(Enumerable.Repeat("{\"a\":", 100)) + "1" + new string('}', 100);
+
+        Assert.Null(QueueReader.ParseHeaders(deep));
+        Assert.Equal("orders", QueueReader.ParseHeaders("""{"message-type":"orders"}""")!["message-type"]);
+    }
+
     private static ConsumerRegistration Consumer(string queue)
         => new(typeof(SweeperTests), queue, [typeof(string)], 1, TimeSpan.FromMinutes(1));
 }

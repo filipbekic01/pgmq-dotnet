@@ -309,6 +309,22 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         => QueryAsync("select msg_id from pgmq.set_vt($1, $2, $3)",
             [Text(queueName), Longs(messageIds), Int(Seconds(timeout))], r => r.GetInt64(0), cancellationToken);
 
+    /// <summary>
+    /// Makes a message visible again that was read but never handed to a consumer, and takes back the read it was
+    /// counted for, so a message that only waited behind another does not use up its attempts. pgmq has no function
+    /// for this, so it writes the queue's table itself.
+    /// </summary>
+    /// <returns>False when the message was no longer on the queue.</returns>
+    internal async Task<bool> ReturnUnreadAsync(string queueName, long messageId, CancellationToken cancellationToken)
+    {
+        PgmqTopology.EnsureValidQueueName(queueName);
+        string table = PgmqMigrator.QuoteIdentifier(("q_" + queueName).ToLowerInvariant());
+        return (await QueryAsync(
+            $"update pgmq.{table} set vt = pg_catalog.clock_timestamp(), " +
+            "read_ct = greatest(read_ct - 1, 0) where msg_id = $1 returning msg_id",
+            [Long(messageId)], r => r.GetInt64(0), cancellationToken)).Count > 0;
+    }
+
     /// <inheritdoc />
     public async Task<long> SendAsync(string queueName, string message, string? headers = null, TimeSpan? delay = null,
         CancellationToken cancellationToken = default)

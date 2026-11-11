@@ -67,6 +67,14 @@ public static class PgmqTelemetry
     internal static readonly Counter<long> LeaseRenewalFailures = Meter.CreateCounter<long>(
         "pgmq.consumer.lease_renewal.failures", "{failure}", "Lease renewals that failed.");
 
+    internal static readonly Counter<long> LostLeases = Meter.CreateCounter<long>(
+        "pgmq.consumer.leases.lost", "{message}",
+        "Messages this host was handling that another reader read again or settled: their lease had lapsed.");
+
+    internal static readonly Counter<long> BackgroundRestarts = Meter.CreateCounter<long>(
+        "pgmq.worker.task.restarts", "{restart}",
+        "Background tasks of the worker (lease renewal, the sweeper, the insert listener) that failed and were started again.");
+
     internal static readonly Counter<long> Reads = Meter.CreateCounter<long>(
         "pgmq.consumer.reads", "{read}", "Reads of a queue by the worker, empty ones included.");
 

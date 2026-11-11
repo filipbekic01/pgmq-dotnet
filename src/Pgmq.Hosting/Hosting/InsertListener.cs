@@ -27,8 +27,11 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
 
     private volatile bool _listening;
 
-    /// <summary>The unpooled source, until it could not connect where the pool can: then null, and the pool is used.</summary>
-    private NpgsqlDataSource? _own = database.ListenerDataSource;
+    /// <summary>How long after the throttle interval ends the sweep for what it swallowed runs.</summary>
+    private static readonly TimeSpan ThrottleMargin = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>1 while a sweep for what the notification throttle swallowed is waiting to run.</summary>
+    private int _sweepPending;
 
     /// <summary>Records that <paramref name="queue"/> has its insert trigger.</summary>
     public void MarkEnabled(string queue) => _enabled[queue] = 0;
@@ -39,7 +42,33 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
     /// <summary>Whether an insert into <paramref name="queue"/> wakes its read loop right now.</summary>
     public bool IsLive(string queue) => _listening && _enabled.ContainsKey(queue);
 
-    public async Task RunAsync(IReadOnlyDictionary<string, Action> wakeByQueue, Action changed,
+    /// <summary>
+    /// Asks for one sweep when the throttle time is over, for the inserts pgmq sent no notification for. One sweep
+    /// covers every queue, however many were notified meanwhile.
+    /// </summary>
+    private void SweepAfterThrottle(TimeSpan throttle, Action sweep, CancellationToken stoppingToken)
+    {
+        if (throttle <= TimeSpan.Zero || Interlocked.CompareExchange(ref _sweepPending, 1, 0) != 0)
+        {
+            return;
+        }
+
+        _ = Task.Delay(throttle + ThrottleMargin, stoppingToken).ContinueWith(_ =>
+        {
+            Volatile.Write(ref _sweepPending, 0);
+            sweep();
+        }, TaskScheduler.Default);
+    }
+
+    /// <param name="wakeByQueue">How to wake each queue's read loop.</param>
+    /// <param name="changed">Makes the sweeper sweep at once.</param>
+    /// <param name="throttle">
+    /// The shortest time between two notifications of one queue (<see cref="PgmqOptions.InsertNotificationThrottle"/>).
+    /// pgmq sends none for an insert inside that time and none when it ends, so a message inserted just after another
+    /// would wait for the next regular sweep. One sweep is asked for when the time is over instead.
+    /// </param>
+    /// <param name="stoppingToken">Ends the listener.</param>
+    public async Task RunAsync(IReadOnlyDictionary<string, Action> wakeByQueue, Action changed, TimeSpan throttle,
         CancellationToken stoppingToken)
     {
         Dictionary<string, Action> wakeByChannel = wakeByQueue.ToDictionary(
@@ -49,13 +78,16 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
         {
             try
             {
-                await using NpgsqlConnection connection = await OpenAsync(stoppingToken);
+                await using NpgsqlConnection connection = await database.OpenDedicatedAsync(logger, stoppingToken);
                 connection.Notification += (_, e) =>
                 {
-                    if (wakeByChannel.TryGetValue(e.Channel, out Action? wake))
+                    if (!wakeByChannel.TryGetValue(e.Channel, out Action? wake))
                     {
-                        wake();
+                        return;
                     }
+
+                    wake();
+                    SweepAfterThrottle(throttle, changed, stoppingToken);
                 };
 
                 foreach (string channel in wakeByChannel.Keys)
@@ -67,6 +99,10 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
                 // Live from here. One sweep catches what was inserted before, instead of every queue reading at once.
                 _listening = true;
                 changed();
+
+                // A notification sent just before this connection listened was heard by nobody, and still throttles
+                // the inserts after it.
+                SweepAfterThrottle(throttle, changed, stoppingToken);
 
                 // A connection that dies without being closed (an idle timeout in a NAT or load balancer, a failover)
                 // would wait here forever, still counted as live. A quiet connection is pinged, so a dead one fails
@@ -106,33 +142,6 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
             {
                 _listening = false;
             }
-        }
-    }
-
-    /// <summary>
-    /// A connection of its own, outside the pool. One built from a handed-in data source's connection string can lack
-    /// the password (or a certificate, or anything else set in code); when it fails where the pool connects, the
-    /// listener stays on the pool from then on.
-    /// </summary>
-    private async Task<NpgsqlConnection> OpenAsync(CancellationToken cancellationToken)
-    {
-        if (_own is not { } own)
-        {
-            return await database.DataSource.OpenConnectionAsync(cancellationToken);
-        }
-
-        try
-        {
-            return await own.OpenConnectionAsync(cancellationToken);
-        }
-        catch (Exception ex) when (database.ListenerIsDerived && ex is not OperationCanceledException)
-        {
-            NpgsqlConnection pooled = await database.DataSource.OpenConnectionAsync(cancellationToken);
-            _own = null;
-            logger.LogWarning(ex, "Could not open the insert listener's own connection from the data source's " +
-                                  "connection string, which keeps the password only with Persist Security Info=true; " +
-                                  "listening on a pooled connection instead");
-            return pooled;
         }
     }
 }

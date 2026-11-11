@@ -5,6 +5,49 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-11
+
+### Fixed
+
+- A consumer cancelled for shutdown that ended with an exception other than `OperationCanceledException` (it wraps
+  its exceptions, or a library reports a cancelled call its own way) had its message archived. Whatever a consumer
+  throws after its token was cancelled for shutdown now puts the message back on the queue.
+- A delete or archive that could not be written was given up after about six seconds, and the message had already
+  stopped renewing its lease, so a database failover ran every consumer that finished during it a second time. The
+  write is now tried for about two minutes and the message keeps its lease meanwhile. After shutdown cancelled the
+  consumers it is still tried for about six seconds only. If the database stays away for longer than a lease, the
+  lease still runs out, as no renewal reaches it: a host then no longer starts a message again that it is still
+  handling, and renews one second after a failed renewal instead of a whole `RenewEvery` later, but another host
+  may still read the message first.
+- Lease renewals took their connection from the pool. With the pool used up they waited, then tried queue by queue,
+  each waiting again, while every lease ran out and other instances read the messages. Renewals now have a connection
+  of their own, outside the pool, open only while messages are handled; a try is bounded to half a `RenewEvery` and
+  made once more on a new connection.
+- A message that was read but never handed to its consumer (the rest of a FIFO group after one of it failed, or one
+  read as the host stopped) went back to the queue with the read counted. Enough of those archived it as
+  `pgmq.attempts_exhausted` without ever running it, and raised its `RedeliveryCount`. The read is now taken back.
+- A message inserted within `InsertNotificationThrottle` of another got no notification, and on a queue that had gone
+  idle again waited for the next regular sweep (up to `MaxIdleDelay`). The worker now sweeps once when the throttle
+  time is over.
+- A message whose headers could not be parsed (nested more than 64 deep) failed every read of its queue, for good. It
+  is now archived as a message of no known type.
+- If a lease lapsed and the same host read the message again, the first handler to finish stopped the renewal of the
+  second.
+
+### Added
+
+- `pgmq.consumer.leases.lost` counts, and a warning names, a message that was read again or settled elsewhere while
+  this host handled it: its lease had lapsed, so its consumer may have run twice. A delete, archive or release that
+  finds its message gone is reported the same way.
+- Lease renewal, the sweeper and the insert listener are started again if they ever fail unexpectedly, with a
+  critical log and `pgmq.worker.task.restarts`. Before, such a failure would have ended them unnoticed.
+
+### Changed
+
+- `RenewEvery`, `MaxIdleDelay` and `DefaultTimeout` must be above zero, and `DrainGrace` (unless infinite) and
+  `AbandonAfter` not negative; setup throws otherwise. A negative `RenewEvery` used to end lease renewal silently.
+- A busy host holds one connection more, for lease renewals.
+
 ## [2.3.0] - 2026-11-11
 
 ### Fixed
