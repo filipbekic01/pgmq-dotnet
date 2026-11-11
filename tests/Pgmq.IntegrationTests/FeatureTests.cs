@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
+using System.Transactions;
+using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 
 namespace Pgmq.IntegrationTests;
@@ -16,6 +18,83 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     private readonly Probe _probe = new();
 
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
+
+    [Fact]
+    public async Task A_publish_to_several_queues_Should_reach_all_of_them_or_none()
+    {
+        await using (NpgsqlDataSource setup = NpgsqlDataSource.Create(db.ConnectionString))
+        {
+            await new PgmqMigrator(setup).MigrateAsync(cancellationToken: Ct);
+        }
+
+        await db.Queues.EnsureQueueAsync("t_fan_a", cancellationToken: Ct);
+        await db.Queues.EnsureQueueAsync("t_fan_b", cancellationToken: Ct);
+        await db.ResetAsync("t_fan_a");
+        await db.ResetAsync("t_fan_b");
+
+        await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
+
+        PgmqTopology both = new();
+        both.Subscribe(typeof(FanOut), "t_fan_a");
+        both.Subscribe(typeof(FanOut), "t_fan_b");
+        await new PgmqPublisher(dataSource, both, NullLogger<PgmqPublisher>.Instance)
+            .PublishAsync(new FanOut(1), Ct);
+        Assert.Equal(1, await db.CountAsync("t_fan_a"));
+        Assert.Equal(1, await db.CountAsync("t_fan_b"));
+
+        // The second queue does not exist: the write to the first rolls back with it.
+        PgmqTopology broken = new();
+        broken.Subscribe(typeof(FanOut), "t_fan_a");
+        broken.Subscribe(typeof(FanOut), "t_fan_missing");
+        await Assert.ThrowsAnyAsync<PostgresException>(() =>
+            new PgmqPublisher(dataSource, broken, NullLogger<PgmqPublisher>.Instance).PublishAsync(new FanOut(2), Ct));
+        Assert.Equal(1, await db.CountAsync("t_fan_a"));
+
+        await Assert.ThrowsAnyAsync<PostgresException>(() =>
+            new PgmqPublisher(dataSource, broken, NullLogger<PgmqPublisher>.Instance)
+                .PublishBatchAsync([new FanOut(3), new FanOut(4)], Ct));
+        Assert.Equal(1, await db.CountAsync("t_fan_a"));
+    }
+
+    [Fact]
+    public async Task A_publish_to_several_queues_inside_a_TransactionScope_Should_commit_and_roll_back_with_it()
+    {
+        await using (NpgsqlDataSource setup = NpgsqlDataSource.Create(db.ConnectionString))
+        {
+            await new PgmqMigrator(setup).MigrateAsync(cancellationToken: Ct);
+        }
+
+        await db.Queues.EnsureQueueAsync("t_scope_a", cancellationToken: Ct);
+        await db.Queues.EnsureQueueAsync("t_scope_b", cancellationToken: Ct);
+        await db.ResetAsync("t_scope_a");
+        await db.ResetAsync("t_scope_b");
+
+        await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
+        PgmqTopology both = new();
+        both.Subscribe(typeof(FanOut), "t_scope_a");
+        both.Subscribe(typeof(FanOut), "t_scope_b");
+        PgmqPublisher publisher = new(dataSource, both, NullLogger<PgmqPublisher>.Instance);
+
+        using (TransactionScope rolledBack = new(TransactionScopeAsyncFlowOption.Enabled))
+        {
+            await publisher.PublishAsync(new FanOut(1), Ct);
+        }
+
+        Assert.Equal(0, await db.CountAsync("t_scope_a"));
+        Assert.Equal(0, await db.CountAsync("t_scope_b"));
+
+        using (TransactionScope committed = new(TransactionScopeAsyncFlowOption.Enabled))
+        {
+            await publisher.PublishAsync(new FanOut(2), Ct);
+            await publisher.PublishBatchAsync([new FanOut(3), new FanOut(4)], Ct);
+            committed.Complete();
+        }
+
+        Assert.Equal(3, await db.CountAsync("t_scope_a"));
+        Assert.Equal(3, await db.CountAsync("t_scope_b"));
+    }
+
+    public sealed record FanOut(int Id);
 
     [Fact]
     public async Task A_consumer_Should_get_its_queue_created_as_the_type_it_asks_for()

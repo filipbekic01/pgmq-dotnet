@@ -21,6 +21,10 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   that cancels its consumer. A message read more than
   `MaxAttempts` times without ever finishing (its consumer keeps crashing the process) is archived without running
   again. Keep `MaxAttempts` above 1, or a message released on shutdown is archived instead of run.
+- **Unknown message types.** A message with no `message-type` header, or no body, is archived at once. One whose
+  type this host cannot resolve is most likely from a newer version during a rolling deploy, so it goes back to the
+  queue for one `Lease`, doubling with each read up to five minutes, where an instance that knows it can take it. Its
+  `MaxAttempts`-th read archives it (about 7.5 minutes with the defaults). A FIFO group waits behind it, in order.
 - **Outbox.** What a consumer publishes through its context is sent only if it succeeds. When it does, everything it
   published and the delete of its message are one transaction: all of it goes out and the message is done, or none of
   it goes out and the message stays on the queue. A failed commit is retried in place, without running the consumer.
@@ -350,8 +354,8 @@ so a trace still continues into the consumer.
 | `pgmq.queue.messages.visible` | Gauge | `{message}` | queue; needs `QueueMetricsInterval` |
 | `pgmq.queue.oldest_message.age` | Gauge | `s` | queue; needs `QueueMetricsInterval` |
 
-`messaging.pgmq.outcome` is what happened to a handled message: `success`, `archived`, `released` (shutdown;
-it goes back to the queue), `lost` (an at-most-once message that did not succeed) or `gone` (the consumer succeeded,
+`messaging.pgmq.outcome` is what happened to a handled message: `success`, `archived`, `released` (shutdown, or a
+type this host does not know; it goes back to the queue), `lost` (an at-most-once message that did not succeed) or `gone` (the consumer succeeded,
 but its message was no longer on the queue, so its publishes were rolled back). `error.type` says why: the
 exception's type, `timeout`, `pgmq.abandoned`, `pgmq.shutdown`, `pgmq.unknown_message_type` or
 `pgmq.attempts_exhausted`. Histograms suggest the
@@ -383,8 +387,9 @@ builder.ConfigureTracing(t => t
 
 ## Limitations
 
-- **Separate writes per queue.** Publishing from outside a consumer to several queues is not one transaction, and
-  there is no transactional outbox with your own database writes. A topic publish is one statement. Inside a consumer,
+- **No transactional outbox with your own database writes.** A publish to several queues is one transaction of its
+  own (or joins an ambient `TransactionScope`), and a topic publish is one statement, but neither joins an
+  `NpgsqlTransaction` of your application's. Inside a consumer,
   everything published through its context commits in one transaction with the delete of its message.
 - **Archives grow** on standard and unlogged queues. Partitioned queues drop old partitions; `ConvertArchivePartitionedAsync`
   partitions an existing archive.

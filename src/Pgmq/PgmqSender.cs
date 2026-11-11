@@ -26,6 +26,12 @@ internal interface IPgmqSender
     Task<IReadOnlyList<string>> SendBatchTopicAsync(string routingKey, IReadOnlyList<string> bodies,
         IReadOnlyList<IReadOnlyDictionary<string, object>> headers, int delaySeconds,
         CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Runs <paramref name="sends"/> so that every write it makes commits together or not at all: a publish to several
+    /// queues never reaches some of them only.
+    /// </summary>
+    Task AllOrNothingAsync(Func<IPgmqSender, Task> sends, CancellationToken cancellationToken) => sends(this);
 }
 
 /// <summary>
@@ -114,6 +120,22 @@ internal sealed class PgmqSender : IPgmqSender
         }
 
         return queues;
+    }
+
+    public async Task AllOrNothingAsync(Func<IPgmqSender, Task> sends, CancellationToken cancellationToken)
+    {
+        // Already in a transaction, ours or an ambient TransactionScope the connections enlist in: it commits or rolls
+        // back as one, and a transaction of our own on an enlisted connection would be refused.
+        if (_transaction is not null || System.Transactions.Transaction.Current is not null)
+        {
+            await sends(this);
+            return;
+        }
+
+        await using NpgsqlConnection connection = await _dataSource!.OpenConnectionAsync(cancellationToken);
+        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await sends(new PgmqSender(transaction));
+        await transaction.CommitAsync(cancellationToken);
     }
 
     private NpgsqlCommand Command(string sql)

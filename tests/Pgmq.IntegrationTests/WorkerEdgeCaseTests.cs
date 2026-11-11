@@ -28,13 +28,43 @@ public sealed class WorkerEdgeCaseTests(PgmqFixture db) : IClassFixture<PgmqFixt
         await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "the typed foreign message handled");
         Assert.Equal(7, Assert.IsType<ForeignOrder>(_probe.Deliveries.Single().Message).OrderId);
 
-        // No headers, and a type nobody consumes: neither can be handled, so both are archived, not retried.
+        // No headers: it can never be handled, so it is archived at once. A type nobody here consumes may be known to
+        // a newer instance, so it is put back a few times first, and archived only after MaxAttempts reads.
         await harness.Queues.SendAsync("t_foreign", """{"orderId":8}""", cancellationToken: Ct);
         await harness.Queues.SendAsync("t_foreign", """{"orderId":9}""", """{"message-type":"nobody.knows"}""",
             cancellationToken: Ct);
-        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_foreign") == 2, Within, "both archived");
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_foreign") == 1, Within,
+            "the headerless one archived");
+        Assert.Equal(1, await db.CountAsync("t_foreign"));
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_foreign") == 2, Within,
+            "the unknown type archived after its attempts");
         Assert.Equal(0, await db.CountAsync("t_foreign"));
         Assert.Single(_probe.Deliveries);
+    }
+
+    [Fact]
+    public async Task A_type_this_instance_does_not_know_Should_wait_for_an_instance_that_does()
+    {
+        // An old instance, during a rolling deploy, reads a message only the new version consumes.
+        await using (TransportHarness old = await StartAsync(typeof(RollingOldConsumer)))
+        {
+            await old.Queues.SendAsync("t_rolling", """{"id":2}""", """{"message-type":"rolling.v2"}""",
+                cancellationToken: Ct);
+            await Eventually.HoldsAsync(async () =>
+                    Convert.ToInt64(await db.ScalarObjectAsync("select count(*) from pgmq.q_t_rolling where read_ct > 0")) == 1,
+                Within, "read by the old instance");
+            await old.StopAsync();
+        }
+
+        Assert.Equal(0, await db.ArchivedAsync("t_rolling"));
+        Assert.Empty(_probe.Deliveries);
+
+        await using TransportHarness updated =
+            await TransportHarness.StartAsync(db, _probe, [typeof(RollingNewConsumer)], reset: false);
+
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "handled by the new instance");
+        Assert.Equal(2, Assert.IsType<RollingV2>(_probe.Deliveries.Single().Message).Id);
+        Assert.Equal(0, await db.ArchivedAsync("t_rolling"));
     }
 
     [Fact]
@@ -171,6 +201,38 @@ public sealed class WorkerEdgeCaseTests(PgmqFixture db) : IClassFixture<PgmqFixt
         public Task HandleAsync(PgmqConsumeContext<ForeignOrder> context, CancellationToken cancellationToken)
         {
             probe.Record(nameof(ForeignConsumer), context.Message, context);
+            return Task.CompletedTask;
+        }
+    }
+
+    [MessageName("rolling.v1")]
+    public sealed record RollingV1(int Id);
+
+    [MessageName("rolling.v2")]
+    public sealed record RollingV2(int Id);
+
+    [QueueName("t_rolling")]
+    public sealed class RollingOldConsumer(Probe probe) : IPgmqConsumer<RollingV1>
+    {
+        public Task HandleAsync(PgmqConsumeContext<RollingV1> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(RollingOldConsumer), context.Message, context);
+            return Task.CompletedTask;
+        }
+    }
+
+    [QueueName("t_rolling")]
+    public sealed class RollingNewConsumer(Probe probe) : IPgmqConsumer<RollingV1>, IPgmqConsumer<RollingV2>
+    {
+        public Task HandleAsync(PgmqConsumeContext<RollingV1> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(RollingNewConsumer), context.Message, context);
+            return Task.CompletedTask;
+        }
+
+        public Task HandleAsync(PgmqConsumeContext<RollingV2> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(RollingNewConsumer), context.Message, context);
             return Task.CompletedTask;
         }
     }

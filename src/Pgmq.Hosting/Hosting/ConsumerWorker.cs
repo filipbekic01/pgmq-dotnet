@@ -69,6 +69,9 @@ internal sealed class ConsumerWorker(
     /// <summary>How long a stop the host gave up on still waits for cancelled consumers to put their messages back.</summary>
     private static readonly TimeSpan ReleaseWindow = TimeSpan.FromSeconds(5);
 
+    /// <summary>The longest a message of a type this host does not know waits before it is read again.</summary>
+    private static readonly TimeSpan MaxUnknownTypeDelay = TimeSpan.FromMinutes(5);
+
     private static readonly TimeSpan[] SettleRetries =
         [TimeSpan.FromMilliseconds(200), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(5)];
 
@@ -76,6 +79,12 @@ internal sealed class ConsumerWorker(
     private readonly CancellationTokenSource _abort = new();
 
     private readonly ConcurrentDictionary<string, QueueState> _queues = new();
+
+    /// <summary>
+    /// Held by a lease renewal from its snapshot of leased messages to its write. A release waits for the renewal in
+    /// flight, so a renewal that saw the message before it was settled never writes over the release.
+    /// </summary>
+    private readonly SemaphoreSlim _renewing = new(1, 1);
 
     /// <summary>The host's stopping token, once running: a FIFO chain stops starting messages when it fires.</summary>
     private CancellationToken _stopping;
@@ -400,6 +409,10 @@ internal sealed class ConsumerWorker(
 
         bool known = headers is not null && messageType is not null && message.Body is not null;
 
+        // Headers and a body, but a type this host cannot resolve: most likely an instance on a newer version published
+        // it during a rolling deploy. It goes back to the queue for a while, so an instance that knows it can take it.
+        bool unresolved = !known && headers is not null && message.Body is not null && !consumer.AtMostOnce;
+
         // A failed attempt is settled, and the last one archived, so a message is read more than MaxAttempts times only
         // when attempts never settled: its consumer kept taking the process down, or it never came back from one.
         bool exhausted = !consumer.AtMostOnce && message.ReadCt > options.MaxAttempts;
@@ -419,6 +432,14 @@ internal sealed class ConsumerWorker(
             else if (known)
             {
                 outcome = await RunConsumerAsync(state, message, headers!, messageType!);
+            }
+            else if (unresolved && message.ReadCt < options.MaxAttempts)
+            {
+                TimeSpan delay = UnknownTypeDelay(message.ReadCt);
+                logger.LogWarning("Message on {Queue} has a type this host does not know ({MessageType}); putting it " +
+                                  "back for {Delay} (read {Reads} of {MaxAttempts}) in case another instance knows it",
+                    consumer.QueueName, headers!.MessageType, delay, message.ReadCt, options.MaxAttempts);
+                outcome = Outcome.Deferred("pgmq.unknown_message_type", delay);
             }
             else
             {
@@ -445,9 +466,22 @@ internal sealed class ConsumerWorker(
         state.Leased.TryRemove(message.MsgId, out _);
         await SettleAsync(state, message, outcome.Settlement);
 
-        // An unknown or exhausted message is archived, which takes it out of its group, so the group's next message may
-        // run.
-        return known && !exhausted ? outcome.Settlement.Kind : SettlementKind.Delete;
+        // An unknown or exhausted message that was archived is out of its group, so the group's next message may run.
+        // One put back for later still holds its group, in order.
+        return (known && !exhausted) || outcome.Settlement.Kind == SettlementKind.Release
+            ? outcome.Settlement.Kind
+            : SettlementKind.Delete;
+    }
+
+    /// <summary>
+    /// How long a message of an unknown type waits before it is read again: one lease, doubling with each read, at most
+    /// five minutes. With the default <see cref="PgmqOptions.MaxAttempts"/> it is archived some 7.5 minutes after it was
+    /// first read, time enough for a rolling deploy to bring up an instance that knows it.
+    /// </summary>
+    private TimeSpan UnknownTypeDelay(int reads)
+    {
+        double factor = Math.Pow(2, Math.Clamp(reads - 1, 0, 20));
+        return TimeSpan.FromTicks((long)Math.Min(options.Lease.Ticks * factor, MaxUnknownTypeDelay.Ticks));
     }
 
     /// <summary>Runs the consumer under its deadline and flushes its outbox, and says what to do with the message.</summary>
@@ -656,7 +690,7 @@ internal sealed class ConsumerWorker(
             {
                 SettlementKind.Delete => queues.DeleteMessageAsync(queue, message.MsgId, ct),
                 SettlementKind.Archive => queues.ArchiveMessageAsync(queue, message.MsgId, ct),
-                SettlementKind.Release => queues.SetVisibilityTimeoutAsync(queue, message.MsgId, TimeSpan.Zero, ct),
+                SettlementKind.Release => ReleaseAsync(queue, message.MsgId, settlement.Delay, ct),
                 _ => Task.CompletedTask,
             }, settlement.Kind.ToString().ToLowerInvariant(), state, message);
         }
@@ -676,6 +710,21 @@ internal sealed class ConsumerWorker(
         {
             PgmqTelemetry.RecordOperation("settle", operation, queue, start, errorType, database.Server);
         }
+    }
+
+    /// <summary>
+    /// Makes a message visible again after <paramref name="delay"/>. It is already out of the leased set, so the next
+    /// renewal skips it; waiting out the one in flight keeps that renewal from hiding it again for a whole lease.
+    /// </summary>
+    private async Task ReleaseAsync(string queue, long messageId, TimeSpan delay, CancellationToken cancellationToken)
+    {
+        // Bounded: a renewal falling back queue by queue during an outage could hold it for minutes, and a release on
+        // shutdown cannot wait that long. Past the bound the race is back, at worst hiding the message for a lease.
+        if (await _renewing.WaitAsync(options.RenewEvery, cancellationToken))
+        {
+            _renewing.Release();
+        }
+        await queues.SetVisibilityTimeoutAsync(queue, messageId, delay, cancellationToken);
     }
 
     /// <summary>Runs <paramref name="write"/>, trying again after a failure that <paramref name="retryIf"/> allows (any, by default).</summary>
@@ -717,58 +766,72 @@ internal sealed class ConsumerWorker(
                 return;
             }
 
-            List<(QueueState State, long[] Leased)> due =
-            [
-                .. _queues.Values
-                    .Select(q => (State: q, Leased: (long[])[.. q.Leased.Keys]))
-                    .Where(q => q.Leased.Length > 0),
-            ];
-            if (due.Count == 0)
-            {
-                continue;
-            }
-
+            await _renewing.WaitAsync(CancellationToken.None);
             try
             {
-                await using NpgsqlBatch batch = database.DataSource.CreateBatch();
-                foreach ((QueueState state, long[] leased) in due)
-                {
-                    batch.BatchCommands.Add(new("select msg_id from pgmq.set_vt($1, $2, $3)")
-                    {
-                        Parameters =
-                        {
-                            new() { Value = state.Consumer.QueueName, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text },
-                            new()
-                            {
-                                Value = leased,
-                                NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Bigint,
-                            },
-                            new() { Value = LeaseSeconds, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Integer },
-                        },
-                    });
-                }
-
-                await batch.ExecuteNonQueryAsync(CancellationToken.None);
+                await RenewOnceAsync(lease);
             }
-            catch (Exception batchFailure)
+            finally
             {
-                // A batch is one transaction: one broken queue fails them all. Renew one queue at a time instead, so
-                // the others keep their leases. One missed renewal is covered: the lease is three renewals long.
-                logger.LogDebug(batchFailure, "Renewing leases in one batch failed; renewing queue by queue");
-                foreach ((QueueState state, long[] leased) in due)
+                _renewing.Release();
+            }
+        }
+    }
+
+    /// <summary>One renewal: every leased message of every queue, in one batch when it can.</summary>
+    private async Task RenewOnceAsync(TimeSpan lease)
+    {
+        List<(QueueState State, long[] Leased)> due =
+        [
+            .. _queues.Values
+                .Select(q => (State: q, Leased: (long[])[.. q.Leased.Keys]))
+                .Where(q => q.Leased.Length > 0),
+        ];
+        if (due.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await using NpgsqlBatch batch = database.DataSource.CreateBatch();
+            foreach ((QueueState state, long[] leased) in due)
+            {
+                batch.BatchCommands.Add(new("select msg_id from pgmq.set_vt($1, $2, $3)")
                 {
-                    try
+                    Parameters =
                     {
-                        await queues.SetVisibilityTimeoutAsync(state.Consumer.QueueName, leased, lease,
-                            CancellationToken.None);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(ex, "Could not renew leases on {Queue}", state.Consumer.QueueName);
-                        TagList failed = state.Tags;
-                        failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
-                        PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
-                    }
+                        new() { Value = state.Consumer.QueueName, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text },
+                        new()
+                        {
+                            Value = leased,
+                            NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Bigint,
+                        },
+                        new() { Value = LeaseSeconds, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Integer },
+                    },
+                });
+            }
+
+            await batch.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        catch (Exception batchFailure)
+        {
+            // A batch is one transaction: one broken queue fails them all. Renew one queue at a time instead, so
+            // the others keep their leases. One missed renewal is covered: the lease is three renewals long.
+            logger.LogDebug(batchFailure, "Renewing leases in one batch failed; renewing queue by queue");
+            foreach ((QueueState state, long[] leased) in due)
+            {
+                try
+                {
+                    await queues.SetVisibilityTimeoutAsync(state.Consumer.QueueName, leased, lease,
+                        CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Could not renew leases on {Queue}", state.Consumer.QueueName);
+                    TagList failed = state.Tags;
+                    failed.Add("error.type", PgmqTelemetry.ErrorType(ex));
+                    PgmqTelemetry.LeaseRenewalFailures.Add(1, failed);
                 }
             }
         }
@@ -828,8 +891,11 @@ internal sealed class ConsumerWorker(
         Release,
     }
 
-    /// <summary>What to write to the queue; nothing, when <c>Written</c> says the outbox's transaction already settled it.</summary>
-    private readonly record struct Settlement(SettlementKind Kind, bool Written = false)
+    /// <summary>
+    /// What to write to the queue; nothing, when <c>Written</c> says the outbox's transaction already settled it. A
+    /// release makes the message visible again after <c>Delay</c>.
+    /// </summary>
+    private readonly record struct Settlement(SettlementKind Kind, bool Written = false, TimeSpan Delay = default)
     {
         public static readonly Settlement Delete = new(SettlementKind.Delete);
         public static readonly Settlement Deleted = new(SettlementKind.Delete, Written: true);
@@ -854,6 +920,10 @@ internal sealed class ConsumerWorker(
         /// </summary>
         public static readonly Outcome Gone = new(Settlement.Deleted, "gone", null, null);
         public static readonly Outcome Released = new(Settlement.Release, "released", null, null);
+
+        /// <summary>Put back on the queue unhandled, to be read again after <paramref name="delay"/>.</summary>
+        public static Outcome Deferred(string errorType, TimeSpan delay)
+            => new(new Settlement(SettlementKind.Release, Delay: delay), "released", errorType, null);
 
         public static Outcome Archived(string errorType, Exception? error = null)
             => new(Settlement.Archive, "archived", errorType, error);

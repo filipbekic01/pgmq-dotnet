@@ -5,6 +5,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A publish to several queues is now one transaction: every subscribed queue gets the message, or none does. Before, a
+  failure part way left some queues with it and others without, and a retry duplicated it in the first ones. It also
+  takes one connection from the pool instead of one per queue. `PublishBatchAsync` likewise. Inside a
+  `TransactionScope`, the scope's transaction is used instead.
+- The insert listener pings its connection after 30 s of quiet, so a connection that died without closing (a NAT or
+  load balancer idle timeout, a failover) is noticed and opened again. Before, it waited forever, still counted as
+  live, and new messages waited for the sweeper (up to `MaxIdleDelay`).
+- A message put back on the queue (on shutdown, or after a FIFO group stopped) could be hidden again for a whole
+  lease by a lease renewal already in flight. A release now waits for that renewal.
+
+### Changed
+
+- A message whose type this host cannot resolve is no longer archived at once. It goes back to the queue for one
+  `Lease`, doubling up to five minutes, and is archived on its `MaxAttempts`-th read, so during a rolling deploy an
+  instance that knows the type can take it. Its outcome is `released` with `error.type` `pgmq.unknown_message_type`.
+  A message with no `message-type` header or no body is still archived at once.
+
 ## [2.2.1] - 2026-11-06
 
 ### Fixed

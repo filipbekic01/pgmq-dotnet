@@ -16,6 +16,12 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
 {
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
 
+    /// <summary>How long the connection may stay quiet before it is pinged to prove it is still there.</summary>
+    private static readonly TimeSpan PingAfter = TimeSpan.FromSeconds(30);
+
+    /// <summary>How long a ping may take before the connection counts as dead.</summary>
+    private const int PingTimeoutSeconds = 10;
+
     /// <summary>Queues whose insert trigger was set up, so a notification will come for them.</summary>
     private readonly ConcurrentDictionary<string, byte> _enabled = new(StringComparer.Ordinal);
 
@@ -62,9 +68,17 @@ internal sealed class InsertListener(PgmqDatabase database, ILogger<InsertListen
                 _listening = true;
                 changed();
 
+                // A connection that dies without being closed (an idle timeout in a NAT or load balancer, a failover)
+                // would wait here forever, still counted as live. A quiet connection is pinged, so a dead one fails
+                // and is opened again.
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    await connection.WaitAsync(stoppingToken);
+                    if (!await connection.WaitAsync(PingAfter, stoppingToken))
+                    {
+                        await using NpgsqlCommand ping = new("select 1", connection);
+                        ping.CommandTimeout = PingTimeoutSeconds;
+                        await ping.ExecuteNonQueryAsync(stoppingToken);
+                    }
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

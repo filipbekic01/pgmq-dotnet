@@ -6,7 +6,7 @@ namespace Pgmq;
 
 /// <summary>
 /// <see cref="IPgmqPublisher"/> on PGMQ: one copy of each message per subscribed queue, a delay being PGMQ's own
-/// delayed send. The copies are separate writes, not one transaction. Topic publishes are one <c>pgmq.send_topic</c>
+/// delayed send. The copies are written in one transaction: every subscribed queue gets the message, or none does. Topic publishes are one <c>pgmq.send_topic</c>
 /// call, which writes to every bound queue in one statement.
 /// </summary>
 public sealed class PgmqPublisher : IPgmqPublisher
@@ -87,13 +87,18 @@ public sealed class PgmqPublisher : IPgmqPublisher
         await TraceSendAsync(messageName, messageName, batch.Length, queues, async () =>
         {
             string[] bodies = [.. batch.Select(m => MessageSerializer.Serialize(m, typeof(TMessage)))];
+            DateTimeOffset? deliverAt = DeliverAt(delay);
 
-            foreach (string queue in queues)
+            await FanOutAsync(queues, async (client, queue) =>
             {
                 IReadOnlyDictionary<string, object>[] headers =
                     [.. batch.Select(_ => NewHeaders(typeof(TMessage), options).ToDictionary())];
 
-                await _client.SendBatchAsync(queue, bodies, headers, DeliverAt(delay), cancellationToken);
+                await client.SendBatchAsync(queue, bodies, headers, deliverAt, cancellationToken);
+            }, cancellationToken);
+
+            foreach (string queue in queues)
+            {
                 PgmqTelemetry.RecordSent(queue, batch.Length, _server);
             }
 
@@ -209,10 +214,16 @@ public sealed class PgmqPublisher : IPgmqPublisher
         await TraceSendAsync(messageName, messageName, 1, queues, async () =>
         {
             string body = MessageSerializer.Serialize(message, messageType);
+            DateTimeOffset? deliverAt = DeliverAt(delay);
+
+            await FanOutAsync(queues,
+                (client, queue) => client.SendAsync(queue, body, NewHeaders(messageType, options).ToDictionary(),
+                    deliverAt, cancellationToken),
+                cancellationToken);
 
             foreach (string queue in queues)
             {
-                await SendAsync(queue, body, NewHeaders(messageType, options), delay, cancellationToken);
+                PgmqTelemetry.RecordSent(queue, 1, _server);
             }
 
             return 0;
@@ -257,6 +268,32 @@ public sealed class PgmqPublisher : IPgmqPublisher
         {
             PgmqTelemetry.RecordOperation("send", "send", destination, start, errorType, _server);
         }
+    }
+
+    /// <summary>
+    /// Writes one copy to each queue. Several queues are written in one transaction, so a failure part way sends to
+    /// none of them, and a retry by the caller never duplicates the copies that had already gone out.
+    /// </summary>
+    private Task FanOutAsync(IReadOnlyList<string> queues, Func<IPgmqSender, string, Task> send,
+        CancellationToken cancellationToken)
+    {
+        if (queues.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (queues.Count == 1)
+        {
+            return send(_client, queues[0]);
+        }
+
+        return _client.AllOrNothingAsync(async client =>
+        {
+            foreach (string queue in queues)
+            {
+                await send(client, queue);
+            }
+        }, cancellationToken);
     }
 
     private static MessageHeaders NewHeaders(Type messageType, PgmqPublishOptions options)
