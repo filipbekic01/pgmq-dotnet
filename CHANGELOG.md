@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-11-11
+
 ### Fixed
 
 - A publish to several queues is now one transaction: every subscribed queue gets the message, or none does. Before, a
