@@ -84,7 +84,9 @@ public sealed class PgmqOptions
     /// Reads of one message before it is archived without running. A consumer that throws is archived at once and never
     /// run again, so a message is read more than once only when an earlier read never finished: the process crashed or
     /// shut down while it ran. One read more than this many times (its consumer keeps taking the process down) is
-    /// archived without running. Keep it above 1, so a message that went back to the queue on shutdown still runs.
+    /// archived without running. Keep it above 1, so a message that went back to the queue on shutdown still runs. A
+    /// message that was read but never handed to its consumer (it waited behind another of its FIFO group, or the host
+    /// was stopping) goes back without that read counted.
     /// </summary>
     public int MaxAttempts { get; set; } = 5;
 
@@ -128,7 +130,8 @@ public sealed class PgmqOptions
     /// Reads, across every queue, that run at once in this host. A busy queue holds a slot only for its read, not
     /// while its messages run, so busy queues take turns and idle ones never ask. Settles, outbox commits and lease
     /// renewals do not count against it. A host then uses at most this many connections for reads, one for the
-    /// listener, one for the sweeper, and one per message settling at that moment, whatever the pool allows.
+    /// listener, one for the sweeper, one for lease renewals while messages run, and one per message settling at that
+    /// moment, whatever the pool allows.
     /// <para>
     /// One by default: the fewest connections. Each read is one round trip, so with many busy queues of low concurrency
     /// (each read then fetches only a message or two) this caps how fast the host reads. Raise it for throughput:
@@ -148,7 +151,10 @@ public sealed class PgmqOptions
     /// </summary>
     public bool UseInsertNotifications { get; set; } = true;
 
-    /// <summary>The shortest time between two insert notifications of one queue.</summary>
+    /// <summary>
+    /// The shortest time between two insert notifications of one queue. pgmq sends none for an insert inside that
+    /// time, so the worker sweeps once when it ends, and a message inserted just after another is still found then.
+    /// </summary>
     public TimeSpan InsertNotificationThrottle { get; set; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
@@ -218,7 +224,12 @@ public sealed class PgmqOptions
         ArgumentOutOfRangeException.ThrowIfLessThan(DefaultConcurrency, 1, nameof(DefaultConcurrency));
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxAttempts, 1, nameof(MaxAttempts));
         ArgumentOutOfRangeException.ThrowIfLessThan(Lease, TimeSpan.FromSeconds(1), nameof(Lease));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(RenewEvery, TimeSpan.Zero, nameof(RenewEvery));
         ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(RenewEvery, Lease, nameof(RenewEvery));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(DefaultTimeout, TimeSpan.Zero, nameof(DefaultTimeout));
+        ArgumentOutOfRangeException.ThrowIfLessThan(AbandonAfter, TimeSpan.Zero, nameof(AbandonAfter));
+        ArgumentOutOfRangeException.ThrowIfLessThan(DrainGrace, TimeSpan.Zero, nameof(DrainGrace));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MaxIdleDelay, TimeSpan.Zero, nameof(MaxIdleDelay));
         ArgumentOutOfRangeException.ThrowIfLessThan(InsertNotificationThrottle, TimeSpan.Zero,
             nameof(InsertNotificationThrottle));
 

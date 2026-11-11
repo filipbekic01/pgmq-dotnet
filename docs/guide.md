@@ -279,12 +279,14 @@ A host uses a fixed number of connections, whatever the number of queues:
 |---|---|
 | Insert listener | 1, outside the pool (none with `UseInsertNotifications = false`) |
 | Sweeper | 1, from the pool, for one short query at a time |
+| Lease renewals | 1, outside the pool, only while messages are being handled |
 | Reads | at most `MaxConcurrentReads` (1), across every queue |
 | Settles | one per message being deleted, archived or released at that moment, and per outbox commit |
 
-An idle host therefore holds 2. A busy one holds at most `MaxConcurrentReads` + the settles in flight + 2. Idle queues
+An idle host therefore holds 2. A busy one holds at most `MaxConcurrentReads` + the settles in flight + 3. Idle queues
 cost nothing because they never read on their own, and a busy queue holds a read slot only for its read, not while its
-messages run, so busy queues take turns. Lease renewals are one batched round trip for every queue each `RenewEvery`.
+messages run, so busy queues take turns. Lease renewals are one batched round trip for every queue each `RenewEvery`,
+on a connection of their own: a pool the application has used up never keeps a renewal waiting while leases run out.
 
 `MaxConcurrentReads` is 1 by default: the fewest connections, but every read waits its turn, and each read is one round
 trip. With many busy queues of low concurrency, where each read fetches only a message or two, that caps throughput.
@@ -346,6 +348,8 @@ so a trace still continues into the consumer.
 | `pgmq.consumer.read_loop.restarts` | Counter | `{restart}` | queue, consumer |
 | `pgmq.consumer.lease_renewal.failures` | Counter | `{failure}` | queue, consumer, `error.type` |
 | `pgmq.consumer.settle.failures` | Counter | `{failure}` | queue, consumer, operation, `error.type` |
+| `pgmq.consumer.leases.lost` | Counter | `{message}` | queue, consumer; a message read again or settled elsewhere while this host handled it |
+| `pgmq.worker.task.restarts` | Counter | `{restart}` | `pgmq.task`; lease renewal, the sweeper or the insert listener failed and was started again |
 | `pgmq.consumer.reads` | Counter | `{read}` | queue, consumer; every read, empty ones included |
 | `pgmq.reads.waiting` | UpDownCounter | `{read}` | reads queued for one of `MaxConcurrentReads` slots |
 | `pgmq.sweep.duration` | Histogram | `s` | `error.type` on failure |

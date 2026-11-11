@@ -139,8 +139,9 @@ public sealed class ConnectionTests(PgmqFixture db) : IClassFixture<PgmqFixture>
 
         await host.Tracker.AllSeen.WaitAsync(TimeSpan.FromMinutes(2), Ct);
 
-        // Concurrency 1 on every queue: at most one settle per queue at a time.
-        Assert.InRange(host.Peak, 1, MaxConcurrentReads + Queues + 2);
+        // Concurrency 1 on every queue: at most one settle per queue at a time. The listener, the sweeper and the
+        // lease renewals have one each.
+        Assert.InRange(host.Peak, 1, MaxConcurrentReads + Queues + 3);
         Assert.Equal(0, host.Tracker.Duplicates);
     }
 

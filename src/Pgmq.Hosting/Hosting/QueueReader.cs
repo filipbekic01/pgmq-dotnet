@@ -119,10 +119,24 @@ internal sealed class QueueReader(NpgsqlDataSource dataSource, PgmqOptions optio
             : $"select {Columns} from pgmq.{function}($1, $2, $3, $4)";
     }
 
-    /// <summary>Headers as the rest of the worker expects them: every value as the text it holds.</summary>
-    private static Dictionary<string, object>? ParseHeaders(string json)
+    /// <summary>
+    /// Headers as the rest of the worker expects them: every value as the text it holds. Headers that cannot be parsed
+    /// (nested deeper than the parser goes) count as none, so the message is archived as one of no known type instead
+    /// of failing every read of its queue.
+    /// </summary>
+    internal static Dictionary<string, object>? ParseHeaders(string json)
     {
-        using JsonDocument document = JsonDocument.Parse(json);
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+
+        using JsonDocument parsed = document;
         if (document.RootElement.ValueKind != JsonValueKind.Object)
         {
             return null;
