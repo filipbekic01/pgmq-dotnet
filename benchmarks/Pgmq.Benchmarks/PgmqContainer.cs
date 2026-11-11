@@ -28,5 +28,11 @@ public sealed class PgmqContainer : IAsyncDisposable
 
     public Task StartAsync(CancellationToken cancellationToken = default) => _container.StartAsync(cancellationToken);
 
+    /// <summary>Freezes the server: its connections stay open and nothing answers, as when a network drops packets.</summary>
+    public Task PauseAsync(CancellationToken cancellationToken = default) => _container.PauseAsync(cancellationToken);
+
+    /// <summary>Lets a paused server go on.</summary>
+    public Task UnpauseAsync(CancellationToken cancellationToken = default) => _container.UnpauseAsync(cancellationToken);
+
     public ValueTask DisposeAsync() => _container.DisposeAsync();
 }

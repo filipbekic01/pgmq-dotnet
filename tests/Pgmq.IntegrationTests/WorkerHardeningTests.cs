@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using Pgmq.Hosting;
 
 namespace Pgmq.IntegrationTests;
@@ -49,6 +51,135 @@ public sealed class WorkerHardeningTests(PgmqFixture db) : IClassFixture<PgmqFix
         await Task.Delay(TimeSpan.FromSeconds(1), Ct);
         Assert.Single(_probe.Deliveries);
         Assert.Equal(0, await db.ArchivedAsync("t_outage"));
+    }
+
+    [Fact]
+    public async Task A_database_that_stops_answering_for_a_while_Should_be_survived_and_its_message_handled_once()
+    {
+        // Commands and connecting give up after two seconds, as they must to notice a server that no longer answers.
+        await using TransportHarness harness = await TransportHarness.StartAsync(db, _probe, [typeof(FrozenConsumer)],
+            o => o.ConnectionString = db.ConnectionString + ";Timeout=2;Command Timeout=2;Cancellation Timeout=1000");
+        await harness.Bus.PublishAsync(new Frozen(), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running");
+
+        // Nothing answers for four leases, as when a network drops every packet. The consumer ends meanwhile: its
+        // delete times out, and so do the renewals, the sweeps and the listener's ping. Two slots, so the queue is
+        // read again as soon as the database answers. This shows the worker comes through it; it does not show how
+        // long a write is tried for, because a server that was only frozen still runs the delete it was sent once it
+        // goes on. The queue that cannot be written, above, shows that.
+        Task frozen = db.FreezeAsync(TimeSpan.FromSeconds(8));
+        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
+        _probe.Open("frozen");
+        await frozen;
+
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_frozen") == 0, TimeSpan.FromSeconds(60),
+            "deleted once the database answered again");
+        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
+        Assert.Single(_probe.Deliveries);
+        Assert.Equal(0, await db.ArchivedAsync("t_frozen"));
+        Assert.Empty(harness.Status.StalledQueues);
+    }
+
+    [Fact]
+    public async Task A_pool_the_application_used_up_Should_not_keep_leases_from_being_renewed()
+    {
+        using TelemetryCapture telemetry = new();
+        await using TransportHarness harness = await TransportHarness.StartAsync(db, _probe, [typeof(HoardingConsumer)],
+            o => o.ConnectionString = db.ConnectionString + $";Maximum Pool Size={HoardingConsumer.PoolSize}");
+        await harness.Bus.PublishAsync(new Hoarded(), Ct);
+
+        // The consumer takes every connection of the pool and keeps them for several leases.
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running, with the pool used up");
+
+        for (int i = 0; i < 10; i++)
+        {
+            await Task.Delay(TransportHarness.Fast.Lease / 2, Ct);
+            Assert.Equal(0L, await db.ScalarObjectAsync(
+                "select count(*) from pgmq.q_t_hoarding where vt <= clock_timestamp()"));
+        }
+
+        _probe.Open("hoarding");
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_hoarding") == 0, Within, "settled");
+        Assert.Single(_probe.Deliveries);
+        Assert.Equal(0, telemetry.Sum("pgmq.consumer.leases.lost", "t_hoarding"));
+        Assert.Equal(0, telemetry.Sum("pgmq.consumer.lease_renewal.failures", "t_hoarding"));
+    }
+
+    [Fact]
+    public async Task A_handed_in_data_source_whose_connection_string_lost_its_password_Should_still_renew_leases()
+    {
+        using TelemetryCapture telemetry = new();
+        await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
+
+        // The data source does not hand out its password, so a connection outside its pool cannot be opened.
+        Assert.DoesNotContain("Password", dataSource.ConnectionString, StringComparison.OrdinalIgnoreCase);
+
+        await using TransportHarness harness = await TransportHarness.StartAsync(db, _probe, [typeof(SharedSourceConsumer)],
+            o =>
+            {
+                o.ConnectionString = null;
+                o.DataSource = dataSource;
+            });
+        await harness.Bus.PublishAsync(new SharedSource(), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running");
+
+        await Task.Delay(TransportHarness.Fast.Lease * 3, Ct);
+        _probe.Open("shared-source");
+
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_shared_source") == 0, Within, "settled");
+        Assert.Single(_probe.Deliveries);
+        Assert.Equal(0, telemetry.Sum("pgmq.consumer.leases.lost", "t_shared_source"));
+    }
+
+    [Fact]
+    public async Task On_shutdown_a_release_that_fails_at_first_Should_be_tried_again_a_little_later()
+    {
+        // A lease long enough that only a release, never a lapsed lease, makes the message visible in this test.
+        TransportHarness harness = await TransportHarness.StartAsync(db, _probe, [typeof(RetriedReleaseConsumer)],
+            o => o.Lease = TimeSpan.FromSeconds(30));
+        await harness.Bus.PublishAsync(new RetriedRelease(), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running");
+
+        // The queue is out of reach when the consumer is cancelled (after the drain grace), and back shortly after.
+        await db.ScalarObjectAsync("alter table pgmq.q_t_retried_release rename to q_t_retried_release_away");
+        Task back = Task.Run(async () =>
+        {
+            await Task.Delay(TransportHarness.Fast.DrainGrace + TimeSpan.FromMilliseconds(700));
+            await db.ScalarObjectAsync("alter table pgmq.q_t_retried_release_away rename to q_t_retried_release");
+        }, Ct);
+
+        await harness.StopAsync();
+        await back;
+
+        Assert.Equal(1, (await harness.Queues.GetMetricsAsync("t_retried_release", Ct)).VisibleLength);
+        Assert.Equal(0, await db.ArchivedAsync("t_retried_release"));
+        await harness.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task A_group_whose_head_this_host_still_handles_Should_wait_for_it_when_its_lease_lapsed()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(RereadGroupConsumer));
+        PgmqPublishOptions group = new() { GroupId = "g" };
+        await harness.Bus.PublishAsync(new RereadStep(1), group, Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "the head runs");
+        await harness.Bus.PublishAsync(new RereadStep(2), group, Ct);
+
+        // The lease of the head lapsed: one read now takes both, the head included.
+        await db.ScalarObjectAsync("update pgmq.q_t_reread_group set vt = clock_timestamp()");
+        await Eventually.HoldsAsync(async () =>
+                (long)(await db.ScalarObjectAsync("select count(*) from pgmq.q_t_reread_group where read_ct = 2"))! == 1,
+            Within, "the head was read again");
+
+        // The second step neither ran alongside the head nor had the read counted.
+        await Task.Delay(TimeSpan.FromSeconds(1), Ct);
+        Assert.Single(_probe.Deliveries);
+
+        _probe.Open("reread-group");
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 2, Within, "the second step ran after the head");
+        Assert.Equal([1, 2], _probe.Deliveries.Select(d => ((RereadStep)d.Message).Seq));
+        Assert.Equal(0, _probe.Deliveries.Last().RedeliveryCount);
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_reread_group") == 0, Within, "queue empty");
     }
 
     [Fact]
@@ -188,6 +319,87 @@ public sealed class WorkerHardeningTests(PgmqFixture db) : IClassFixture<PgmqFix
         {
             probe.Record(nameof(LostLeaseConsumer), context.Message, context);
             await probe.Gate("lost-lease").WaitAsync(cancellationToken);
+        }
+    }
+
+    public sealed record Frozen;
+
+    [QueueName("t_frozen")]
+    [ConsumerOptions(Concurrency = 2)]
+    public sealed class FrozenConsumer(Probe probe) : IPgmqConsumer<Frozen>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<Frozen> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(FrozenConsumer), context.Message, context);
+            await probe.Gate("frozen").WaitAsync(cancellationToken);
+        }
+    }
+
+    public sealed record Hoarded;
+
+    [QueueName("t_hoarding")]
+    public sealed class HoardingConsumer(Probe probe, IServiceProvider services) : IPgmqConsumer<Hoarded>
+    {
+        public const int PoolSize = 3;
+
+        public async Task HandleAsync(PgmqConsumeContext<Hoarded> context, CancellationToken cancellationToken)
+        {
+            NpgsqlDataSource pool = services.GetRequiredService<PgmqDatabase>().DataSource;
+            List<NpgsqlConnection> held = [];
+            try
+            {
+                for (int i = 0; i < PoolSize; i++)
+                {
+                    held.Add(await pool.OpenConnectionAsync(cancellationToken));
+                }
+
+                probe.Record(nameof(HoardingConsumer), context.Message, context);
+                await probe.Gate("hoarding").WaitAsync(cancellationToken);
+            }
+            finally
+            {
+                foreach (NpgsqlConnection connection in held)
+                {
+                    await connection.DisposeAsync();
+                }
+            }
+        }
+    }
+
+    public sealed record SharedSource;
+
+    [QueueName("t_shared_source")]
+    public sealed class SharedSourceConsumer(Probe probe) : IPgmqConsumer<SharedSource>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<SharedSource> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(SharedSourceConsumer), context.Message, context);
+            await probe.Gate("shared-source").WaitAsync(cancellationToken);
+        }
+    }
+
+    public sealed record RetriedRelease;
+
+    [QueueName("t_retried_release")]
+    public sealed class RetriedReleaseConsumer(Probe probe) : IPgmqConsumer<RetriedRelease>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<RetriedRelease> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(RetriedReleaseConsumer), context.Message, context);
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+    }
+
+    public sealed record RereadStep(int Seq);
+
+    [QueueName("t_reread_group")]
+    [ConsumerOptions(ReadMode = PgmqReadMode.Grouped, Concurrency = 3)]
+    public sealed class RereadGroupConsumer(Probe probe) : IPgmqConsumer<RereadStep>
+    {
+        public async Task HandleAsync(PgmqConsumeContext<RereadStep> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(RereadGroupConsumer), context.Message, context);
+            await probe.Gate("reread-group").WaitAsync(cancellationToken);
         }
     }
 
