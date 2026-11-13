@@ -159,6 +159,10 @@ one empty read per sweep for that queue.
 `PgmqPublishOptions.Headers` travel with the message and reach the consumer as `context.Headers`, next to
 `context.GroupId`. Redelivered messages keep both.
 
+Pgmq's own headers are not in `context.Headers` and cannot be set through `PgmqPublishOptions.Headers`, which throws
+for them: `message-type`, `message-id`, `redelivery-count`, `traceparent`, `tracestate`, `x-pgmq-group` and
+`shovel-count` (see [Shovel](#shovel)).
+
 ### Queue management
 
 `IPgmqQueueManager` resolves from dependency injection, or create a `new PgmqQueueManager(dataSource)` without hosting:
@@ -200,12 +204,36 @@ await queues.ShovelAsync("orders", "orders_v2");                        // move 
 await queues.ShovelAsync("orders", "orders", fromArchive: true);        // replay what failed back onto the queue
 await queues.ShovelAsync("orders", "orders", fromArchive: true, maxMessages: null); // all of them at once
 await queues.ShovelAsync("orders", "orders", [41, 42], fromArchive: true);  // exactly these, by msg_id
+await queues.ShovelAsync("orders", "orders", fromArchive: true, maxShovels: 3); // replay, each message 3 times at most
 ```
 
 One call moves at most 1000 messages (`maxMessages`), so it stays one modest transaction. Given message ids, it moves
 exactly those, however many, and leaves out ids that are not there or (in the queue) not visible. To drain a big queue, call
 it until it returns 0; `maxMessages: null` moves everything in one transaction. It is plain SQL too:
 `select pgmq.shovel('orders', 'orders', from_archive => true, msg_ids => array[41, 42])`.
+
+#### Capping replays
+
+A consumer that throws is not run again: its message is archived, and a shovel out of the archive is the retry. Each
+such shovel adds one to the message's `shovel-count` header, in the statement that moves it. A consumer reads it as
+`context.ShovelCount` (zero for a message never replayed); a `RedeliverAsync` keeps it. A shovel from a queue is not a
+retry and leaves the count as it is.
+
+`maxShovels` (`max_shovels` in SQL) makes a shovel out of an archive leave behind every message already replayed that
+many times: with `maxShovels: 3` a message that keeps failing is run four times in all, then stays in the archive.
+Such messages are passed over before `maxMessages` is counted, so a batch is never used up by them, and they are not
+in the returned count; a replay job can call until it gets 0. The cap applies to message ids too. Without it
+(`null`, the default) messages move whatever their count, which is how to replay one by hand once more.
+
+```csharp
+// Every few hours: put what failed back, 1000 at a time, each message three times at most.
+while (await queues.ShovelAsync("orders", "orders", fromArchive: true, maxShovels: 3) > 0) { }
+```
+
+The count is only as good as the header. `IPgmqPublisher` cannot set it, but raw JSON headers
+(`IPgmqQueueManager.SendAsync`, plain `pgmq.send`) can, and a consumer that publishes a fresh copy of a failed message
+starts it again from zero. A missing header, or a value that is not a whole number, counts as zero. Messages at the
+cap stay in the archive until something removes them, and each capped shovel reads past them.
 
 ## Database setup
 

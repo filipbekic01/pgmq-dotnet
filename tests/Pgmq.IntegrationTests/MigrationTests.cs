@@ -145,6 +145,37 @@ public sealed class MigrationTests(MigrationServers servers) : IClassFixture<Mig
     }
 
     [Fact]
+    public async Task A_database_with_an_earlier_shovel_Should_get_the_new_one_in_its_place()
+    {
+        string connectionString = servers.NewOnPlainServer();
+        await PgmqMigrator.EnsureDatabaseAsync(connectionString, cancellationToken: Ct);
+        await MigratorOn(connectionString).MigrateAsync(cancellationToken: Ct);
+
+        // As Pgmq.NET 2.4 left it: the shovel without max_shovels.
+        await ExecuteAsync(connectionString, """
+            drop function pgmq.shovel(text, text, boolean, integer, bigint[], integer);
+            create function pgmq.shovel(source_queue text, target_queue text, from_archive boolean default false,
+                max_messages integer default 1000, msg_ids bigint[] default null) returns bigint
+                language sql as 'select -1::bigint';
+            select pgmq.create('kept');
+            select pgmq.archive('kept', pgmq.send('kept', '{"n": 7}'));
+            """);
+
+        PgmqMigrationResult upgraded = await MigratorOn(connectionString).MigrateAsync(cancellationToken: Ct);
+
+        Assert.Equal([PgmqMigrator.SHOVEL_SCRIPT], upgraded.AppliedScripts);
+        Assert.Equal("pgmq.shovel(text,text,boolean,integer,bigint[],integer)", await ScalarAsync<string>(connectionString,
+            "select string_agg(oid::regprocedure::text, ' ') from pg_proc " +
+            "where proname = 'shovel' and pronamespace = 'pgmq'::regnamespace"));
+        // The call an application on 2.4 makes still finds one function, and it is the new one.
+        Assert.Equal(1L, await ScalarAsync<long>(connectionString, "select pgmq.shovel('kept', 'kept', true, 1000, null)"));
+        Assert.Equal("1", await ScalarAsync<string>(connectionString,
+            "select headers ->> 'shovel-count' from pgmq.q_kept"));
+
+        Assert.False((await MigratorOn(connectionString).MigrateAsync(cancellationToken: Ct)).Changed);
+    }
+
+    [Fact]
     public async Task Several_instances_starting_together_Should_create_the_database_and_install_pgmq_once()
     {
         string connectionString = servers.NewOnPlainServer();

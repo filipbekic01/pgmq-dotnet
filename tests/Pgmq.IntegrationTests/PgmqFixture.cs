@@ -223,7 +223,7 @@ public sealed class Probe
 
     public void Record(string consumer, object message, PgmqConsumeContext context)
         => Deliveries.Enqueue(new(consumer, message, context.RedeliveryCount, context.MessageId,
-            Activity.Current?.TraceId.ToString(), context.GroupId, context.Headers));
+            Activity.Current?.TraceId.ToString(), context.GroupId, context.Headers, context.ShovelCount));
 
     public IReadOnlyList<Delivered> Of(string consumer) => [.. Deliveries.Where(d => d.Consumer == consumer)];
 
@@ -251,7 +251,7 @@ public sealed class Probe
     }
 
     public sealed record Delivered(string Consumer, object Message, int RedeliveryCount, Guid? MessageId, string? TraceId,
-        string? GroupId = null, IReadOnlyDictionary<string, string>? Headers = null);
+        string? GroupId = null, IReadOnlyDictionary<string, string>? Headers = null, int ShovelCount = 0);
 }
 
 public static class Eventually

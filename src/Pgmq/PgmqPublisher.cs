@@ -184,17 +184,17 @@ public sealed class PgmqPublisher : IPgmqPublisher
 
     /// <summary>
     /// Writes straight to one queue, past the fan-out: how a consumer's message goes back to where it came from. A
-    /// <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message; the group and headers
-    /// go with it.
+    /// <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message; the group, headers
+    /// and shovel count go with it.
     /// </summary>
     internal async Task SendAsync(string queueName, object message, Type messageType, TimeSpan delay,
         int redeliveryCount, Guid? messageId, string? groupId, IReadOnlyDictionary<string, string>? headers,
-        CancellationToken cancellationToken)
+        int shovelCount, CancellationToken cancellationToken)
     {
         await TraceSendAsync(queueName, MessageNames.Of(messageType), 1, queues: null, async () =>
         {
             await SendAsync(queueName, MessageSerializer.Serialize(message, messageType),
-                MessageHeaders.New(messageType, redeliveryCount, messageId, groupId, headers), delay,
+                MessageHeaders.New(messageType, redeliveryCount, messageId, groupId, headers, shovelCount), delay,
                 cancellationToken);
             return 0;
         });

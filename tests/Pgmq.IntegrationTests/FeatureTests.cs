@@ -267,6 +267,37 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
+    public async Task A_failed_message_shoveled_back_Should_tell_its_consumer_how_often_and_stop_at_the_cap()
+    {
+        await using TransportHarness harness = await StartAsync(typeof(ReplayedConsumer));
+
+        await harness.Bus.PublishAsync(new ReplayedMessage(), new PgmqPublishOptions
+        {
+            Headers = new Dictionary<string, string> { ["tenant"] = "acme" },
+        }, Ct);
+
+        // It fails and is archived; each replay is one shovel out of the archive, and the cap allows two.
+        foreach (int replay in new[] { 1, 2 })
+        {
+            await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_replayed") == 1, Within, "archived");
+            Assert.Equal(1, await harness.Queues.ShovelAsync("t_replayed", "t_replayed", fromArchive: true,
+                maxShovels: 2, cancellationToken: Ct));
+            // Each replay redelivers itself once, which keeps the shovel count.
+            await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 2 * replay + 1, Within, $"replay {replay}");
+        }
+
+        await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_replayed") == 1, Within, "archived for good");
+        Assert.Equal(0, await harness.Queues.ShovelAsync("t_replayed", "t_replayed", fromArchive: true,
+            maxShovels: 2, cancellationToken: Ct));
+
+        // The redelivery count is the message's own and carries over a shovel, as before.
+        Assert.Equal([(0, 0), (1, 0), (1, 1), (2, 1), (2, 2)],
+            _probe.Deliveries.Select(d => (d.ShovelCount, d.RedeliveryCount)));
+        Assert.All(_probe.Deliveries, d => Assert.Equal("acme", Assert.Single(d.Headers!).Value));
+        Assert.Single(_probe.Deliveries.Select(d => d.MessageId).Distinct());
+    }
+
+    [Fact]
     public async Task The_queue_manager_Should_create_inspect_and_drop_queues()
     {
         PgmqQueueManager queues = db.Queues;
@@ -616,6 +647,21 @@ public sealed class FeatureTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         {
             probe.Record(nameof(AtMostOnceConsumer), context.Message, context);
             throw new TimeoutException("transient, but there is no second chance");
+        }
+    }
+
+    public sealed record ReplayedMessage;
+
+    /// <summary>Redelivers itself once on each delivery, then fails, so it is archived every time.</summary>
+    [QueueName("t_replayed")]
+    public sealed class ReplayedConsumer(Probe probe) : IPgmqConsumer<ReplayedMessage>
+    {
+        public Task HandleAsync(PgmqConsumeContext<ReplayedMessage> context, CancellationToken cancellationToken)
+        {
+            probe.Record(nameof(ReplayedConsumer), context.Message, context);
+            return context.RedeliveryCount < context.ShovelCount
+                ? context.RedeliverAsync(TimeSpan.FromMilliseconds(100))
+                : throw new InvalidOperationException("fails every time");
         }
     }
 

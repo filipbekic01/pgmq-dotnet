@@ -85,7 +85,7 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
 
     /// <inheritdoc />
     public async Task<long> ShovelAsync(string sourceQueue, string targetQueue, bool fromArchive = false,
-        int? maxMessages = 1000, CancellationToken cancellationToken = default)
+        int? maxMessages = 1000, int? maxShovels = null, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(sourceQueue);
         ArgumentException.ThrowIfNullOrEmpty(targetQueue);
@@ -95,23 +95,36 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
                 "Move at least one message, or pass null to move them all.");
         }
 
-        return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, maxMessages, null, cancellationToken);
+        ThrowIfBelowOne(maxShovels);
+        return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, maxMessages, null, maxShovels,
+            cancellationToken);
     }
 
     /// <inheritdoc />
     public async Task<long> ShovelAsync(string sourceQueue, string targetQueue, IReadOnlyCollection<long> messageIds,
-        bool fromArchive = false, CancellationToken cancellationToken = default)
+        bool fromArchive = false, int? maxShovels = null, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(sourceQueue);
         ArgumentException.ThrowIfNullOrEmpty(targetQueue);
         ArgumentNullException.ThrowIfNull(messageIds);
 
-        return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, null, messageIds, cancellationToken);
+        ThrowIfBelowOne(maxShovels);
+        return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, null, messageIds, maxShovels,
+            cancellationToken);
+    }
+
+    private static void ThrowIfBelowOne(int? maxShovels)
+    {
+        if (maxShovels is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxShovels), maxShovels,
+                "Allow at least one shovel, or pass null to move messages whatever their shovel count.");
+        }
     }
 
     private Task<long> ShovelCoreAsync(string sourceQueue, string targetQueue, bool fromArchive, int? maxMessages,
-        IReadOnlyCollection<long>? messageIds, CancellationToken cancellationToken)
-        => ScalarAsync<long>("select pgmq.shovel($1, $2, $3, $4, $5)",
+        IReadOnlyCollection<long>? messageIds, int? maxShovels, CancellationToken cancellationToken)
+        => ScalarAsync<long>("select pgmq.shovel($1, $2, $3, $4, $5, $6)",
             [
                 Text(sourceQueue), Text(targetQueue),
                 new NpgsqlParameter { Value = fromArchive, NpgsqlDbType = NpgsqlDbType.Boolean },
@@ -122,6 +135,10 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
                 messageIds is null
                     ? new NpgsqlParameter { Value = DBNull.Value, NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Bigint }
                     : Longs(messageIds),
+                new NpgsqlParameter
+                {
+                    Value = maxShovels is { } shovels ? shovels : DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer,
+                },
             ], cancellationToken);
 
     /// <inheritdoc />

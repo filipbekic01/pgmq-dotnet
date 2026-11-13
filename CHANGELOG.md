@@ -5,6 +5,31 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-13
+
+### Added
+
+- A cap on replays. A consumer that throws is never run again, so a shovel out of an archive is the retry, and
+  nothing stopped a message that keeps failing from being shoveled back for ever. `pgmq.shovel` now adds one to a
+  message's `shovel-count` header each time it moves it out of an archive, and takes `max_shovels`
+  (`ShovelAsync(..., maxShovels: 3)`): archived messages already shoveled that many times stay in the archive. They
+  are passed over before `maxMessages` is counted and are not in the returned count. It applies to message ids too;
+  without it (the default) everything moves as before. A shovel from a queue leaves the count alone.
+- `PgmqConsumeContext.ShovelCount`: how many times the message was shoveled out of an archive. `RedeliverAsync`
+  keeps it, and the `PgmqConsumeContext<TMessage>` constructor for tests takes a `shovelCount`.
+
+### Changed
+
+- `shovel-count` is one of Pgmq's own headers: `PgmqPublishOptions.Headers` throws for it and it is not in
+  `PgmqConsumeContext.Headers`. A message sent with raw headers can still carry it.
+- `pgmq.shovel` has a sixth argument, `max_shovels`, and the five-argument function is dropped by the migrator, so
+  existing SQL calls keep working, and so does an instance still on 2.4. But if a 2.4 instance starts after the
+  upgrade (a rolling deploy, a rollback) its migrator puts the five-argument function back next to the new one, and
+  calls with fewer than six arguments then fail as ambiguous until a 2.5 instance starts again. 2.5 itself always
+  passes all six.
+- `IPgmqQueueManager.ShovelAsync` has a `maxShovels` parameter before the cancellation token. Callers compile
+  unchanged unless they pass the token by position; an implementation of the interface has to add the parameter.
+
 ## [2.4.0] - 2026-11-11
 
 ### Fixed
