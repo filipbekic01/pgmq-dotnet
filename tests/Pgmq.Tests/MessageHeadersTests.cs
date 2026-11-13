@@ -29,6 +29,46 @@ public sealed class MessageHeadersTests
     }
 
     [Fact]
+    public void The_shovel_count_Should_read_from_its_header_and_stay_out_of_the_custom_ones()
+    {
+        MessageHeaders? read = MessageHeaders.From(new Dictionary<string, object>
+        {
+            ["message-type"] = "pinned",
+            ["shovel-count"] = "2",
+            ["tenant"] = "acme",
+        });
+
+        Assert.Equal(2, read?.ShovelCount);
+        Assert.Equal("acme", Assert.Single(read!.CustomHeaders).Value);
+        Assert.Equal("2", read.ToDictionary()["shovel-count"]);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("many")]
+    [InlineData("-1")]
+    public void A_missing_or_odd_shovel_count_Should_read_as_zero_and_not_be_written(string? value)
+    {
+        Dictionary<string, object> headers = new() { ["message-type"] = "pinned" };
+        if (value is not null)
+        {
+            headers["shovel-count"] = value;
+        }
+
+        MessageHeaders? read = MessageHeaders.From(headers);
+
+        Assert.Equal(0, read?.ShovelCount);
+        Assert.False(read!.ToDictionary().ContainsKey("shovel-count"));
+    }
+
+    [Fact]
+    public void A_publisher_Should_not_set_the_shovel_count_itself()
+    {
+        Assert.Throws<ArgumentException>(() => MessageHeaders.New(typeof(Pinned),
+            custom: new Dictionary<string, string> { ["shovel-count"] = "0" }));
+    }
+
+    [Fact]
     public void Headers_without_a_message_type_Should_not_read()
     {
         Assert.Null(MessageHeaders.From(null));

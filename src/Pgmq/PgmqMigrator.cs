@@ -196,12 +196,13 @@ public sealed class PgmqMigrator(NpgsqlDataSource dataSource)
     /// Creates or replaces <c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq, under the migration lock and after pgmq,
     /// which it builds on. It runs on every migration, so an upgraded package brings its new version.
     /// </summary>
-    /// <returns>True when the shovel did not exist before.</returns>
+    /// <returns>True when the shovel did not exist before, or only with an earlier signature.</returns>
     private static async Task<bool> EnsureShovelAsync(NpgsqlConnection connection, NpgsqlTransaction transaction,
         CancellationToken cancellationToken)
     {
         await using NpgsqlCommand exists = new(
-            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[])') is not null", connection, transaction);
+            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[], integer)') is not null",
+            connection, transaction);
         bool existed = (bool)(await exists.ExecuteScalarAsync(cancellationToken))!;
 
         await ExecuteAsync(connection, transaction, ReadResource(OWN_RESOURCE_PREFIX, SHOVEL_SCRIPT), cancellationToken);

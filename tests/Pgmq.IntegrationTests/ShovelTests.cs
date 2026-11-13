@@ -28,7 +28,9 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
 
         Assert.False(again.Changed);
         Assert.Equal(true, await db.ScalarObjectAsync(
-            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[])') is not null"));
+            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[], integer)') is not null"));
+        Assert.Equal(1L, await db.ScalarObjectAsync(
+            "select count(*) from pg_proc where proname = 'shovel' and pronamespace = 'pgmq'::regnamespace"));
     }
 
     [Fact]
@@ -227,6 +229,154 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
         Assert.Equal(1200, await Queues.ShovelAsync("s_ids_many", "s_ids_many_to", ids, cancellationToken: Ct));
         Assert.Equal(0, await db.CountAsync("s_ids_many"));
     }
+
+    [Fact]
+    public async Task Each_shovel_from_the_archive_Should_count_one_up_and_keep_the_other_headers()
+    {
+        await NewQueuesAsync("s_count");
+        await Queues.SendAsync("s_count", """{"n": 1}""", """{"tenant": "acme"}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_count", """{"n": 2}""", cancellationToken: Ct); // no headers at all
+
+        foreach (string expected in new[] { "1", "2" })
+        {
+            await ArchiveAllAsync("s_count");
+            Assert.Equal(2, await Queues.ShovelAsync("s_count", "s_count", fromArchive: true, cancellationToken: Ct));
+            Assert.Equal([expected, expected], await ShovelCountsAsync("q_s_count"));
+        }
+
+        Assert.Equal(
+            ["""{"tenant": "acme", "shovel-count": "2"}""", """{"shovel-count": "2"}"""],
+            (string[])(await db.ScalarObjectAsync(
+                "select array_agg(headers::text order by msg_id) from pgmq.q_s_count"))!);
+    }
+
+    [Fact]
+    public async Task A_shovel_from_the_archive_Should_count_from_zero_whatever_the_header_holds()
+    {
+        await NewQueuesAsync("s_odd");
+        await Queues.SendAsync("s_odd", """{"n": 1}""", """{"shovel-count": 3}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_odd", """{"n": 2}""", """{"shovel-count": "many"}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_odd", """{"n": 3}""", """{"shovel-count": {"n": 1}}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_odd", """{"n": 4}""", """["not", "an object"]""", cancellationToken: Ct);
+        await ArchiveAllAsync("s_odd");
+
+        Assert.Equal(4, await Queues.ShovelAsync("s_odd", "s_odd", fromArchive: true, maxShovels: 4, cancellationToken: Ct));
+
+        // A number counts as written, anything else as zero, and headers that are no object move as they are.
+        Assert.Equal(
+            ["""{"shovel-count": "4"}""", """{"shovel-count": "1"}""", """{"shovel-count": "1"}""", """["not", "an object"]"""],
+            (string[])(await db.ScalarObjectAsync("select array_agg(headers::text order by msg_id) from pgmq.q_s_odd"))!);
+    }
+
+    [Fact]
+    public async Task A_capped_shovel_Should_leave_messages_at_the_cap_in_the_archive_and_not_count_them()
+    {
+        await NewQueuesAsync("s_cap");
+        long capped = await Queues.SendAsync("s_cap", """{"n": "capped"}""", """{"shovel-count": "2"}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_cap", """{"n": "once"}""", """{"shovel-count": "1"}""", cancellationToken: Ct);
+        long over = await Queues.SendAsync("s_cap", """{"n": "over"}""", """{"shovel-count": "7"}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_cap", """{"n": "never"}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_cap", """{"n": "late"}""", cancellationToken: Ct);
+        await ArchiveAllAsync("s_cap");
+
+        // The oldest is at the cap: it is passed over, not counted against the two this call may move.
+        Assert.Equal(2, await Queues.ShovelAsync("s_cap", "s_cap", fromArchive: true, maxMessages: 2, maxShovels: 2,
+            cancellationToken: Ct));
+        Assert.Equal(["2", "1"], await ShovelCountsAsync("q_s_cap"));
+
+        Assert.Equal(1, await Queues.ShovelAsync("s_cap", "s_cap", fromArchive: true, maxShovels: 2, cancellationToken: Ct));
+        Assert.Equal(0, await Queues.ShovelAsync("s_cap", "s_cap", fromArchive: true, maxShovels: 2, cancellationToken: Ct));
+
+        // The two at the cap are still archived, the very rows they were.
+        Assert.Equal([capped, over],
+            (long[])(await db.ScalarObjectAsync("select array_agg(msg_id order by msg_id) from pgmq.a_s_cap"))!);
+        Assert.Equal(["2", "7"], await ShovelCountsAsync("a_s_cap"));
+
+        // Without a cap they move like any other.
+        Assert.Equal(2, await Queues.ShovelAsync("s_cap", "s_cap", fromArchive: true, cancellationToken: Ct));
+        Assert.Equal(0, await db.ArchivedAsync("s_cap"));
+    }
+
+    [Fact]
+    public async Task A_capped_shovel_by_id_Should_skip_those_at_the_cap_and_without_a_cap_force_them()
+    {
+        await NewQueuesAsync("s_cap_ids");
+        long capped = await Queues.SendAsync("s_cap_ids", """{"n": 1}""", """{"shovel-count": "3"}""", cancellationToken: Ct);
+        long fresh = await Queues.SendAsync("s_cap_ids", """{"n": 2}""", cancellationToken: Ct);
+        await ArchiveAllAsync("s_cap_ids");
+
+        Assert.Equal(1, await Queues.ShovelAsync("s_cap_ids", "s_cap_ids", [capped, fresh], fromArchive: true,
+            maxShovels: 3, cancellationToken: Ct));
+        Assert.Equal(capped, await db.ScalarObjectAsync("select msg_id from pgmq.a_s_cap_ids"));
+
+        Assert.Equal(1, await Queues.ShovelAsync("s_cap_ids", "s_cap_ids", [capped], fromArchive: true, cancellationToken: Ct));
+        Assert.Equal(["1", "4"], await ShovelCountsAsync("q_s_cap_ids"));
+    }
+
+    [Fact]
+    public async Task A_shovel_between_queues_Should_leave_the_count_alone_and_ignore_the_cap()
+    {
+        await NewQueuesAsync("s_plain", "s_plain_to");
+        await Queues.SendAsync("s_plain", """{"n": 1}""", """{"shovel-count": "5", "tenant": "acme"}""", cancellationToken: Ct);
+        await Queues.SendAsync("s_plain", """{"n": 2}""", cancellationToken: Ct);
+
+        Assert.Equal(2, await Queues.ShovelAsync("s_plain", "s_plain_to", maxShovels: 1, cancellationToken: Ct));
+
+        Assert.Equal(["""{"tenant": "acme", "shovel-count": "5"}""", null],
+            (string?[])(await db.ScalarObjectAsync(
+                "select array_agg(headers::text order by msg_id) from pgmq.q_s_plain_to"))!);
+    }
+
+    [Fact]
+    public async Task A_cap_below_one_Should_be_refused()
+    {
+        await NewQueuesAsync("s_bad_cap");
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => Queues.ShovelAsync("s_bad_cap", "s_bad_cap", fromArchive: true, maxShovels: 0, cancellationToken: Ct));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => Queues.ShovelAsync("s_bad_cap", "s_bad_cap", [1], fromArchive: true, maxShovels: 0, cancellationToken: Ct));
+
+        PostgresException ex = await Assert.ThrowsAsync<PostgresException>(
+            () => db.ScalarObjectAsync("select pgmq.shovel('s_bad_cap', 's_bad_cap', true, max_shovels => 0)"));
+        Assert.Contains("max_shovels must be at least 1", ex.MessageText);
+    }
+
+    [Fact]
+    public async Task Two_capped_shovels_from_the_archive_at_once_Should_never_move_the_same_message()
+    {
+        await NewQueuesAsync("s_arace");
+        await db.SendAsync("s_arace", 4);
+        await ArchiveAllAsync("s_arace");
+
+        await using NpgsqlConnection first = new(db.ConnectionString);
+        await first.OpenAsync(Ct);
+        await using NpgsqlTransaction transaction = await first.BeginTransactionAsync(Ct);
+        await using (NpgsqlCommand shovel = new(
+                         "select pgmq.shovel('s_arace', 's_arace', true, 2, max_shovels => 1)", first, transaction))
+        {
+            Assert.Equal(2L, await shovel.ExecuteScalarAsync(Ct));
+        }
+
+        Assert.Equal(2, await Queues.ShovelAsync("s_arace", "s_arace", fromArchive: true, maxMessages: null,
+            maxShovels: 1, cancellationToken: Ct));
+        await transaction.CommitAsync(Ct);
+
+        Assert.Equal(0, await db.ArchivedAsync("s_arace"));
+        Assert.Equal(4L, await db.ScalarObjectAsync("select count(distinct message) from pgmq.q_s_arace"));
+        Assert.Equal(["1", "1", "1", "1"], await ShovelCountsAsync("q_s_arace"));
+    }
+
+    private async Task ArchiveAllAsync(string queue)
+    {
+        long[] ids = (long[])(await db.ScalarObjectAsync($"select array_agg(msg_id) from pgmq.q_{queue}"))!;
+        await Queues.ArchiveMessagesAsync(queue, ids, Ct);
+    }
+
+    /// <summary>The shovel-count header of every row in <paramref name="table"/>, oldest first; null where it is absent.</summary>
+    private async Task<string?[]> ShovelCountsAsync(string table)
+        => (string?[])(await db.ScalarObjectAsync(
+            $"select array_agg(headers ->> 'shovel-count' order by msg_id) from pgmq.{table}"))!;
 
     private async Task NewQueuesAsync(params string[] names)
     {

@@ -10,7 +10,8 @@ namespace Pgmq;
 /// The pgmq headers every message carries. All values are written as strings, so they read back the same whatever
 /// the JSON converter makes of them. <see cref="TraceParent"/> and <see cref="TraceState"/> are the W3C trace context
 /// of the sender, so the consumer's span joins the trace that published the message. <see cref="GroupId"/> is pgmq's
-/// own FIFO group header, and <see cref="Custom"/> holds the application's headers.
+/// own FIFO group header, and <see cref="Custom"/> holds the application's headers. <see cref="ShovelCount"/> is
+/// written by <c>pgmq.shovel</c>, which adds one each time it moves the message out of an archive.
 /// </summary>
 internal sealed record MessageHeaders(
     string MessageType,
@@ -19,7 +20,8 @@ internal sealed record MessageHeaders(
     string? TraceParent = null,
     string? TraceState = null,
     string? GroupId = null,
-    IReadOnlyDictionary<string, string>? Custom = null)
+    IReadOnlyDictionary<string, string>? Custom = null,
+    int ShovelCount = 0)
 {
     public const string GroupKey = "x-pgmq-group";
     private const string MessageTypeKey = "message-type";
@@ -28,8 +30,11 @@ internal sealed record MessageHeaders(
     private const string TraceParentKey = "traceparent";
     private const string TraceStateKey = "tracestate";
 
+    /// <summary>The header <c>pgmq.shovel</c> counts in (shovel.sql names it too).</summary>
+    public const string ShovelCountKey = "shovel-count";
+
     private static readonly HashSet<string> Reserved =
-        new([MessageTypeKey, MessageIdKey, RedeliveryCountKey, TraceParentKey, TraceStateKey, GroupKey],
+        new([MessageTypeKey, MessageIdKey, RedeliveryCountKey, TraceParentKey, TraceStateKey, GroupKey, ShovelCountKey],
             StringComparer.Ordinal);
 
     private static readonly IReadOnlyDictionary<string, string> NoHeaders = new Dictionary<string, string>();
@@ -39,7 +44,7 @@ internal sealed record MessageHeaders(
 
     /// <summary>Fresh headers for a message sent now, under the current trace.</summary>
     public static MessageHeaders New(Type messageType, int redeliveryCount = 0, Guid? messageId = null,
-        string? groupId = null, IReadOnlyDictionary<string, string>? custom = null)
+        string? groupId = null, IReadOnlyDictionary<string, string>? custom = null, int shovelCount = 0)
     {
         Activity? current = Activity.Current;
         bool w3c = current is { IdFormat: ActivityIdFormat.W3C };
@@ -51,7 +56,8 @@ internal sealed record MessageHeaders(
 
         return new(MessageNames.Of(messageType), messageId ?? Guid.CreateVersion7(), redeliveryCount,
             w3c ? current!.Id : null, w3c ? current!.TraceStateString : null, groupId,
-            custom is { Count: > 0 } ? new Dictionary<string, string>(custom, StringComparer.Ordinal) : null);
+            custom is { Count: > 0 } ? new Dictionary<string, string>(custom, StringComparer.Ordinal) : null,
+            shovelCount);
     }
 
     public IReadOnlyDictionary<string, object> ToDictionary()
@@ -70,6 +76,11 @@ internal sealed record MessageHeaders(
         if (GroupId is not null)
         {
             headers[GroupKey] = GroupId;
+        }
+
+        if (ShovelCount > 0)
+        {
+            headers[ShovelCountKey] = ShovelCount.ToString(CultureInfo.InvariantCulture);
         }
 
         if (MessageId is { } messageId)
@@ -114,7 +125,11 @@ internal sealed record MessageHeaders(
             Read(headers, TraceParentKey),
             Read(headers, TraceStateKey),
             Read(headers, GroupKey),
-            custom);
+            custom,
+            // As shovel.sql reads it: anything but a whole number counts as zero.
+            int.TryParse(Read(headers, ShovelCountKey), NumberStyles.None, CultureInfo.InvariantCulture, out int shovels)
+                ? shovels
+                : 0);
     }
 
     private static string? Read(IReadOnlyDictionary<string, object> headers, string key)

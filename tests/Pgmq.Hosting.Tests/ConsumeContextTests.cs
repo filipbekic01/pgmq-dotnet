@@ -18,7 +18,7 @@ public sealed class ConsumeContextTests
         Mock<IPgmqPublisher> publisher = new(MockBehavior.Strict);
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), publisher.Object,
-            sendBack: (_, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+            sendBack: (_, _, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
 
         await context.PublishAsync(new Ping(), Ct);
         await context.SchedulePublishAsync(new Ping(), TimeSpan.FromMinutes(1), Ct);
@@ -35,7 +35,7 @@ public sealed class ConsumeContextTests
         (int Count, Guid? Id)? sentBack = null;
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
-            sendBack: (_, _, _, _, count, id, _, _, _) =>
+            sendBack: (_, _, _, _, count, id, _, _, _, _) =>
             {
                 sentBack = (count, id);
                 return Task.CompletedTask;
@@ -54,7 +54,7 @@ public sealed class ConsumeContextTests
         Outbox outbox = new();
         Dictionary<string, string> headers = new() { ["tenant"] = "acme" };
         PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
-            sendBack: (_, _, _, _, _, _, group, sent, _) =>
+            sendBack: (_, _, _, _, _, _, group, sent, _, _) =>
             {
                 sentBack = (group, sent);
                 return Task.CompletedTask;
@@ -67,6 +67,28 @@ public sealed class ConsumeContextTests
         Assert.Equal("acme", sentBack?.Headers?["tenant"]);
         Assert.Equal("customer-1", context.GroupId);
         Assert.Equal("acme", context.Headers["tenant"]);
+    }
+
+    [Fact]
+    public async Task A_redelivery_Should_keep_the_shovel_count_and_a_send_to_self_start_from_zero()
+    {
+        List<int> sentBack = [];
+        Outbox outbox = new();
+        PgmqConsumeContext<Ping> context = new(new Ping(), Mock.Of<IPgmqPublisher>(),
+            sendBack: (_, _, _, _, _, _, _, _, shovels, _) =>
+            {
+                sentBack.Add(shovels);
+                return Task.CompletedTask;
+            }, outbox, Guid.NewGuid(), redeliveryCount: 0, shovelCount: 2);
+
+        await context.RedeliverAsync(TimeSpan.FromSeconds(1));
+        await context.SendToSelfAsync(new Ping(), TimeSpan.FromSeconds(1), Ct);
+        await outbox.FlushAsync(Mock.Of<IPgmqPublisher>(), Ct);
+
+        Assert.Equal(2, context.ShovelCount);
+        Assert.Equal([2, 0], sentBack);
+        Assert.Equal(0, new PgmqConsumeContext<Ping>(new Ping()).ShovelCount);
+        Assert.Equal(3, new PgmqConsumeContext<Ping>(new Ping(), shovelCount: 3).ShovelCount);
     }
 
     [Fact]
@@ -86,7 +108,7 @@ public sealed class ConsumeContextTests
         Mock<IPgmqPublisher> publisher = new(MockBehavior.Strict);
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), publisher.Object,
-            sendBack: (_, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+            sendBack: (_, _, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
 
         await Assert.ThrowsAsync<ArgumentException>(() =>
             context.PublishToTopicAsync("notify.email.big spender", new Ping(), Ct));
@@ -102,7 +124,7 @@ public sealed class ConsumeContextTests
         Mock<IPgmqPublisher> flushedThrough = new();
         Outbox outbox = new();
         PgmqConsumeContext<Ping> context = new(new Ping(), held.Object,
-            sendBack: (_, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
+            sendBack: (_, _, _, _, _, _, _, _, _, _) => Task.CompletedTask, outbox, Guid.NewGuid(), 0);
 
         await context.PublishAsync(new Ping(), Ct);
         await outbox.FlushAsync(flushedThrough.Object, Ct);

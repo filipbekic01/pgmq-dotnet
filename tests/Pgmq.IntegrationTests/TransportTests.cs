@@ -342,7 +342,7 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await harness.Queues.CreateQueueAsync("t_gauged", cancellationToken: Ct);
         await harness.Queues.PurgeQueueAsync("t_gauged", Ct);
         await ((PgmqPublisher)harness.Bus).SendAsync("t_gauged", new FanOutMessage(5), typeof(FanOutMessage),
-            TimeSpan.Zero, 0, null, null, null, Ct);
+            TimeSpan.Zero, 0, null, null, null, 0, Ct);
         await harness.StartHostedAsync<Pgmq.Hosting.QueueMetricsCollector>();
 
         await Eventually.HoldsAsync(() =>

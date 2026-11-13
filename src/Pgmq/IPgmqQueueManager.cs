@@ -53,9 +53,14 @@ public interface IPgmqQueueManager
     /// body and headers and arrives as a new message, visible at once, read zero times. From a queue only visible
     /// messages move: one being handled or delayed stays, and two shovels at once never move the same message. Either
     /// every selected message moves or none does. From the archive messages are moved, not copied: they leave it.
+    /// <para>
+    /// A shovel out of an archive is a retry, and each one is counted in the message's <c>shovel-count</c> header
+    /// (<c>PgmqConsumeContext.ShovelCount</c> in a consumer). <paramref name="maxShovels"/> caps it: a message that
+    /// keeps failing stays in the archive once it has been replayed that many times.
+    /// </para>
     /// <code>
-    /// // Replay what failed: everything in orders' archive goes back onto orders.
-    /// await queues.ShovelAsync("orders", "orders", fromArchive: true);
+    /// // Replay what failed: everything in orders' archive goes back onto orders, each message three times at most.
+    /// await queues.ShovelAsync("orders", "orders", fromArchive: true, maxShovels: 3);
     /// </code>
     /// </summary>
     /// <param name="sourceQueue">The queue to take messages from.</param>
@@ -65,16 +70,23 @@ public interface IPgmqQueueManager
     /// Move at most this many, oldest first: 1000 by default, so one call stays one modest transaction. Call it until
     /// it returns 0 to drain a queue, or pass null to move everything in one transaction.
     /// </param>
+    /// <param name="maxShovels">
+    /// With <paramref name="fromArchive"/>, leave in the archive every message already shoveled out of an archive
+    /// this many times or more. Those are passed over before <paramref name="maxMessages"/> is counted and are not in
+    /// the returned number. Null, the default, moves messages whatever their count. Without
+    /// <paramref name="fromArchive"/> it does nothing.
+    /// </param>
     /// <param name="cancellationToken">Cancels the call.</param>
     /// <returns>How many messages moved.</returns>
     Task<long> ShovelAsync(string sourceQueue, string targetQueue, bool fromArchive = false, int? maxMessages = 1000,
-        CancellationToken cancellationToken = default);
+        int? maxShovels = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Moves the messages with <paramref name="messageIds"/> from <paramref name="sourceQueue"/>, or from its archive,
     /// onto <paramref name="targetQueue"/> in one statement, however many there are; see
-    /// <see cref="ShovelAsync(string, string, bool, int?, CancellationToken)"/> for how they move. Ids that are not
-    /// there, or (in the queue) not visible because they are being handled or delayed, are left out.
+    /// <see cref="ShovelAsync(string, string, bool, int?, int?, CancellationToken)"/> for how they move. Ids that are
+    /// not there, or (in the queue) not visible because they are being handled or delayed, are left out, and so are
+    /// archived messages at <paramref name="maxShovels"/>.
     /// <code>
     /// // Replay two archived failures.
     /// await queues.ShovelAsync("orders", "orders", [41, 42], fromArchive: true);
@@ -84,10 +96,15 @@ public interface IPgmqQueueManager
     /// <param name="targetQueue">The queue to put them on. It must exist.</param>
     /// <param name="messageIds">The <c>msg_id</c>s to move, in the queue or in its archive.</param>
     /// <param name="fromArchive">Take them from the source's archive (<c>pgmq.a_{source}</c>) instead.</param>
+    /// <param name="maxShovels">
+    /// With <paramref name="fromArchive"/>, leave in the archive every listed message already shoveled out of an
+    /// archive this many times or more. Null, the default, replays them whatever their count: the way to force a
+    /// replay by hand.
+    /// </param>
     /// <param name="cancellationToken">Cancels the call.</param>
     /// <returns>How many messages moved.</returns>
     Task<long> ShovelAsync(string sourceQueue, string targetQueue, IReadOnlyCollection<long> messageIds,
-        bool fromArchive = false, CancellationToken cancellationToken = default);
+        bool fromArchive = false, int? maxShovels = null, CancellationToken cancellationToken = default);
 
     /// <summary>Deletes every message in a queue (<c>pgmq.purge_queue</c>).</summary>
     /// <returns>How many messages were deleted.</returns>

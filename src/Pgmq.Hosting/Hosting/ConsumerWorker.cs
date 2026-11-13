@@ -731,11 +731,13 @@ internal sealed class ConsumerWorker(
             RedeliveryCount: headers.RedeliveryCount + Math.Max(0, message.ReadCt - 1),
             outbox,
             // The outbox flushes through this worker's publisher, bound to its transaction: always a PgmqPublisher.
-            SendBack: (p, m, type, delay, count, messageId, groupId, custom, ct) =>
-                ((PgmqPublisher)p).SendAsync(consumer.QueueName, m, type, delay, count, messageId, groupId, custom, ct))
+            SendBack: (p, m, type, delay, count, messageId, groupId, custom, shovels, ct) =>
+                ((PgmqPublisher)p).SendAsync(consumer.QueueName, m, type, delay, count, messageId, groupId, custom,
+                    shovels, ct))
         {
             GroupId = headers.GroupId,
             Headers = headers.CustomHeaders,
+            ShovelCount = headers.ShovelCount,
         };
 
         await using AsyncServiceScope scope = scopeFactory.CreateAsyncScope();

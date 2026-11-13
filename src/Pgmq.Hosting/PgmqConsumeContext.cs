@@ -18,7 +18,8 @@ public abstract class PgmqConsumeContext
     private static readonly IReadOnlyDictionary<string, string> NoHeaders = new Dictionary<string, string>();
 
     private protected PgmqConsumeContext(IPgmqPublisher? publisher, SendBack? sendBack, Outbox? outbox,
-        Guid? messageId, int redeliveryCount, string? groupId, IReadOnlyDictionary<string, string>? headers)
+        Guid? messageId, int redeliveryCount, string? groupId, IReadOnlyDictionary<string, string>? headers,
+        int shovelCount)
     {
         _publisher = publisher;
         _sendBack = sendBack;
@@ -27,6 +28,7 @@ public abstract class PgmqConsumeContext
         RedeliveryCount = redeliveryCount;
         GroupId = groupId;
         Headers = headers ?? NoHeaders;
+        ShovelCount = shovelCount;
     }
 
     /// <summary>The id the message was published with. It stays the same when the message is redelivered.</summary>
@@ -42,8 +44,20 @@ public abstract class PgmqConsumeContext
     /// <summary>The FIFO group the message was published in (<see cref="PgmqPublishOptions.GroupId"/>), if any.</summary>
     public string? GroupId { get; }
 
-    /// <summary>The application's own headers the message was published with (<see cref="PgmqPublishOptions.Headers"/>).</summary>
+    /// <summary>
+    /// The application's own headers the message was published with (<see cref="PgmqPublishOptions.Headers"/>).
+    /// Pgmq's own headers are not among them: the shovel count is <see cref="ShovelCount"/>.
+    /// </summary>
     public IReadOnlyDictionary<string, string> Headers { get; }
+
+    /// <summary>
+    /// How many times this message was shoveled out of an archive back onto a queue (<c>pgmq.shovel</c>,
+    /// <see cref="IPgmqQueueManager"/>'s <c>ShovelAsync</c> with <c>fromArchive</c>): how many times it was replayed
+    /// after failing. Zero for a message that never was. A <see cref="PgmqConsumeContext{TMessage}.RedeliverAsync"/>
+    /// keeps it. It travels in the <c>shovel-count</c> header, which <c>pgmq.shovel</c> writes and a publisher cannot
+    /// set.
+    /// </summary>
+    public int ShovelCount { get; }
 
     /// <summary>Publishes <paramref name="message"/> with <paramref name="options"/> once this consumer succeeds.</summary>
     public Task PublishAsync<TOther>(TOther message, PgmqPublishOptions options,
@@ -91,13 +105,13 @@ public abstract class PgmqConsumeContext
         where TOther : class
         => _sendBack is null
             ? SchedulePublishAsync(message, delay, cancellationToken)
-            : SendAsync((p, ct) => _sendBack(p, message, typeof(TOther), delay, 0, null, null, null, ct), cancellationToken);
+            : SendAsync((p, ct) => _sendBack(p, message, typeof(TOther), delay, 0, null, null, null, 0, ct), cancellationToken);
 
     private protected Task SendBackAsync(object message, Type messageType, TimeSpan delay, int redeliveryCount)
         => _sendBack is null
             ? throw new InvalidOperationException("This message was not read from a queue, so it cannot go back to one.")
             : SendAsync((p, ct) => _sendBack(p, message, messageType, delay, redeliveryCount, MessageId, GroupId,
-                Headers.Count == 0 ? null : Headers, ct), default);
+                Headers.Count == 0 ? null : Headers, ShovelCount, ct), default);
 
     /// <summary>Holds the send in the outbox, or sends it now when there is none (a test calling a consumer).</summary>
     private Task SendAsync(Func<IPgmqPublisher, CancellationToken, Task> send, CancellationToken cancellationToken)
@@ -129,15 +143,19 @@ public sealed class PgmqConsumeContext<TMessage> : PgmqConsumeContext where TMes
     /// <param name="messageId">What <see cref="PgmqConsumeContext.MessageId"/> reports.</param>
     /// <param name="groupId">What <see cref="PgmqConsumeContext.GroupId"/> reports.</param>
     /// <param name="headers">What <see cref="PgmqConsumeContext.Headers"/> reports.</param>
+    /// <param name="shovelCount">What <see cref="PgmqConsumeContext.ShovelCount"/> reports.</param>
     public PgmqConsumeContext(TMessage message, IPgmqPublisher? publisher = null, int redeliveryCount = 0,
-        Guid? messageId = null, string? groupId = null, IReadOnlyDictionary<string, string>? headers = null)
-        : this(message, publisher, sendBack: null, outbox: null, messageId, redeliveryCount, groupId, headers)
+        Guid? messageId = null, string? groupId = null, IReadOnlyDictionary<string, string>? headers = null,
+        int shovelCount = 0)
+        : this(message, publisher, sendBack: null, outbox: null, messageId, redeliveryCount, groupId, headers,
+            shovelCount)
     {
     }
 
     internal PgmqConsumeContext(TMessage message, IPgmqPublisher? publisher, SendBack? sendBack, Outbox? outbox,
-        Guid? messageId, int redeliveryCount, string? groupId = null, IReadOnlyDictionary<string, string>? headers = null)
-        : base(publisher, sendBack, outbox, messageId, redeliveryCount, groupId, headers)
+        Guid? messageId, int redeliveryCount, string? groupId = null, IReadOnlyDictionary<string, string>? headers = null,
+        int shovelCount = 0)
+        : base(publisher, sendBack, outbox, messageId, redeliveryCount, groupId, headers, shovelCount)
     {
         ArgumentNullException.ThrowIfNull(message);
         Message = message;
@@ -148,7 +166,7 @@ public sealed class PgmqConsumeContext<TMessage> : PgmqConsumeContext where TMes
 
     /// <summary>
     /// Puts this message back on this consumer's queue after <paramref name="delay"/>, with the same
-    /// <see cref="PgmqConsumeContext.MessageId"/>, group and headers, and a
+    /// <see cref="PgmqConsumeContext.MessageId"/>, group, headers and <see cref="PgmqConsumeContext.ShovelCount"/>, and a
     /// <see cref="PgmqConsumeContext.RedeliveryCount"/> one higher. The current delivery then completes normally. In a
     /// FIFO group the copy goes to the back of the group.
     /// </summary>

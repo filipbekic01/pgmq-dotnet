@@ -7,10 +7,10 @@ namespace Pgmq.Hosting;
 /// <summary>
 /// Puts a message back on the queue it was read from, through <paramref name="publisher"/>, after a delay, with the
 /// given redelivery count. A <paramref name="messageId"/> keeps the id it had, so the copy reads as the same message; a
-/// group and headers go with it.
+/// group, headers and its shovel count go with it.
 /// </summary>
 internal delegate Task SendBack(IPgmqPublisher publisher, object message, Type messageType, TimeSpan delay, int redeliveryCount, Guid? messageId,
-    string? groupId, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken);
+    string? groupId, IReadOnlyDictionary<string, string>? headers, int shovelCount, CancellationToken cancellationToken);
 
 /// <summary>
 /// How a message reached its consumer: where to publish, how to send it back, the outbox its sends wait in, and the
@@ -26,6 +26,8 @@ internal sealed record Delivery(
     public string? GroupId { get; init; }
 
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
+
+    public int ShovelCount { get; init; }
 }
 
 /// <summary>
@@ -64,7 +66,7 @@ internal static class ConsumerDispatcher
 
         return consumer.HandleAsync(
             new PgmqConsumeContext<TMessage>((TMessage)message, delivery.Publisher, delivery.SendBack, delivery.Outbox,
-                delivery.MessageId, delivery.RedeliveryCount, delivery.GroupId, delivery.Headers),
+                delivery.MessageId, delivery.RedeliveryCount, delivery.GroupId, delivery.Headers, delivery.ShovelCount),
             cancellationToken);
     }
 }
