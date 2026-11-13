@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-13
+
 ### Added
 
 - A cap on replays. A consumer that throws is never run again, so a shovel out of an archive is the retry, and
