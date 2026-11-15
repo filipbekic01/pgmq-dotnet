@@ -9,26 +9,35 @@ namespace Pgmq.Hosting;
 /// <see cref="NpgsqlDataSource"/> the application registers. One Pgmq builds from a connection string is disposed with
 /// it; one handed in through <see cref="PgmqOptions.DataSource"/> is left to its owner.
 /// <para>
-/// Beside it is an unpooled data source for the one LISTEN connection, so the listener never takes a pool slot and
-/// never waits for one when it reconnects. With a data source handed in, it is built from that source's connection
-/// string, which keeps the password only with <c>Persist Security Info=true</c>; the listener falls back to the pool
-/// when it cannot connect that way.
+/// Beside it is an unpooled data source for the two connections that must never wait for a pool slot: the one that
+/// LISTENs, and the lease renewals'. With a data source handed in, it is built from
+/// <see cref="PgmqOptions.DedicatedConnectionString"/> when that is set. Otherwise it is built from that source's
+/// connection string, which keeps the password only with <c>Persist Security Info=true</c>; those connections fall
+/// back to the pool when they cannot connect that way.
 /// </para>
 /// </summary>
 internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
 {
     private readonly bool _owned;
 
-    public PgmqDatabase(NpgsqlDataSource? dataSource, string? connectionString)
+    /// <param name="dataSource">The application's data source, or null to build one.</param>
+    /// <param name="connectionString">What to build the data source from, when none is handed in.</param>
+    /// <param name="dedicatedConnectionString">
+    /// With a data source handed in: what to open the connections outside the pool with, instead of that source's own
+    /// connection string.
+    /// </param>
+    public PgmqDatabase(NpgsqlDataSource? dataSource, string? connectionString,
+        string? dedicatedConnectionString = null)
     {
         _owned = dataSource is null;
         DataSource = dataSource ?? Build(connectionString!);
         Server = ServerEndpoint.Of(DataSource);
-        ListenerDataSource = Build(new NpgsqlConnectionStringBuilder(connectionString ?? DataSource.ConnectionString)
+        ListenerDataSource = Build(new NpgsqlConnectionStringBuilder(
+            dedicatedConnectionString ?? connectionString ?? DataSource.ConnectionString)
         {
             Pooling = false,
         }.ConnectionString);
-        ListenerIsDerived = dataSource is not null;
+        ListenerIsDerived = dataSource is not null && dedicatedConnectionString is null;
     }
 
     public NpgsqlDataSource DataSource { get; }
@@ -44,6 +53,9 @@ internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
 
     /// <summary>Set once the unpooled source could not connect where the pool can: the pool is used from then on.</summary>
     private volatile bool _dedicatedOnPool;
+
+    /// <summary>Whether the connections meant to be outside the pool are taken from it; see <see cref="OpenDedicatedAsync"/>.</summary>
+    public bool DedicatedOnPool => _dedicatedOnPool;
 
     /// <summary>
     /// A connection of its own, outside the pool, for work that must not wait behind the application for a pool slot:
@@ -82,7 +94,10 @@ internal sealed class PgmqDatabase : IAsyncDisposable, IDisposable
             _dedicatedOnPool = true;
             logger.LogWarning(ex, "Could not open a connection outside the pool from the data source's connection " +
                                   "string, which keeps the password only with Persist Security Info=true; the " +
-                                  "insert listener and lease renewals use pooled connections instead");
+                                  "insert listener and lease renewals hold two pooled connections instead, and " +
+                                  "wait behind the application when the pool is used up. Set " +
+                                  "PgmqOptions.DedicatedConnectionString to give them a connection string of " +
+                                  "their own");
             return pooled;
         }
     }

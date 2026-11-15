@@ -64,6 +64,14 @@ public sealed class SweeperTests
             MaxConcurrentReads = 0,
         }.Validate());
 
+    [Fact]
+    public void MaxConcurrentSettles_Should_be_at_least_one()
+        => Assert.Throws<ArgumentOutOfRangeException>(() => new PgmqOptions
+        {
+            ConnectionString = "Host=h",
+            MaxConcurrentSettles = 0,
+        }.Validate());
+
     [Theory]
     [InlineData(nameof(PgmqOptions.RenewEvery), 0)]
     [InlineData(nameof(PgmqOptions.RenewEvery), -1)]

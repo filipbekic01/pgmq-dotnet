@@ -34,7 +34,8 @@ Everything the [README](../README.md) leaves out: behavior, PGMQ feature support
   skips all of this: it sends at once, on its own. Writes to your own database stay outside the transaction, so
   consumers still need to be idempotent.
 - **Timeouts.** A consumer past its timeout has its token cancelled and its message archived. One that ignores the
-  token is abandoned, so its slot frees.
+  token cannot be stopped: it is abandoned, and keeps its slot until it ends, so a queue never runs more consumers
+  than its concurrency. A queue whose every slot is held that way reads nothing and is reported as stalled.
 - **Graceful shutdown.** Reading stops, running consumers get `DrainGrace` to finish, and what stops on cancellation
   goes straight back to the queue.
 - **Survival.** A failed read loop restarts itself. `PgmqStatus.StalledQueues` and the health check report a loop
@@ -235,6 +236,7 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | Option | Default | |
 |---|---|---|
 | `ConnectionString` / `DataSource` | | One of the two is required. |
+| `DedicatedConnectionString` | | With `DataSource`: the connection string for the listener's and the lease renewals' connections, outside the pool. See [Connections](#connections). |
 | `Database` | | The database to use instead of the connection string's, e.g. `"transport"`. Not with `DataSource`. |
 | `AutoSetup` | `true` | Create the database, install or upgrade pgmq, and create queues and triggers on start. Off to only check they exist. |
 | `CreateDatabase` | `true` | With `AutoSetup`, create the database in `ConnectionString` when missing (needs `CREATEDB`). Not with `DataSource`. |
@@ -250,6 +252,7 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `MaxIdleDelay` | 5 s | How often the sweeper looks for work while notifications are live: the most a delayed or released message waits. |
 | `MinIdleDelay` | 200 ms | How often the sweeper looks for work while notifications are not live, backing off to about 1 s. |
 | `MaxConcurrentReads` | `1` | Reads at once across every queue in the host; raise it for throughput. See [Connections](#connections). |
+| `MaxConcurrentSettles` | `4` | Outbox commits and releases at once across every queue in the host. Deletes and archives do not count: they go out together on one connection. |
 | `UseInsertNotifications` / `InsertNotificationThrottle` | `true` / 250 ms | Wake idle queues through LISTEN/NOTIFY. |
 | `LongPollTimeout` | `null` | Obsolete and ignored; the sweeper replaced long polling. |
 | `QueueMetricsInterval` | `null` | How often to read queue depth and oldest message age for the `pgmq.queue.*` gauges. Off by default. |
@@ -278,15 +281,28 @@ A host uses a fixed number of connections, whatever the number of queues:
 | | Connections |
 |---|---|
 | Insert listener | 1, outside the pool (none with `UseInsertNotifications = false`) |
-| Sweeper | 1, from the pool, for one short query at a time |
+| Sweeper | 1, from the pool, only for the one short query of a sweep |
 | Lease renewals | 1, outside the pool, only while messages are being handled |
 | Reads | at most `MaxConcurrentReads` (1), across every queue |
-| Settles | one per message being deleted, archived or released at that moment, and per outbox commit |
+| Deletes and archives | 1, across every queue |
+| Outbox commits and releases | at most `MaxConcurrentSettles` (4), across every queue |
 
-An idle host therefore holds 2. A busy one holds at most `MaxConcurrentReads` + the settles in flight + 3. Idle queues
+An idle host therefore holds 2: the listener's, and the one its pool keeps open for the sweeps, which is in use only
+for the moment of a sweep and free for your application in between when the pool is yours. A busy one holds
+at most `MaxConcurrentReads` + `MaxConcurrentSettles` + 4, whatever the concurrency of its consumers. Nothing is held
+for a message while its consumer runs: the read gave its connection back before the consumer started. Idle queues
 cost nothing because they never read on their own, and a busy queue holds a read slot only for its read, not while its
 messages run, so busy queues take turns. Lease renewals are one batched round trip for every queue each `RenewEvery`,
 on a connection of their own: a pool the application has used up never keeps a renewal waiting while leases run out.
+
+A message that is done is deleted or archived through one connection for the whole host. What finishes while a write
+is on its way goes out together in the next one, a statement per queue in one round trip, so seventy consumers that
+end at once cost one or two round trips, not seventy connections. An outbox commit is a transaction of its own per
+message, and a release (on shutdown, or for a type the host does not know) is written per message too; those share
+`MaxConcurrentSettles` connections, and a message waiting for its turn keeps its lease.
+
+The connections your consumers open themselves are yours to bound, and `Concurrency` is the bound: a queue never runs
+more consumers than that, not even when some ignore their timeout (see **Timeouts** above).
 
 `MaxConcurrentReads` is 1 by default: the fewest connections, but every read waits its turn, and each read is one round
 trip. With many busy queues of low concurrency, where each read fetches only a message or two, that caps throughput.
@@ -300,9 +316,20 @@ builder.Services.AddPgmq(o => o.MaxConcurrentReads = 16);
 `Max Pool Size` stays the ceiling and Pgmq never changes it; normally the pool never gets near it. Pgmq's pool keeps an
 idle connection for Npgsql's `Connection Idle Lifetime` (300 s) after a burst of settles before closing it.
 
-With a `DataSource` of your own, the listener's connection is built from that source's `ConnectionString`, which keeps
-the password only with `Persist Security Info=true`. When it cannot connect that way (no password, or a certificate or
-password provider set in code), the listener takes a pooled connection instead and logs a warning once.
+With a `DataSource` of your own, the two connections outside the pool (the listener's and the lease renewals') are
+built from that source's `ConnectionString`, which keeps the password only with `Persist Security Info=true`. When
+they cannot connect that way (no password, or a certificate or password provider set in code), both take pooled
+connections instead: two pool slots held for good, and a renewal that waits behind your application when the pool is
+used up. A warning is logged once and `PgmqStatus.DedicatedConnectionsUsePool` turns true. To keep them outside the
+pool, give them a connection string of their own:
+
+```csharp
+builder.Services.AddPgmq(o =>
+{
+    o.DataSource = dataSource;
+    o.DedicatedConnectionString = connectionString;   // same server and database, with its password
+});
+```
 
 ## Telemetry
 
@@ -344,6 +371,7 @@ so a trace still continues into the consumer.
 | `messaging.client.consumed.messages` | Counter | `{message}` | queue, consumer, `read` or `pop` |
 | `messaging.process.duration` | Histogram | `s` | queue, consumer, `messaging.pgmq.outcome`, `error.type` on failure |
 | `pgmq.consumer.messages.active` | UpDownCounter | `{message}` | queue, consumer |
+| `pgmq.consumer.abandoned` | UpDownCounter | `{consumer}` | queue, consumer; consumers that ignored their timeout and still run, each holding a slot |
 | `pgmq.consumer.read.failures` | Counter | `{failure}` | queue, consumer, `error.type` |
 | `pgmq.consumer.read_loop.restarts` | Counter | `{restart}` | queue, consumer |
 | `pgmq.consumer.lease_renewal.failures` | Counter | `{failure}` | queue, consumer, `error.type` |

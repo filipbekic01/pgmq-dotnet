@@ -9,10 +9,11 @@ using Pgmq.Hosting;
 namespace Pgmq.IntegrationTests;
 
 /// <summary>
-///     How many connections a host holds, measured in <c>pg_stat_activity</c>: an idle host holds two (the listener
-///     and the sweeper's) whatever the number of queues, and a busy one at most
-///     <see cref="PgmqOptions.MaxConcurrentReads"/> plus the settles in flight plus those two. Each test's host has its
-///     own application name, so no other connection is counted.
+///     How many connections a host holds, measured in <c>pg_stat_activity</c>: an idle host holds the listener's and
+///     the one its pool keeps for the sweeps, whatever the number of queues, and a busy one at most
+///     <see cref="PgmqOptions.MaxConcurrentReads"/> for reads, one for deletes and archives,
+///     <see cref="PgmqOptions.MaxConcurrentSettles"/> for outbox commits and releases, and one for lease renewals
+///     beside those two. Each test's host has its own application name, so no other connection is counted.
 /// </summary>
 [Trait("Category", "Connections")]
 public sealed class ConnectionTests(PgmqFixture db) : IClassFixture<PgmqFixture>
@@ -64,8 +65,9 @@ public sealed class ConnectionTests(PgmqFixture db) : IClassFixture<PgmqFixture>
         await host.Tracker.AllSeen.WaitAsync(TimeSpan.FromSeconds(10), Ct);
         await Task.Delay(TimeSpan.FromSeconds(1), Ct);
 
-        // Reads take turns on MaxConcurrentReads slots; the ten settles may overlap them.
-        Assert.InRange(host.Peak, 1, MaxConcurrentReads + Busy + 2);
+        // Reads take turns on MaxConcurrentReads slots; the settles go out together on one connection. The listener,
+        // the sweeper and the lease renewals have one each.
+        Assert.InRange(host.Peak, 1, MaxConcurrentReads + 1 + 3);
         Assert.All(host.QueueNames.Skip(Busy), q => Assert.Equal(0, telemetry.Sum("pgmq.consumer.reads", q)));
         Assert.All(host.QueueNames.Take(Busy), q => Assert.True(telemetry.Sum("pgmq.consumer.reads", q) > 0));
     }
@@ -139,10 +141,39 @@ public sealed class ConnectionTests(PgmqFixture db) : IClassFixture<PgmqFixture>
 
         await host.Tracker.AllSeen.WaitAsync(TimeSpan.FromMinutes(2), Ct);
 
-        // Concurrency 1 on every queue: at most one settle per queue at a time. The listener, the sweeper and the
-        // lease renewals have one each.
-        Assert.InRange(host.Peak, 1, MaxConcurrentReads + Queues + 3);
+        // The sixteen connections the publishes above left in the pool are still there, idle. Beside the pool: the
+        // listener and the lease renewals. Reads, the one connection for deletes and the sweeper stay within it.
+        Assert.InRange(host.Peak, 1, 16 + 2);
         Assert.Equal(0, host.Tracker.Duplicates);
+    }
+
+    [Fact]
+    public async Task Consumers_finishing_together_Should_settle_through_one_connection()
+    {
+        const int Messages = 3000;
+        using TelemetryCapture telemetry = new();
+        await using Host host = await Host.StartAsync(db, queues: 1, messages: Messages,
+            o => o.DefaultConcurrency = 64,
+            before: async (h, ct) =>
+            {
+                // One after another, so the pool starts with a single connection.
+                for (int id = 0; id < Messages; id++)
+                {
+                    LoadMessage message = (LoadMessage)Activator.CreateInstance(h.MessageTypes[0])!;
+                    message.Id = id;
+                    await h.Publisher.PublishAsync(message, h.MessageTypes[0], ct);
+                }
+            });
+
+        await host.Tracker.AllSeen.WaitAsync(TimeSpan.FromMinutes(1), Ct);
+        await Eventually.HoldsAsync(async () => await db.CountAsync(host.QueueNames[0]) == 0, TimeSpan.FromSeconds(20),
+            "every message deleted");
+
+        // Sixty-four consumers end at once, again and again. From the pool: one read, the deletes together on one
+        // connection, and a sweep that may overlap both. Outside it: the listener and the lease renewals.
+        Assert.InRange(host.Peak, 1, 5);
+        Assert.Equal(0, host.Tracker.Duplicates);
+        Assert.Equal(0, await db.ArchivedAsync(host.QueueNames[0]));
     }
 
     [Fact]

@@ -23,7 +23,15 @@ namespace Pgmq.Hosting;
 /// <c>pgmq.a_{queue}</c>; a consumer is never run again because it failed. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
 /// consumer keeps taking the process down) is archived without running. The outcome is decided first and written to the queue after, with its own retries
 /// (some two minutes of them, the message keeping its lease meanwhile), so a failed delete does not run a consumer
-/// again unless the database stays away longer than that.
+/// again unless the database stays away longer than that. Deletes and archives of every queue go out together
+/// through the <see cref="SettleBatcher"/>, on one connection at a time; outbox commits and releases, which are
+/// written one message at a time, share <see cref="PgmqOptions.MaxConcurrentSettles"/> connections.
+/// </para>
+/// <para>
+/// <b>Slots.</b> A queue runs at most its <c>Concurrency</c> consumers, always. A consumer that ignores its cancelled
+/// token cannot be stopped; it is abandoned, its message archived, and it keeps its slot until it does end, so
+/// consumers that hang never pile up beyond the concurrency. A queue whose every slot is held that way reads nothing
+/// and is reported as stalled.
 /// </para>
 /// <para>
 /// <b>Shutdown.</b> Reading stops at once, and a message read but not yet started goes back to the queue. Running
@@ -49,14 +57,16 @@ namespace Pgmq.Hosting;
 /// <b>Waking.</b> An idle queue never goes to the database on its own. Its read loop reads only when woken: by an
 /// insert notification (LISTEN/NOTIFY), by the <see cref="QueueSweeper"/>, which finds every queue with a visible
 /// message in one query, or because its last read found messages, so more are likely. Otherwise it waits. An idle host
-/// therefore holds two connections (the listener and the sweeper's) whatever the number of queues, and a busy one
-/// reads through at most <see cref="PgmqOptions.MaxConcurrentReads"/> connections at once, and renews its leases on
-/// one more, outside the pool.
+/// therefore holds two connections whatever the number of queues: the listener's, outside the pool, and the one the
+/// pool keeps open for the sweeps, which is taken only for the moment of a sweep. A busy one reads through at most <see cref="PgmqOptions.MaxConcurrentReads"/>
+/// connections at once, settles through at most one and <see cref="PgmqOptions.MaxConcurrentSettles"/> more, and
+/// renews its leases on one more, outside the pool.
 /// </para>
 /// </summary>
 internal sealed class ConsumerWorker(
     PgmqQueueManager queues,
     QueueReader reader,
+    SettleBatcher settler,
     InsertListener listener,
     QueueSweeper sweeper,
     ConsumerRegistry registry,
@@ -100,6 +110,12 @@ internal sealed class ConsumerWorker(
     /// </summary>
     private readonly SemaphoreSlim _renewing = new(1, 1);
 
+    /// <summary>
+    /// Bounds the writes that take a connection per message: outbox commits and releases. Deletes and archives go
+    /// through the <see cref="SettleBatcher"/> instead.
+    /// </summary>
+    private readonly SemaphoreSlim _settling = new(options.MaxConcurrentSettles, options.MaxConcurrentSettles);
+
     /// <summary>The host's stopping token, once running: a FIFO chain stops starting messages when it fires.</summary>
     private CancellationToken _stopping;
 
@@ -117,14 +133,19 @@ internal sealed class ConsumerWorker(
     /// </summary>
     private int RenewTimeoutSeconds => Math.Max(1, (int)Math.Ceiling(options.RenewEvery.TotalSeconds / 2));
 
-    /// <summary>The queues whose read loop has not run for <see cref="PgmqOptions.StallAfter"/> while the host is up.</summary>
+    /// <summary>
+    /// The queues that read nothing while the host is up: their read loop has not run for
+    /// <see cref="PgmqOptions.StallAfter"/>, or abandoned consumers that never ended hold every slot.
+    /// </summary>
     public IReadOnlyList<string> Stalled()
     {
         long now = Stopwatch.GetTimestamp();
         return
         [
             .. _queues.Values
-                .Where(q => !q.Stopped && Stopwatch.GetElapsedTime(Volatile.Read(ref q.LastBeat), now) > options.StallAfter)
+                .Where(q => !q.Stopped
+                            && (Stopwatch.GetElapsedTime(Volatile.Read(ref q.LastBeat), now) > options.StallAfter
+                                || Volatile.Read(ref q.Abandoned) >= q.Consumer.Concurrency))
                 .Select(q => q.Consumer.QueueName)
                 .Order(StringComparer.Ordinal)
         ];
@@ -133,6 +154,7 @@ internal sealed class ConsumerWorker(
     public override Task StartAsync(CancellationToken cancellationToken)
     {
         status.ReportStalledFrom(Stalled);
+        status.ReportDedicatedOnPoolFrom(() => database.DedicatedOnPool);
         return base.StartAsync(cancellationToken);
     }
 
@@ -408,7 +430,8 @@ internal sealed class ConsumerWorker(
 
     /// <summary>
     /// Runs messages one after another on their own task, freeing each one's slot when it is settled, whatever
-    /// happened. Once one does not succeed, or the host is stopping, the rest go back to the queue unhandled. An
+    /// happened; the slot of an abandoned consumer is freed only when that consumer ends. Once one does not succeed,
+    /// or the host is stopping, the rest go back to the queue unhandled. An
     /// at-most-once message is already off the queue, so it runs even while the host stops: its consumer gets the
     /// drain grace like any running one.
     /// </summary>
@@ -436,9 +459,12 @@ internal sealed class ConsumerWorker(
             for (; run && next < chain.Length && carryOn && (atMostOnce || !_stopping.IsCancellationRequested); next++)
             {
                 QueueMessage message = chain[next];
+                Task? stillRunning = null;
                 try
                 {
-                    carryOn = await HandleAsync(state, message, leases[next]) == SettlementKind.Delete;
+                    Handled handled = await HandleAsync(state, message, leases[next]);
+                    carryOn = handled.Kind == SettlementKind.Delete;
+                    stillRunning = handled.StillRunning;
                 }
                 catch (Exception ex)
                 {
@@ -451,7 +477,7 @@ internal sealed class ConsumerWorker(
                 finally
                 {
                     Unlease(state, message, leases[next]);
-                    state.Slots.Release();
+                    FreeSlot(state, message, stillRunning);
                 }
             }
 
@@ -478,6 +504,51 @@ internal sealed class ConsumerWorker(
 
         state.InFlight.TryAdd(handling, 0);
         handling.ContinueWith(done => state.InFlight.TryRemove(done, out _), TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Frees a message's slot, at once or, when its consumer was abandoned and still runs, as soon as that consumer
+    /// ends. Until then the slot counts as taken, so a queue never runs more consumers than its concurrency, however
+    /// many of them ignore their timeout.
+    /// </summary>
+    private void FreeSlot(QueueState state, QueueMessage message, Task? stillRunning)
+    {
+        if (stillRunning is null || stillRunning.IsCompleted)
+        {
+            state.Slots.Release();
+            return;
+        }
+
+        string queue = state.Consumer.QueueName;
+        string consumer = state.Consumer.ConsumerType.Name;
+        long started = Stopwatch.GetTimestamp();
+        int held = Interlocked.Increment(ref state.Abandoned);
+        PgmqTelemetry.AbandonedConsumers.Add(1, state.Tags);
+
+        if (held >= state.Consumer.Concurrency)
+        {
+            logger.LogCritical("Abandoned consumers that never ended hold every slot of {Queue} ({Slots}); it reads " +
+                               "nothing until one of them ends. {Consumer} must stop when its token is cancelled",
+                queue, state.Consumer.Concurrency, consumer);
+        }
+
+        stillRunning.ContinueWith(_ =>
+        {
+            Interlocked.Decrement(ref state.Abandoned);
+            PgmqTelemetry.AbandonedConsumers.Add(-1, state.Tags);
+            state.Slots.Release();
+
+            try
+            {
+                logger.LogWarning("{Consumer}, abandoned while handling message {MsgId} on {Queue}, ended {After} " +
+                                  "later; its slot is free again", consumer, message.MsgId, queue,
+                    Stopwatch.GetElapsedTime(started));
+            }
+            catch (ObjectDisposedException)
+            {
+                // It outlived the host: nobody is left to tell.
+            }
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
 
     /// <summary>
@@ -508,8 +579,11 @@ internal sealed class ConsumerWorker(
         }
     }
 
-    /// <summary>Handles one message to its end, and says how it was settled.</summary>
-    private async Task<SettlementKind> HandleAsync(QueueState state, QueueMessage message, LeaseEntry? lease)
+    /// <summary>
+    /// Handles one message to its end, and says how it was settled, and whether its consumer was abandoned and still
+    /// runs.
+    /// </summary>
+    private async Task<Handled> HandleAsync(QueueState state, QueueMessage message, LeaseEntry? lease)
     {
         ConsumerRegistration consumer = state.Consumer;
         string consumerName = consumer.ConsumerType.Name;
@@ -539,6 +613,7 @@ internal sealed class ConsumerWorker(
         // when attempts never settled: its consumer kept taking the process down, or it never came back from one.
         bool exhausted = !consumer.AtMostOnce && message.ReadCt > options.MaxAttempts;
         Outcome outcome;
+        Task? stillRunning = null;
 
         PgmqTelemetry.ActiveMessages.Add(1, state.Tags);
         try
@@ -553,7 +628,7 @@ internal sealed class ConsumerWorker(
             }
             else if (known)
             {
-                outcome = await RunConsumerAsync(state, message, headers!, messageType!, lease);
+                (outcome, stillRunning) = await RunConsumerAsync(state, message, headers!, messageType!, lease);
             }
             else if (unresolved && message.ReadCt < options.MaxAttempts)
             {
@@ -600,9 +675,9 @@ internal sealed class ConsumerWorker(
 
         // An unknown or exhausted message that was archived is out of its group, so the group's next message may run.
         // One put back for later still holds its group, in order.
-        return (known && !exhausted) || outcome.Settlement.Kind == SettlementKind.Release
+        return new((known && !exhausted) || outcome.Settlement.Kind == SettlementKind.Release
             ? outcome.Settlement.Kind
-            : SettlementKind.Delete;
+            : SettlementKind.Delete, stillRunning);
     }
 
     /// <summary>
@@ -616,8 +691,11 @@ internal sealed class ConsumerWorker(
         return TimeSpan.FromTicks((long)Math.Min(options.Lease.Ticks * factor, MaxUnknownTypeDelay.Ticks));
     }
 
-    /// <summary>Runs the consumer under its deadline and flushes its outbox, and says what to do with the message.</summary>
-    private async Task<Outcome> RunConsumerAsync(QueueState state, QueueMessage message,
+    /// <summary>
+    /// Runs the consumer under its deadline and flushes its outbox, and says what to do with the message. A consumer
+    /// that was abandoned is returned as well: it still runs.
+    /// </summary>
+    private async Task<(Outcome Outcome, Task? StillRunning)> RunConsumerAsync(QueueState state, QueueMessage message,
         MessageHeaders headers, Type messageType, LeaseEntry? lease)
     {
         ConsumerRegistration consumer = state.Consumer;
@@ -632,16 +710,16 @@ internal sealed class ConsumerWorker(
         try
         {
             // Normally the consumer returns, or throws once its token cancels. One that ignores the token is waited for
-            // AbandonAfter longer, then left to finish on its own. On shutdown one that ignores it keeps the drain
-            // waiting until the host gives up; its lease then lapses and the message comes back.
+            // AbandonAfter longer, then left to finish on its own, still in its slot. On shutdown one that ignores it
+            // keeps the drain waiting until the host gives up; its lease then lapses and the message comes back.
             await run.WaitAsync(timeout + options.AbandonAfter);
         }
         catch (TimeoutException ex) when (!run.IsCompleted)
         {
             _ = run.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
-            logger.LogError(ex, "{Consumer} ignored its timeout of {Timeout}; abandoned it and archiving the message",
-                consumer.ConsumerType.Name, timeout);
-            return Outcome.Archived("pgmq.abandoned", ex);
+            logger.LogError(ex, "{Consumer} ignored its timeout of {Timeout}; abandoned it and archiving the message. " +
+                                "It keeps its slot until it ends", consumer.ConsumerType.Name, timeout);
+            return (Outcome.Archived("pgmq.abandoned", ex), run);
         }
         catch (Exception ex) when (_abort.IsCancellationRequested)
         {
@@ -653,28 +731,28 @@ internal sealed class ConsumerWorker(
             {
                 logger.LogWarning(ex, "{Consumer} stopped for shutdown; its at-most-once message is lost",
                     consumer.ConsumerType.Name);
-                return Outcome.Lost("pgmq.shutdown");
+                return (Outcome.Lost("pgmq.shutdown"), null);
             }
 
             logger.LogInformation(ex is OperationCanceledException ? null : ex,
                 "{Consumer} stopped for shutdown; its message goes back to the queue",
                 consumer.ConsumerType.Name);
-            return Outcome.Released;
+            return (Outcome.Released, null);
         }
         catch (OperationCanceledException ex) when (deadline.IsCancellationRequested)
         {
             logger.LogError(ex, "{Consumer} ran past its timeout of {Timeout}; archiving the message",
                 consumer.ConsumerType.Name, timeout);
-            return Outcome.Archived("timeout", ex);
+            return (Outcome.Archived("timeout", ex), null);
         }
         catch (Exception ex)
         {
-            return Failed(consumer, message, messageType, ex);
+            return (Failed(consumer, message, messageType, ex), null);
         }
 
         if (outbox.Count == 0)
         {
-            return Outcome.Success;
+            return (Outcome.Success, null);
         }
 
         // The commit deletes the message: from here a renewal that finds it gone has not lost its lease.
@@ -698,18 +776,18 @@ internal sealed class ConsumerWorker(
             {
                 logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; the " +
                                     "at-most-once message is lost", consumer.ConsumerType.Name, outbox.Count);
-                return Outcome.Lost(PgmqTelemetry.ErrorType(ex), ex);
+                return (Outcome.Lost(PgmqTelemetry.ErrorType(ex), ex), null);
             }
 
             // Running it again is the only way to send them, and a consumer is never run again.
             logger.LogError(ex, "{Consumer} succeeded but its {Count} publishes could not be sent; archiving the " +
                                 "message", consumer.ConsumerType.Name, outbox.Count);
-            return Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex);
+            return (Outcome.Archived(PgmqTelemetry.ErrorType(ex), ex), null);
         }
 
         if (consumer.AtMostOnce || deleted)
         {
-            return Outcome.Committed;
+            return (Outcome.Committed, null);
         }
 
         // Someone else settled the message first (its lease lapsed and another read finished it, or it was deleted by
@@ -717,7 +795,7 @@ internal sealed class ConsumerWorker(
         // other read; these were rolled back.
         logger.LogWarning("{Consumer} succeeded, but message {MsgId} was no longer on {Queue}; its {Count} publishes " +
                           "were not sent", consumer.ConsumerType.Name, message.MsgId, consumer.QueueName, outbox.Count);
-        return Outcome.Gone;
+        return (Outcome.Gone, null);
     }
 
     private async Task DispatchAsync(ConsumerRegistration consumer, QueueMessage message,
@@ -765,19 +843,28 @@ internal sealed class ConsumerWorker(
     private async Task<bool> CommitAsync(QueueState state, QueueMessage message, Outbox outbox,
         CancellationToken cancellationToken)
     {
-        await using NpgsqlConnection connection = await database.DataSource.OpenConnectionAsync(cancellationToken);
-        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
-
-        await outbox.FlushAsync(publisher.InTransaction(transaction), cancellationToken);
-
-        if (!state.Consumer.AtMostOnce && !await DeleteAsync(state, message, transaction, cancellationToken))
+        // The message keeps its lease while it waits for its turn.
+        await _settling.WaitAsync(cancellationToken);
+        try
         {
-            await transaction.RollbackAsync(cancellationToken);
-            return false;
-        }
+            await using NpgsqlConnection connection = await database.DataSource.OpenConnectionAsync(cancellationToken);
+            await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-        await transaction.CommitAsync(cancellationToken);
-        return true;
+            await outbox.FlushAsync(publisher.InTransaction(transaction), cancellationToken);
+
+            if (!state.Consumer.AtMostOnce && !await DeleteAsync(state, message, transaction, cancellationToken))
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _settling.Release();
+        }
     }
 
     /// <summary>The delete of a message in its outbox's transaction, traced and measured as any other settle.</summary>
@@ -836,8 +923,8 @@ internal sealed class ConsumerWorker(
                 tries++;
                 found = settlement.Kind switch
                 {
-                    SettlementKind.Delete => await queues.DeleteMessageAsync(queue, message.MsgId, ct),
-                    SettlementKind.Archive => await queues.ArchiveMessageAsync(queue, message.MsgId, ct),
+                    SettlementKind.Delete => await settler.DeleteAsync(queue, message.MsgId),
+                    SettlementKind.Archive => await settler.ArchiveAsync(queue, message.MsgId),
                     _ => await ReleaseAsync(queue, message.MsgId, settlement, ct),
                 };
             }, settlement.Kind.ToString().ToLowerInvariant(), state, message);
@@ -883,9 +970,17 @@ internal sealed class ConsumerWorker(
             _renewing.Release();
         }
 
-        return settlement.Unread
-            ? await queues.ReturnUnreadAsync(queue, messageId, cancellationToken)
-            : await queues.SetVisibilityTimeoutAsync(queue, messageId, settlement.Delay, cancellationToken);
+        await _settling.WaitAsync(cancellationToken);
+        try
+        {
+            return settlement.Unread
+                ? await queues.ReturnUnreadAsync(queue, messageId, cancellationToken)
+                : await queues.SetVisibilityTimeoutAsync(queue, messageId, settlement.Delay, cancellationToken);
+        }
+        finally
+        {
+            _settling.Release();
+        }
     }
 
     /// <summary>
@@ -1186,6 +1281,9 @@ internal sealed class ConsumerWorker(
         public long LastBeat = Stopwatch.GetTimestamp();
         public volatile bool Stopped;
 
+        /// <summary>Slots held by abandoned consumers that have not ended yet.</summary>
+        public int Abandoned;
+
         public ConsumerRegistration Consumer { get; } = consumer;
 
         /// <summary>The queue and consumer, as tags of the worker's metrics.</summary>
@@ -1229,6 +1327,9 @@ internal sealed class ConsumerWorker(
         /// <summary>Its outcome is being written, so its row may be gone before the lease is ended.</summary>
         public volatile bool Settling;
     }
+
+    /// <summary>How a message was settled, and its consumer when it was abandoned and still runs.</summary>
+    private readonly record struct Handled(SettlementKind Kind, Task? StillRunning);
 
     private enum SettlementKind
     {
