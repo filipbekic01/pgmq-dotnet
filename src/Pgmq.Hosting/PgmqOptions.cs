@@ -140,8 +140,8 @@ public sealed class PgmqOptions
     /// Reads, across every queue, that run at once in this host. A busy queue holds a slot only for its read, not
     /// while its messages run, so busy queues take turns and idle ones never ask. Settles, outbox commits and lease
     /// renewals do not count against it. A host then uses at most this many connections for reads, one for the
-    /// listener, one for the sweeper, one for lease renewals while messages run, one for deletes and archives, and
-    /// <see cref="MaxConcurrentSettles"/> for outbox commits and releases, whatever the pool allows.
+    /// listener, one for the sweeper, one for lease renewals while messages run, one for deletes, archives and
+    /// releases, and <see cref="MaxConcurrentCommits"/> for outbox commits, whatever the pool allows.
     /// <para>
     /// One by default: the fewest connections. Each read is one round trip, so with many busy queues of low concurrency
     /// (each read then fetches only a message or two) this caps how fast the host reads. Raise it for throughput:
@@ -153,17 +153,16 @@ public sealed class PgmqOptions
     public int MaxConcurrentReads { get; set; } = 1;
 
     /// <summary>
-    /// Outbox commits and releases, across every queue, that run at once in this host. Each is written for one
-    /// message on a connection of its own: an outbox commit when a consumer that published through its context
-    /// succeeds, a release when a message goes back to the queue (on shutdown, or for a type this host does not know).
-    /// A message waiting for its turn keeps its lease. Deletes and archives do not count against it: those of every
-    /// queue go out together, on one connection at a time.
+    /// Outbox commits, across every queue, that run at once in this host. A consumer that published through its
+    /// context and succeeded has what it published sent, and its message deleted, in a transaction of its own on a
+    /// connection of its own; a message waiting for its turn keeps its lease. Nothing else counts against it:
+    /// deletes, archives and releases of every queue go out together, on one connection at a time.
     /// <para>
     /// Four by default. Raise it when most consumers publish through their context and the host should commit more of
     /// them at once.
     /// </para>
     /// </summary>
-    public int MaxConcurrentSettles { get; set; } = 4;
+    public int MaxConcurrentCommits { get; set; } = 4;
 
     /// <summary>
     /// Wake an idle read loop as soon as a message is inserted, through PostgreSQL LISTEN/NOTIFY
@@ -278,7 +277,7 @@ public sealed class PgmqOptions
         }
 
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentReads, 1, nameof(MaxConcurrentReads));
-        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentSettles, 1, nameof(MaxConcurrentSettles));
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentCommits, 1, nameof(MaxConcurrentCommits));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MinIdleDelay, TimeSpan.Zero, nameof(MinIdleDelay));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(StallAfter, TimeSpan.Zero, nameof(StallAfter));
     }

@@ -11,9 +11,9 @@ namespace Pgmq.IntegrationTests;
 /// <summary>
 ///     How many connections a host holds, measured in <c>pg_stat_activity</c>: an idle host holds the listener's and
 ///     the one its pool keeps for the sweeps, whatever the number of queues, and a busy one at most
-///     <see cref="PgmqOptions.MaxConcurrentReads"/> for reads, one for deletes and archives,
-///     <see cref="PgmqOptions.MaxConcurrentSettles"/> for outbox commits and releases, and one for lease renewals
-///     beside those two. Each test's host has its own application name, so no other connection is counted.
+///     <see cref="PgmqOptions.MaxConcurrentReads"/> for reads, one for deletes, archives and releases,
+///     <see cref="PgmqOptions.MaxConcurrentCommits"/> for outbox commits, and one for lease renewals beside those
+///     two. Each test's host has its own application name, so no other connection is counted.
 /// </summary>
 [Trait("Category", "Connections")]
 public sealed class ConnectionTests(PgmqFixture db) : IClassFixture<PgmqFixture>

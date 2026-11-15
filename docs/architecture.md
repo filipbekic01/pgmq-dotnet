@@ -53,9 +53,10 @@ One read loop per queue, each with its own semaphore of slots:
 4. Decide the outcome first, then write it to the queue with its own retries: delete on success (in one
    transaction with what the consumer published, when it published anything); archive on a failure or a timeout.
    A consumer is never run again because it failed. A failed
-   write is never mistaken for a failed consumer. Deletes and archives of every queue go through one writer, which
-   sends whatever waits as one batch, a statement per queue, on one connection at a time; outbox commits and
-   releases are written per message, at most `MaxConcurrentSettles` at once.
+   write is never mistaken for a failed consumer. Deletes, archives and releases of every queue go through one writer,
+   which sends whatever waits as one batch, a statement per queue, on one connection at a time. A batch that fails
+   sets its queues apart, each written on its own until it succeeds, so one broken queue never fails the others
+   twice. Outbox commits are a transaction per message, at most `MaxConcurrentCommits` at once.
 5. Free the slot.
 
 Nothing an idle queue does grows with the number of queues. One connection per host LISTENs to every queue, outside
@@ -65,8 +66,8 @@ whose time came, released messages, lapsed leases and lost notifications; every 
 they are not. The listener and the sweeper start before the read loops, which start waiting, so starting the host is one
 query, and a listener that comes back runs one sweep rather than waking every queue. An idle host holds two
 connections, the listener's and the one the pool keeps for the sweeps; a busy one at most `MaxConcurrentReads` for reads, one for
-deletes and archives, `MaxConcurrentSettles` for outbox commits and releases, and one for lease renewals beside
-those two.
+deletes, archives and releases, `MaxConcurrentCommits` for outbox commits, and one for lease renewals beside those
+two.
 
 A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the health check read.
 

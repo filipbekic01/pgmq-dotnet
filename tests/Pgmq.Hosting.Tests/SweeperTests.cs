@@ -65,11 +65,11 @@ public sealed class SweeperTests
         }.Validate());
 
     [Fact]
-    public void MaxConcurrentSettles_Should_be_at_least_one()
+    public void MaxConcurrentCommits_Should_be_at_least_one()
         => Assert.Throws<ArgumentOutOfRangeException>(() => new PgmqOptions
         {
             ConnectionString = "Host=h",
-            MaxConcurrentSettles = 0,
+            MaxConcurrentCommits = 0,
         }.Validate());
 
     [Theory]

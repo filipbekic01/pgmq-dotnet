@@ -252,7 +252,7 @@ the version in `PgmqMigrator.EmbeddedVersion`. `PgmqMigrator` can also be used w
 | `MaxIdleDelay` | 5 s | How often the sweeper looks for work while notifications are live: the most a delayed or released message waits. |
 | `MinIdleDelay` | 200 ms | How often the sweeper looks for work while notifications are not live, backing off to about 1 s. |
 | `MaxConcurrentReads` | `1` | Reads at once across every queue in the host; raise it for throughput. See [Connections](#connections). |
-| `MaxConcurrentSettles` | `4` | Outbox commits and releases at once across every queue in the host. Deletes and archives do not count: they go out together on one connection. |
+| `MaxConcurrentCommits` | `4` | Outbox commits at once across every queue in the host. Deletes, archives and releases do not count: they go out together on one connection. |
 | `UseInsertNotifications` / `InsertNotificationThrottle` | `true` / 250 ms | Wake idle queues through LISTEN/NOTIFY. |
 | `LongPollTimeout` | `null` | Obsolete and ignored; the sweeper replaced long polling. |
 | `QueueMetricsInterval` | `null` | How often to read queue depth and oldest message age for the `pgmq.queue.*` gauges. Off by default. |
@@ -284,22 +284,28 @@ A host uses a fixed number of connections, whatever the number of queues:
 | Sweeper | 1, from the pool, only for the one short query of a sweep |
 | Lease renewals | 1, outside the pool, only while messages are being handled |
 | Reads | at most `MaxConcurrentReads` (1), across every queue |
-| Deletes and archives | 1, across every queue |
-| Outbox commits and releases | at most `MaxConcurrentSettles` (4), across every queue |
+| Deletes, archives and releases | 1, across every queue (one per queue while a write of it fails) |
+| Outbox commits | at most `MaxConcurrentCommits` (4), across every queue |
 
 An idle host therefore holds 2: the listener's, and the one its pool keeps open for the sweeps, which is in use only
 for the moment of a sweep and free for your application in between when the pool is yours. A busy one holds
-at most `MaxConcurrentReads` + `MaxConcurrentSettles` + 4, whatever the concurrency of its consumers. Nothing is held
+at most `MaxConcurrentReads` + `MaxConcurrentCommits` + 4, whatever the concurrency of its consumers. Nothing is held
 for a message while its consumer runs: the read gave its connection back before the consumer started. Idle queues
 cost nothing because they never read on their own, and a busy queue holds a read slot only for its read, not while its
 messages run, so busy queues take turns. Lease renewals are one batched round trip for every queue each `RenewEvery`,
 on a connection of their own: a pool the application has used up never keeps a renewal waiting while leases run out.
 
-A message that is done is deleted or archived through one connection for the whole host. What finishes while a write
-is on its way goes out together in the next one, a statement per queue in one round trip, so seventy consumers that
-end at once cost one or two round trips, not seventy connections. An outbox commit is a transaction of its own per
-message, and a release (on shutdown, or for a type the host does not know) is written per message too; those share
-`MaxConcurrentSettles` connections, and a message waiting for its turn keeps its lease.
+A message that is done is deleted, archived or released through one connection for the whole host. What finishes
+while a write is on its way goes out together in the next one, a statement per queue in one round trip, so seventy
+consumers that end at once cost one or two round trips, not seventy connections. An outbox commit is a transaction of
+its own per message; those share `MaxConcurrentCommits` connections, and a message waiting for its turn keeps its
+lease.
+
+That one write is one transaction, so a queue that cannot be written (its table locked, or dropped) fails the write it
+is in. Every queue of a failed write is then written on its own, each on its own connection, until a write of it
+succeeds: the queue at fault keeps failing alone and the others go back to the shared write. While the database is
+away, or a queue is broken, settling can therefore use one connection per queue that has messages to settle, never
+one per message.
 
 The connections your consumers open themselves are yours to bound, and `Concurrency` is the bound: a queue never runs
 more consumers than that, not even when some ignore their timeout (see **Timeouts** above).

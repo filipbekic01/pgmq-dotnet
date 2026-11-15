@@ -23,9 +23,9 @@ namespace Pgmq.Hosting;
 /// <c>pgmq.a_{queue}</c>; a consumer is never run again because it failed. A message read more than <see cref="PgmqOptions.MaxAttempts"/> times without settling (its
 /// consumer keeps taking the process down) is archived without running. The outcome is decided first and written to the queue after, with its own retries
 /// (some two minutes of them, the message keeping its lease meanwhile), so a failed delete does not run a consumer
-/// again unless the database stays away longer than that. Deletes and archives of every queue go out together
-/// through the <see cref="SettleBatcher"/>, on one connection at a time; outbox commits and releases, which are
-/// written one message at a time, share <see cref="PgmqOptions.MaxConcurrentSettles"/> connections.
+/// again unless the database stays away longer than that. Deletes, archives and releases of every queue go out
+/// together through the <see cref="SettleBatcher"/>, on one connection at a time; outbox commits, each a transaction
+/// of its own, share <see cref="PgmqOptions.MaxConcurrentCommits"/> connections.
 /// </para>
 /// <para>
 /// <b>Slots.</b> A queue runs at most its <c>Concurrency</c> consumers, always. A consumer that ignores its cancelled
@@ -58,9 +58,9 @@ namespace Pgmq.Hosting;
 /// insert notification (LISTEN/NOTIFY), by the <see cref="QueueSweeper"/>, which finds every queue with a visible
 /// message in one query, or because its last read found messages, so more are likely. Otherwise it waits. An idle host
 /// therefore holds two connections whatever the number of queues: the listener's, outside the pool, and the one the
-/// pool keeps open for the sweeps, which is taken only for the moment of a sweep. A busy one reads through at most <see cref="PgmqOptions.MaxConcurrentReads"/>
-/// connections at once, settles through at most one and <see cref="PgmqOptions.MaxConcurrentSettles"/> more, and
-/// renews its leases on one more, outside the pool.
+/// pool keeps open for the sweeps, which is taken only for the moment of a sweep. A busy one reads through at most
+/// <see cref="PgmqOptions.MaxConcurrentReads"/> connections at once, settles through one, commits outboxes through
+/// at most <see cref="PgmqOptions.MaxConcurrentCommits"/>, and renews its leases on one more, outside the pool.
 /// </para>
 /// </summary>
 internal sealed class ConsumerWorker(
@@ -111,10 +111,10 @@ internal sealed class ConsumerWorker(
     private readonly SemaphoreSlim _renewing = new(1, 1);
 
     /// <summary>
-    /// Bounds the writes that take a connection per message: outbox commits and releases. Deletes and archives go
-    /// through the <see cref="SettleBatcher"/> instead.
+    /// Bounds the one write that takes a connection per message: the outbox commit. Deletes, archives and releases
+    /// go through the <see cref="SettleBatcher"/> instead.
     /// </summary>
-    private readonly SemaphoreSlim _settling = new(options.MaxConcurrentSettles, options.MaxConcurrentSettles);
+    private readonly SemaphoreSlim _committing = new(options.MaxConcurrentCommits, options.MaxConcurrentCommits);
 
     /// <summary>The host's stopping token, once running: a FIFO chain stops starting messages when it fires.</summary>
     private CancellationToken _stopping;
@@ -519,8 +519,10 @@ internal sealed class ConsumerWorker(
             return;
         }
 
+        // Only what the continuation needs: it lives as long as the consumer does, and must not keep the message.
         string queue = state.Consumer.QueueName;
         string consumer = state.Consumer.ConsumerType.Name;
+        long messageId = message.MsgId;
         long started = Stopwatch.GetTimestamp();
         int held = Interlocked.Increment(ref state.Abandoned);
         PgmqTelemetry.AbandonedConsumers.Add(1, state.Tags);
@@ -541,7 +543,7 @@ internal sealed class ConsumerWorker(
             try
             {
                 logger.LogWarning("{Consumer}, abandoned while handling message {MsgId} on {Queue}, ended {After} " +
-                                  "later; its slot is free again", consumer, message.MsgId, queue,
+                                  "later; its slot is free again", consumer, messageId, queue,
                     Stopwatch.GetElapsedTime(started));
             }
             catch (ObjectDisposedException)
@@ -844,7 +846,7 @@ internal sealed class ConsumerWorker(
         CancellationToken cancellationToken)
     {
         // The message keeps its lease while it waits for its turn.
-        await _settling.WaitAsync(cancellationToken);
+        await _committing.WaitAsync(cancellationToken);
         try
         {
             await using NpgsqlConnection connection = await database.DataSource.OpenConnectionAsync(cancellationToken);
@@ -863,7 +865,7 @@ internal sealed class ConsumerWorker(
         }
         finally
         {
-            _settling.Release();
+            _committing.Release();
         }
     }
 
@@ -970,17 +972,9 @@ internal sealed class ConsumerWorker(
             _renewing.Release();
         }
 
-        await _settling.WaitAsync(cancellationToken);
-        try
-        {
-            return settlement.Unread
-                ? await queues.ReturnUnreadAsync(queue, messageId, cancellationToken)
-                : await queues.SetVisibilityTimeoutAsync(queue, messageId, settlement.Delay, cancellationToken);
-        }
-        finally
-        {
-            _settling.Release();
-        }
+        return settlement.Unread
+            ? await settler.ReturnUnreadAsync(queue, messageId)
+            : await settler.ReleaseAsync(queue, messageId, settlement.Delay);
     }
 
     /// <summary>
