@@ -32,10 +32,12 @@ public static class PgmqServiceCollectionExtensions
 
         // One pool for everything Pgmq does, and one unpooled connection for the insert listener. A data source Pgmq
         // builds is its own and disposed with the container; one handed in belongs to the application.
-        services.TryAddSingleton(_ => new PgmqDatabase(options.DataSource, options.EffectiveConnectionString));
+        services.TryAddSingleton(_ => new PgmqDatabase(options.DataSource, options.EffectiveConnectionString,
+            options.DedicatedConnectionString));
         services.TryAddSingleton(sp => new PgmqQueueManager(sp.GetRequiredService<PgmqDatabase>().DataSource));
         services.TryAddSingleton<IPgmqQueueManager>(sp => sp.GetRequiredService<PgmqQueueManager>());
         services.TryAddSingleton(sp => new QueueReader(sp.GetRequiredService<PgmqDatabase>().DataSource, options));
+        services.TryAddSingleton(sp => new SettleBatcher(sp.GetRequiredService<PgmqDatabase>().DataSource));
         services.TryAddSingleton(sp => new InsertListener(sp.GetRequiredService<PgmqDatabase>(),
             sp.GetRequiredService<ILogger<InsertListener>>()));
         services.TryAddSingleton<QueueSweeper>();

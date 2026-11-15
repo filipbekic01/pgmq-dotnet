@@ -41,6 +41,28 @@ public sealed class RegistrationTests
     }
 
     [Fact]
+    public void A_dedicated_connection_string_without_a_data_source_Should_be_refused()
+        => Assert.Throws<InvalidOperationException>(() => new ServiceCollection().AddPgmq(o =>
+        {
+            o.ConnectionString = Unreachable;
+            o.DedicatedConnectionString = Unreachable;
+        }));
+
+    [Fact]
+    public void A_dedicated_connection_string_Should_be_what_the_connections_outside_the_pool_are_opened_with()
+    {
+        using Npgsql.NpgsqlDataSource dataSource = Npgsql.NpgsqlDataSource.Create(Unreachable);
+        using PgmqDatabase derived = new(dataSource, connectionString: null);
+        using PgmqDatabase given = new(dataSource, connectionString: null,
+            dedicatedConnectionString: "Host=127.0.0.1;Port=1;Username=listener;Password=p;Database=d");
+
+        Assert.True(derived.ListenerIsDerived);
+        Assert.False(given.ListenerIsDerived);
+        Assert.Equal("listener", new Npgsql.NpgsqlConnectionStringBuilder(given.ListenerDataSource.ConnectionString).Username);
+        Assert.False(new Npgsql.NpgsqlConnectionStringBuilder(given.ListenerDataSource.ConnectionString).Pooling);
+    }
+
+    [Fact]
     public void A_class_that_consumes_nothing_Should_be_refused()
         => Assert.Throws<ArgumentException>(() => new ServiceCollection().AddPgmqConsumer<NotAConsumer>());
 

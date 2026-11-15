@@ -27,6 +27,16 @@ public sealed class PgmqOptions
     public NpgsqlDataSource? DataSource { get; set; }
 
     /// <summary>
+    /// With <see cref="DataSource"/>: the connection string for the two connections Pgmq keeps outside the pool, the
+    /// one that listens for inserts and the lease renewals', so that neither ever waits behind the application for a
+    /// pool slot. It names the same server and database as the data source. Null builds them from the data source's
+    /// own connection string, which keeps the password only with <c>Persist Security Info=true</c>; when that cannot
+    /// connect, both take pooled connections instead and <see cref="PgmqStatus.DedicatedConnectionsUsePool"/> turns
+    /// true. Not with <see cref="ConnectionString"/>, which is used for them already.
+    /// </summary>
+    public string? DedicatedConnectionString { get; set; }
+
+    /// <summary>
     /// Run the registered consumers in this host. Turn off for a host that only publishes: it still knows every
     /// consumer's queue, so what it publishes reaches the hosts that consume.
     /// </summary>
@@ -130,8 +140,8 @@ public sealed class PgmqOptions
     /// Reads, across every queue, that run at once in this host. A busy queue holds a slot only for its read, not
     /// while its messages run, so busy queues take turns and idle ones never ask. Settles, outbox commits and lease
     /// renewals do not count against it. A host then uses at most this many connections for reads, one for the
-    /// listener, one for the sweeper, one for lease renewals while messages run, and one per message settling at that
-    /// moment, whatever the pool allows.
+    /// listener, one for the sweeper, one for lease renewals while messages run, one for deletes, archives and
+    /// releases, and <see cref="MaxConcurrentCommits"/> for outbox commits, whatever the pool allows.
     /// <para>
     /// One by default: the fewest connections. Each read is one round trip, so with many busy queues of low concurrency
     /// (each read then fetches only a message or two) this caps how fast the host reads. Raise it for throughput:
@@ -141,6 +151,18 @@ public sealed class PgmqOptions
     /// </code>
     /// </summary>
     public int MaxConcurrentReads { get; set; } = 1;
+
+    /// <summary>
+    /// Outbox commits, across every queue, that run at once in this host. A consumer that published through its
+    /// context and succeeded has what it published sent, and its message deleted, in a transaction of its own on a
+    /// connection of its own; a message waiting for its turn keeps its lease. Nothing else counts against it:
+    /// deletes, archives and releases of every queue go out together, on one connection at a time.
+    /// <para>
+    /// Four by default. Raise it when most consumers publish through their context and the host should commit more of
+    /// them at once.
+    /// </para>
+    /// </summary>
+    public int MaxConcurrentCommits { get; set; } = 4;
 
     /// <summary>
     /// Wake an idle read loop as soon as a message is inserted, through PostgreSQL LISTEN/NOTIFY
@@ -220,6 +242,17 @@ public sealed class PgmqOptions
             }
         }
 
+        if (DedicatedConnectionString is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(DedicatedConnectionString, nameof(DedicatedConnectionString));
+            if (DataSource is null)
+            {
+                throw new InvalidOperationException(
+                    $"{nameof(DedicatedConnectionString)} needs {nameof(DataSource)}; with {nameof(ConnectionString)} " +
+                    "the connections outside the pool are opened from it already.");
+            }
+        }
+
         ArgumentException.ThrowIfNullOrEmpty(MaintenanceDatabase, nameof(MaintenanceDatabase));
         ArgumentOutOfRangeException.ThrowIfLessThan(DefaultConcurrency, 1, nameof(DefaultConcurrency));
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxAttempts, 1, nameof(MaxAttempts));
@@ -244,6 +277,7 @@ public sealed class PgmqOptions
         }
 
         ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentReads, 1, nameof(MaxConcurrentReads));
+        ArgumentOutOfRangeException.ThrowIfLessThan(MaxConcurrentCommits, 1, nameof(MaxConcurrentCommits));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(MinIdleDelay, TimeSpan.Zero, nameof(MinIdleDelay));
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(StallAfter, TimeSpan.Zero, nameof(StallAfter));
     }

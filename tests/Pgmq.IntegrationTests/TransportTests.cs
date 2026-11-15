@@ -117,15 +117,28 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
     }
 
     [Fact]
-    public async Task A_consumer_ignoring_its_timeout_Should_be_abandoned_and_free_its_slot()
+    public async Task A_consumer_ignoring_its_timeout_Should_be_abandoned_and_keep_its_slot_until_it_ends()
     {
+        using TelemetryCapture telemetry = new();
         await using TransportHarness harness = await StartAsync(o => o.DefaultTimeout = TimeSpan.FromSeconds(1), typeof(HangingConsumer));
 
         await harness.Bus.PublishAsync(new HangingMessage(HonoursToken: false), Ct);
         await harness.Bus.PublishAsync(new HangingMessage(HonoursToken: false, Hang: false), Ct);
 
         await Eventually.HoldsAsync(async () => await db.ArchivedAsync("t_hanging") == 1, Within, "abandoned");
-        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 2, Within, "the next one ran in the freed slot");
+
+        // It still runs, in the queue's only slot: the queue runs nothing else, and says so.
+        await Eventually.HoldsAsync(() => harness.Status.StalledQueues.Contains("t_hanging"), Within, "reported");
+        Assert.Equal(1, telemetry.Sum("pgmq.consumer.abandoned", "t_hanging"));
+        await Task.Delay(TimeSpan.FromSeconds(2), Ct);
+        Assert.Single(_probe.Deliveries);
+        Assert.Equal(1, await db.CountAsync("t_hanging"));
+
+        _probe.Open("hanging");
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 2, Within, "the next one ran once the slot was free");
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_hanging") == 0, Within, "queue empty");
+        Assert.Empty(harness.Status.StalledQueues);
+        Assert.Equal(0, telemetry.Sum("pgmq.consumer.abandoned", "t_hanging"));
     }
 
     [Fact]
@@ -574,7 +587,8 @@ public sealed class TransportTests(PgmqFixture db) : IClassFixture<PgmqFixture>
             }
             else
             {
-                await Task.Delay(TimeSpan.FromSeconds(15), CancellationToken.None);
+                // Ignores its token, until the test lets it go.
+                await probe.Gate("hanging").WaitAsync(TimeSpan.FromSeconds(60), CancellationToken.None);
             }
         }
     }

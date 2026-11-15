@@ -53,7 +53,10 @@ One read loop per queue, each with its own semaphore of slots:
 4. Decide the outcome first, then write it to the queue with its own retries: delete on success (in one
    transaction with what the consumer published, when it published anything); archive on a failure or a timeout.
    A consumer is never run again because it failed. A failed
-   write is never mistaken for a failed consumer.
+   write is never mistaken for a failed consumer. Deletes, archives and releases of every queue go through one writer,
+   which sends whatever waits as one batch, a statement per queue, on one connection at a time. A batch that fails
+   sets its queues apart, each written on its own until it succeeds, so one broken queue never fails the others
+   twice. Outbox commits are a transaction per message, at most `MaxConcurrentCommits` at once.
 5. Free the slot.
 
 Nothing an idle queue does grows with the number of queues. One connection per host LISTENs to every queue, outside
@@ -62,7 +65,9 @@ a visible message, and wakes only those: every `MaxIdleDelay` while notification
 whose time came, released messages, lapsed leases and lost notifications; every `MinIdleDelay` to about a second while
 they are not. The listener and the sweeper start before the read loops, which start waiting, so starting the host is one
 query, and a listener that comes back runs one sweep rather than waking every queue. An idle host holds two
-connections; a busy one at most `MaxConcurrentReads` plus the settles in flight plus those two.
+connections, the listener's and the one the pool keeps for the sweeps; a busy one at most `MaxConcurrentReads` for reads, one for
+deletes, archives and releases, `MaxConcurrentCommits` for outbox commits, and one for lease renewals beside those
+two.
 
 A loop that fails restarts itself and reports a heartbeat, which `PgmqStatus` and the health check read.
 
@@ -71,7 +76,9 @@ grouped FIFO reads, or `pop` for at-most-once. A grouped read can return several
 after another on one task, and when one does not succeed the rest are released unhandled, so a group never runs out of
 order. pgmq itself holds back a group while one of its messages is invisible.
 
-Timeouts cancel the consumer's token; a consumer that ignores it is abandoned after `AbandonAfter` so its slot frees.
+Timeouts cancel the consumer's token; a consumer that ignores it is abandoned after `AbandonAfter` and its message
+archived, but it keeps its slot until it ends, since nothing can stop it: a queue's concurrency bounds the consumers
+that run, not the messages that are leased. A queue with every slot held that way is reported as stalled.
 On shutdown the loops stop reading, running consumers get `DrainGrace`, and a message that stops on cancellation is
 made visible again at once.
 

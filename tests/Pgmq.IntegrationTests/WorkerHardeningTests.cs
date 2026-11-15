@@ -129,6 +129,39 @@ public sealed class WorkerHardeningTests(PgmqFixture db) : IClassFixture<PgmqFix
         await Eventually.HoldsAsync(async () => await db.CountAsync("t_shared_source") == 0, Within, "settled");
         Assert.Single(_probe.Deliveries);
         Assert.Equal(0, telemetry.Sum("pgmq.consumer.leases.lost", "t_shared_source"));
+
+        // Not silently: the status says the listener and the renewals hold pool slots.
+        Assert.True(harness.Status.DedicatedConnectionsUsePool);
+    }
+
+    [Fact]
+    public async Task A_dedicated_connection_string_Should_keep_the_listener_and_renewals_off_a_handed_in_pool()
+    {
+        string application = $"pgmq_ded_{Guid.NewGuid():N}"[..30];
+        await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
+        Assert.DoesNotContain("Password", dataSource.ConnectionString, StringComparison.OrdinalIgnoreCase);
+
+        await using TransportHarness harness = await TransportHarness.StartAsync(db, _probe, [typeof(SharedSourceConsumer)],
+            o =>
+            {
+                o.ConnectionString = null;
+                o.DataSource = dataSource;
+                o.DedicatedConnectionString = new NpgsqlConnectionStringBuilder(db.ConnectionString)
+                {
+                    ApplicationName = application,
+                }.ConnectionString;
+            });
+        await harness.Bus.PublishAsync(new SharedSource(), Ct);
+        await Eventually.HoldsAsync(() => _probe.Deliveries.Count == 1, Within, "running");
+
+        // The listener and the lease renewals: both opened with the connection string given for them.
+        await Eventually.HoldsAsync(async () => (long)(await db.ScalarObjectAsync(
+                $"select count(*) from pg_stat_activity where application_name = '{application}'"))! == 2,
+            Within, "two connections outside the pool");
+        Assert.False(harness.Status.DedicatedConnectionsUsePool);
+
+        _probe.Open("shared-source");
+        await Eventually.HoldsAsync(async () => await db.CountAsync("t_shared_source") == 0, Within, "settled");
     }
 
     [Fact]

@@ -58,6 +58,10 @@ public static class PgmqTelemetry
     internal static readonly UpDownCounter<long> ActiveMessages = Meter.CreateUpDownCounter<long>(
         "pgmq.consumer.messages.active", "{message}", "Messages being handled right now.");
 
+    internal static readonly UpDownCounter<long> AbandonedConsumers = Meter.CreateUpDownCounter<long>(
+        "pgmq.consumer.abandoned", "{consumer}",
+        "Consumers that ignored their timeout, were abandoned, and still run: each holds a slot of its queue until it ends.");
+
     internal static readonly Counter<long> ReadFailures = Meter.CreateCounter<long>(
         "pgmq.consumer.read.failures", "{failure}", "Reads of a queue that failed and will be tried again.");
 

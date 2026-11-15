@@ -5,6 +5,35 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-15
+
+### Changed
+
+- Deletes, archives and releases of every queue are written together, through one connection at a time: what
+  finishes while a write is on its way goes out in the next one, a statement per queue in one round trip. Before,
+  every message that was done took a connection of its own, so a consumer with `Concurrency = 70` whose messages ended
+  together asked the pool for seventy at once, at the very moment a failing database or a used-up pool made them all
+  fail together. A write that fails sets its queues apart, each written on its own until it succeeds, so a queue that
+  cannot be written fails alone.
+- A consumer that ignores its timeout and is abandoned now keeps its slot until it ends. Before, the slot was freed
+  and the next message started beside it, so consumers that hang piled up past the queue's `Concurrency`, each with
+  whatever connections it held. A queue whose every slot is held by abandoned consumers reads nothing: it is named in
+  `PgmqStatus.StalledQueues`, the health check reports it, and a critical log says which consumer must honour its
+  token. The message of an abandoned consumer is archived as before.
+- A busy host holds at most `MaxConcurrentReads` + `MaxConcurrentCommits` + 4 connections, whatever the concurrency
+  of its consumers. While settles fail it can use one per queue with messages to settle, never one per message.
+
+### Added
+
+- `PgmqOptions.MaxConcurrentCommits` (default 4): outbox commits at once across every queue in a host, each of which
+  is a transaction for one message on a connection of its own. A message waiting for its turn keeps its lease.
+- `PgmqOptions.DedicatedConnectionString`, with `DataSource`: the connection string for the listener's and the lease
+  renewals' connections, so they stay outside the pool when the data source's own connection string has lost its
+  password.
+- `PgmqStatus.DedicatedConnectionsUsePool`: true once those two connections fell back to the pool. Before, only one
+  warning in the log said so.
+- `pgmq.consumer.abandoned` counts the abandoned consumers that still run, per queue.
+
 ## [2.4.0] - 2026-11-11
 
 ### Fixed
