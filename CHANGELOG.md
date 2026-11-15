@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-15
+
 ### Changed
 
 - Deletes, archives and releases of every queue are written together, through one connection at a time: what
