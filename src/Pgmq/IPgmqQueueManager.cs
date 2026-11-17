@@ -49,10 +49,11 @@ public interface IPgmqQueueManager
 
     /// <summary>
     /// Moves messages from <paramref name="sourceQueue"/>, or from its archive, onto <paramref name="targetQueue"/>
-    /// in one statement (<c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq, created by the migrator). Each keeps its
+    /// in one statement: a delete from the source and a <c>pgmq.send_batch</c> to the target. Each keeps its
     /// body and headers and arrives as a new message, visible at once, read zero times. From a queue only visible
     /// messages move: one being handled or delayed stays, and two shovels at once never move the same message. Either
-    /// every selected message moves or none does. From the archive messages are moved, not copied: they leave it.
+    /// every selected message moves or none does. Both queues must exist, and a queue cannot be shoveled into itself
+    /// (its archive can). From the archive messages are moved, not copied: they leave it.
     /// <code>
     /// // Replay what failed: everything in orders' archive goes back onto orders.
     /// await queues.ShovelAsync("orders", "orders", fromArchive: true);

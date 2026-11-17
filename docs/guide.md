@@ -190,9 +190,9 @@ with the type's full name, or its `[MessageName]`. Without that header the worke
 
 ### Shovel
 
-`pgmq.shovel` is Pgmq.NET's one addition to pgmq, created by the migrator: it moves messages from a queue, or from its archive, onto
-another queue in one statement. Each message keeps its body and headers and arrives as a new message, visible at
-once, read zero times. From a queue only visible messages move, so a message being handled or still delayed stays
+`ShovelAsync` moves messages from a queue, or from its archive, onto another queue in one statement: a delete from
+the source and a `pgmq.send_batch` to the target, so it needs nothing in the database beyond pgmq. Each message keeps
+its body and headers and arrives as a new message, visible at once, read zero times. From a queue only visible messages move, so a message being handled or still delayed stays
 where it is, and two shovels on one queue at once never move the same message. Both queues must exist; either every
 selected message moves or none does. From the archive messages are moved, not copied: they leave the archive.
 
@@ -205,8 +205,21 @@ await queues.ShovelAsync("orders", "orders", [41, 42], fromArchive: true);  // e
 
 One call moves at most 1000 messages (`maxMessages`), so it stays one modest transaction. Given message ids, it moves
 exactly those, however many, and leaves out ids that are not there or (in the queue) not visible. To drain a big queue, call
-it until it returns 0; `maxMessages: null` moves everything in one transaction. It is plain SQL too:
-`select pgmq.shovel('orders', 'orders', from_archive => true, msg_ids => array[41, 42])`.
+it until it returns 0; `maxMessages: null` moves everything in one transaction.
+
+In plain SQL, the same move is a delete feeding `pgmq.send_batch`. Keep the `vt` condition, or a message being handled
+moves too and is handled twice; keep `skip locked`, so two moves at once never take the same message; and keep the
+headers, or the worker cannot tell the messages' types and archives them:
+
+```sql
+with taken as (
+    delete from pgmq.q_orders
+    where msg_id in (select msg_id from pgmq.q_orders where vt <= clock_timestamp()
+                     order by msg_id limit 1000 for update skip locked)
+    returning msg_id, message, headers)
+select pgmq.send_batch('orders_v2', array_agg(message order by msg_id), array_agg(headers order by msg_id))
+from taken having count(*) > 0;
+```
 
 ## Database setup
 
@@ -222,9 +235,7 @@ everything current changes nothing:
    - Not installed: `create extension pgmq` where the server has it, otherwise the embedded `pgmq.sql`
      (`InstallMode` narrows this).
    - A `pgmq` schema with no version record is refused rather than guessed at.
-3. **Shovel.** In the same transaction, after pgmq: `create or replace function pgmq.shovel`, Pgmq.NET's one addition
-   to pgmq.
-4. **Queues.** Each consumer's queue, FIFO index, topic bindings and insert notification trigger.
+3. **Queues.** Each consumer's queue, FIFO index, topic bindings and insert notification trigger.
 
 The SQL install follows what upstream calls a versioned SQL-only install. It uses the same table and lock key as the
 Rust client, so a database installed by either one can be upgraded by both. The embedded scripts are pgmq's own, at

@@ -109,20 +109,88 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         return await ShovelCoreAsync(sourceQueue, targetQueue, fromArchive, null, messageIds, cancellationToken);
     }
 
-    private Task<long> ShovelCoreAsync(string sourceQueue, string targetQueue, bool fromArchive, int? maxMessages,
+    private async Task<long> ShovelCoreAsync(string sourceQueue, string targetQueue, bool fromArchive, int? maxMessages,
         IReadOnlyCollection<long>? messageIds, CancellationToken cancellationToken)
-        => ScalarAsync<long>("select pgmq.shovel($1, $2, $3, $4, $5)",
-            [
-                Text(sourceQueue), Text(targetQueue),
-                new NpgsqlParameter { Value = fromArchive, NpgsqlDbType = NpgsqlDbType.Boolean },
-                new NpgsqlParameter
-                {
-                    Value = maxMessages is { } max ? max : DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer,
-                },
-                messageIds is null
-                    ? new NpgsqlParameter { Value = DBNull.Value, NpgsqlDbType = NpgsqlDbType.Array | NpgsqlDbType.Bigint }
-                    : Longs(messageIds),
-            ], cancellationToken);
+    {
+        if (!fromArchive && string.Equals(sourceQueue, targetQueue, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException($"Cannot shovel queue {sourceQueue} into itself.", nameof(targetQueue));
+        }
+
+        await using NpgsqlConnection connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        await using (NpgsqlCommand exists = new(
+                         "select exists (select 1 from pgmq.meta where lower(queue_name) = lower($1)), " +
+                         "exists (select 1 from pgmq.meta where lower(queue_name) = lower($2))", connection, transaction))
+        {
+            exists.Parameters.Add(Text(sourceQueue));
+            exists.Parameters.Add(Text(targetQueue));
+            await using NpgsqlDataReader reader = await exists.ExecuteReaderAsync(cancellationToken);
+            await reader.ReadAsync(cancellationToken);
+            if (!reader.GetBoolean(0))
+            {
+                throw new InvalidOperationException($"The source queue {sourceQueue} does not exist.");
+            }
+
+            if (!reader.GetBoolean(1))
+            {
+                throw new InvalidOperationException($"The target queue {targetQueue} does not exist.");
+            }
+        }
+
+        // Take the oldest visible messages (a leased or delayed one stays), skipping rows another transaction holds so
+        // two shovels at once never take the same one, and send them on with their headers, in order, in one statement.
+        string source = QuoteTable(fromArchive ? "a_" : "q_", sourceQueue);
+        List<string> conditions = [];
+        if (!fromArchive)
+        {
+            conditions.Add("vt <= pg_catalog.clock_timestamp()");
+        }
+
+        if (messageIds is not null)
+        {
+            conditions.Add("msg_id = any($3)");
+        }
+
+        string where = conditions.Count == 0 ? "" : "where " + string.Join(" and ", conditions);
+        string sql = $"""
+            with taken as (
+                delete from {source}
+                where msg_id in (
+                    select msg_id from {source}
+                    {where}
+                    order by msg_id
+                    limit $2
+                    for update skip locked)
+                returning msg_id, message, headers
+            ), batch as (
+                select array_agg(message order by msg_id) as msgs, array_agg(headers order by msg_id) as hdrs from taken
+            )
+            select case when msgs is null then 0
+                else (select count(*) from pgmq.send_batch($1, msgs, hdrs)) end
+            from batch
+            """;
+
+        await using NpgsqlCommand shovel = new(sql, connection, transaction);
+        shovel.Parameters.Add(Text(targetQueue));
+        shovel.Parameters.Add(new NpgsqlParameter
+        {
+            Value = maxMessages is { } max ? max : DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer,
+        });
+        if (messageIds is not null)
+        {
+            shovel.Parameters.Add(Longs(messageIds));
+        }
+
+        long moved = (long)(await shovel.ExecuteScalarAsync(cancellationToken))!;
+        await transaction.CommitAsync(cancellationToken);
+        return moved;
+    }
+
+    /// <summary>A queue's table, <c>pgmq.q_{name}</c> or <c>pgmq.a_{name}</c>, quoted as pgmq names it.</summary>
+    private static string QuoteTable(string prefix, string queueName)
+        => $"pgmq.\"{(prefix + queueName.ToLowerInvariant()).Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
 
     /// <inheritdoc />
     public async Task<long> PurgeQueueAsync(string queueName, CancellationToken cancellationToken = default)

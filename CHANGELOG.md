@@ -5,6 +5,17 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `ShovelAsync` sends its own statement, a delete from the source feeding `pgmq.send_batch`, and moves messages as
+  before. A missing source or target queue now throws `InvalidOperationException`, and shoveling a queue into itself
+  `ArgumentException`, instead of a `PostgresException`.
+
+### Removed
+
+- The `pgmq.shovel` function: the migrator no longer creates it, and `AppliedScripts` no longer lists `shovel.sql`.
+  Databases that already have it keep it.
+
 ## [2.5.0] - 2026-11-15
 
 ### Changed
