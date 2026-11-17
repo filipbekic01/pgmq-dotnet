@@ -176,7 +176,8 @@ public sealed class PgmqQueueManager(NpgsqlDataSource dataSource) : IPgmqQueueMa
         shovel.Parameters.Add(Text(targetQueue));
         shovel.Parameters.Add(new NpgsqlParameter
         {
-            Value = maxMessages is { } max ? max : DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer,
+            Value = maxMessages is { } max ? max : DBNull.Value,
+            NpgsqlDbType = NpgsqlDbType.Integer,
         });
         if (messageIds is not null)
         {
