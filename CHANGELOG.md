@@ -5,6 +5,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-17
+
 ### Changed
 
 - `ShovelAsync` sends its own statement, a delete from the source feeding `pgmq.send_batch`, and moves messages as
