@@ -8,7 +8,6 @@ adds an opinionated runtime service for .NET that consumes your messages for you
 | Every pgmq feature, one to one | ✅ | ✅ |
 | Background workers woken by LISTEN/NOTIFY | ✅ | ❌ |
 | OpenTelemetry traces and metrics out of the box | ✅ | ❌ |
-| Shovel: move or replay messages between queues | ✅ | ❌ |
 
 ## Run it
 
