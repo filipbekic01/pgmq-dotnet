@@ -208,26 +208,37 @@ public sealed class SettleBatcherTests
     [Fact]
     public async Task A_message_missing_on_a_second_write_Should_not_be_reported_as_gone()
     {
-        // The first write went through but its answer was lost; the second finds nothing left to delete.
-        bool first = true;
-        SettleBatcher batcher = new(groups =>
+        // The shared write of both went through but its answer was lost; each queue's own write finds nothing left.
+        TaskCompletionSource holding = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int writes = 0;
+        SettleBatcher batcher = new(async groups =>
         {
-            if (first)
+            switch (Interlocked.Increment(ref writes))
             {
-                first = false;
-                throw new TimeoutException("the answer was lost");
+                case 1:
+                    // Holds the writer, so the two below wait behind it and go out together in the next write.
+                    holding.SetResult();
+                    await release.Task;
+                    SettleAll(groups);
+                    return;
+                case 2:
+                    throw new TimeoutException("the answer was lost");
             }
 
             foreach (SettleGroup group in groups)
             {
                 group.Settled = [];
             }
-
-            return Task.CompletedTask;
         });
 
-        Assert.All(await Task.WhenAll(batcher.DeleteAsync("emails", 1), batcher.DeleteAsync("orders", 2))
-            .WaitAsync(Soon, Ct), Assert.True);
+        Task<bool> held = batcher.DeleteAsync("held", 1);
+        await holding.Task.WaitAsync(Soon, Ct);
+        Task<bool[]> both = Task.WhenAll(batcher.DeleteAsync("emails", 1), batcher.DeleteAsync("orders", 2));
+        release.SetResult();
+
+        Assert.True(await held.WaitAsync(Soon, Ct));
+        Assert.All(await both.WaitAsync(Soon, Ct), Assert.True);
     }
 
     [Fact]

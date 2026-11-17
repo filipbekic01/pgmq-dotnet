@@ -3,8 +3,8 @@ using Npgsql;
 namespace Pgmq.IntegrationTests;
 
 /// <summary>
-///     <c>pgmq.shovel</c>, Pgmq.NET's one addition to pgmq, through <see cref="IPgmqQueueManager.ShovelAsync"/>: moving
-///     messages from a queue or its archive onto another queue. Needs a running Docker daemon.
+///     <see cref="IPgmqQueueManager.ShovelAsync(string, string, bool, int?, CancellationToken)"/>: moving messages from a
+///     queue or its archive onto another queue. Needs a running Docker daemon.
 /// </summary>
 public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IAsyncLifetime
 {
@@ -19,17 +19,6 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
-
-    [Fact]
-    public async Task The_migrator_Should_create_the_shovel_in_pgmq_and_report_it_only_once()
-    {
-        await using NpgsqlDataSource dataSource = NpgsqlDataSource.Create(db.ConnectionString);
-        PgmqMigrationResult again = await new PgmqMigrator(dataSource).MigrateAsync(cancellationToken: Ct);
-
-        Assert.False(again.Changed);
-        Assert.Equal(true, await db.ScalarObjectAsync(
-            "select to_regprocedure('pgmq.shovel(text, text, boolean, integer, bigint[])') is not null"));
-    }
 
     [Fact]
     public async Task A_shovel_Should_move_every_visible_message_in_order_with_its_headers()
@@ -100,10 +89,10 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
         await NewQueuesAsync("s_nowhere");
         await Queues.SendAsync("s_nowhere", """{"n": 1}""", cancellationToken: Ct);
 
-        PostgresException ex = await Assert.ThrowsAsync<PostgresException>(
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => Queues.ShovelAsync("s_nowhere", "s_missing", cancellationToken: Ct));
 
-        Assert.Contains("target queue s_missing does not exist", ex.MessageText);
+        Assert.Contains("target queue s_missing does not exist", ex.Message);
         Assert.Equal(1, await db.CountAsync("s_nowhere"));
     }
 
@@ -112,10 +101,10 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
     {
         await NewQueuesAsync("s_lonely_to");
 
-        PostgresException ex = await Assert.ThrowsAsync<PostgresException>(
+        InvalidOperationException ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => Queues.ShovelAsync("s_gone", "s_lonely_to", cancellationToken: Ct));
 
-        Assert.Contains("source queue s_gone does not exist", ex.MessageText);
+        Assert.Contains("source queue s_gone does not exist", ex.Message);
     }
 
     [Fact]
@@ -147,40 +136,23 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
         await NewQueuesAsync("s_race", "s_race_to");
         await db.SendAsync("s_race", 4);
 
-        // The first holds the two oldest in an open transaction; the second skips them and takes the rest.
-        await using NpgsqlConnection first = new(db.ConnectionString);
-        await first.OpenAsync(Ct);
-        await using NpgsqlTransaction transaction = await first.BeginTransactionAsync(Ct);
-        await using (NpgsqlCommand shovel = new("select pgmq.shovel('s_race', 's_race_to', false, 2)", first, transaction))
+        // Another transaction holds the two oldest, as a shovel still running would; this one skips them.
+        await using NpgsqlConnection other = new(db.ConnectionString);
+        await other.OpenAsync(Ct);
+        await using NpgsqlTransaction transaction = await other.BeginTransactionAsync(Ct);
+        await using (NpgsqlCommand hold = new(
+                         "select msg_id from pgmq.q_s_race order by msg_id limit 2 for update", other, transaction))
         {
-            Assert.Equal(2L, await shovel.ExecuteScalarAsync(Ct));
+            await hold.ExecuteNonQueryAsync(Ct);
         }
 
         Assert.Equal(2, await Queues.ShovelAsync("s_race", "s_race_to", maxMessages: null, cancellationToken: Ct));
-        await transaction.CommitAsync(Ct);
+        await transaction.RollbackAsync(Ct);
 
-        Assert.Equal(0, await db.CountAsync("s_race"));
-        Assert.Equal(4, await db.CountAsync("s_race_to"));
+        Assert.Equal(2, await db.CountAsync("s_race"));
+        Assert.Equal(2, await db.CountAsync("s_race_to"));
+        Assert.Equal(2, await Queues.ShovelAsync("s_race", "s_race_to", cancellationToken: Ct));
         Assert.Equal(4L, await db.ScalarObjectAsync("select count(distinct message) from pgmq.q_s_race_to"));
-    }
-
-    [Fact]
-    public async Task A_shovel_in_a_transaction_that_rolls_back_Should_move_nothing()
-    {
-        await NewQueuesAsync("s_undo", "s_undo_to");
-        await db.SendAsync("s_undo", 3);
-
-        await using (NpgsqlConnection connection = new(db.ConnectionString))
-        {
-            await connection.OpenAsync(Ct);
-            await using NpgsqlTransaction transaction = await connection.BeginTransactionAsync(Ct);
-            await using NpgsqlCommand shovel = new("select pgmq.shovel('s_undo', 's_undo_to')", connection, transaction);
-            Assert.Equal(3L, await shovel.ExecuteScalarAsync(Ct));
-            await transaction.RollbackAsync(Ct);
-        }
-
-        Assert.Equal(3, await db.CountAsync("s_undo"));
-        Assert.Equal(0, await db.CountAsync("s_undo_to"));
     }
 
     [Fact]
@@ -188,7 +160,7 @@ public sealed class ShovelTests(PgmqFixture db) : IClassFixture<PgmqFixture>, IA
     {
         await NewQueuesAsync("s_self");
 
-        await Assert.ThrowsAsync<PostgresException>(() => Queues.ShovelAsync("s_self", "s_self", cancellationToken: Ct));
+        await Assert.ThrowsAsync<ArgumentException>(() => Queues.ShovelAsync("s_self", "s_self", cancellationToken: Ct));
     }
 
     [Fact]
